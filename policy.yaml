@@ -1,0 +1,141 @@
+policies:
+- name: session_route_local
+  priority: 5
+  description: 会话级路由本地：上传机密文件后，同一会话内的所有 chat/messages/responses 请求自动走本地模型，30 分钟 TTL
+  when:
+    any:
+    - session.confidential == true: true
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+- name: financial_local_only
+  priority: 10
+  description: 财务表格：命中财务关键词才走内网（保持默认）
+  when:
+    any:
+    - file.sheet_names contains_any:
+      - 工资
+      - 薪资
+      - 财务
+      - 预算
+      - 决算
+      - 成本
+      - 营收
+      - 利润
+      - 资产负债
+    - file.headers contains_any:
+      - 姓名
+      - 身份证
+      - 工资
+      - 薪资
+      - 银行账号
+      - 银行卡
+      - 金额
+      - 成本
+      - 利润
+      - 营收
+    - file.filename contains_any:
+      - 工资
+      - 薪资
+      - 财务
+      - 预算
+      - salary
+      - financial
+      - cost
+    - text contains_any:
+      - 财务报表
+      - 资产负债
+      - 利润表
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+- name: ocr_empty_image_route_local
+  priority: 12
+  description: 'P0-3 fix: image branch + OCR returned empty (engine missing / corrupted
+    / unsupported format) -> fail-CLOSED route_local instead of fail-open allow'
+  when:
+    any:
+    - findings.ocr_empty_and_image == true: true
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+- name: unparsed_binary_route_local
+  priority: 13
+  description: 'P0-3b fix: 扩展名伪装 / 未知或损坏二进制（magic 嗅探失败或富格式分支解析失败）
+    -> fail-CLOSED route_local，取代旧的「把二进制 dump 成文本 -> 抽不出关键词 -> allow」'
+  when:
+    any:
+    - findings.unparsed_binary == true: true
+    - findings.parse_failed == true: true
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+- name: drawing_local_only
+  priority: 20
+  description: 设计图纸：含机密/保密水印才走内网（按你选择）
+  when:
+    any:
+    - file.text contains_any:
+      - 机密
+      - 保密
+      - 内部资料
+      - 不得外传
+      - confidential
+      - secret
+    - file.watermark contains_any:
+      - 机密
+      - 保密
+      - confidential
+      - secret
+    - file.filename contains_any:
+      - 机密
+      - 保密
+      - confidential
+      - secret
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+- name: block_secrets
+  priority: 30
+  description: 密钥/私钥 直接拦截（DeepSeek sk-+32hex / AWS AKIA / PEM / Anthropic / GitHub
+    / aws_secret）
+  when:
+    any:
+    - text matches_regex: AKIA[0-9A-Z]{16}
+    - text matches_regex: '-----BEGIN (RSA )?PRIVATE KEY-----'
+    - text matches_regex: sk-[0-9a-fA-F]{32}
+    - text contains_any:
+      - sk-ant-
+      - ghp_
+      - aws_secret
+  action: block
+- name: pii_critical_block
+  priority: 25
+  description: 高危密钥/私钥权重高，直接 block (fallback_local 降本地审)
+  when:
+    any:
+    - text matches_regex: AKIA[0-9A-Z]{16}
+    - text matches_regex: '-----BEGIN (?:RSA )?PRIVATE KEY-----'
+    - text matches_regex: ghp_[A-Za-z0-9]{36,}
+    - text matches_regex: sk-ant-[A-Za-z0-9_-]{20,}
+  action: block
+- name: pii_weighted_route_local
+  priority: 40
+  description: PII 加权评分 >= 60 转内网 (身份证 70/银行卡 Luhn 60; 密钥类 90+)
+  when:
+    any:
+    - findings.weighted_pii_score >=: 60
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+- name: default_allow
+  priority: 100
+  description: 默认外网（provider 留空 = 用 routing.yaml 的 default_external）
+  when: always
+  action: allow

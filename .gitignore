@@ -1,0 +1,18 @@
+.env
+.venv/
+var/
+.pytest_cache/
+_backup/
+*.log
+__pycache__/
+*.pyc
+node_modules/
+.workbuddy/
+# 历史备份文件不再入库（远端备份直接放 /tmp，不进仓库）
+*.bak
+*.bak_*
+*.bak-*
+*.bak.*
+*.corrupt
+*.orig
+*.rej

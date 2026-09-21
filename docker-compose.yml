@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles: ["ollama"]
+    # 首次启动后手动: docker compose exec ollama ollama pull qwen2:7b
+
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 如内网vLLM在宿主机/另一台机器，无需 ollama 容器；已有内网模型时注释掉 ollama 服务
+    environment:
+      DATABASE_URL: postgresql+psycopg://gateway:gateway@postgres:5432/gateway
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:8000/v1}
+      AI_GATEWAY_POLICY_PATH: /app/policy.yaml
+      AI_GATEWAY_DEV_API_KEY: pk_live_dev_changeme
+      AI_GATEWAY_RATE_LIMIT_RPM: 120
+      OLLAMA_MOCK: ${OLLAMA_MOCK:-false}
+    volumes:
+      - ./policy.yaml:/app/policy.yaml:ro
+      - ./src:/app/src:ro
+    command: uvicorn src.gateway.main:app --host 0.0.0.0 --port 8080 --reload
+
+volumes:
+  pgdata:
+  ollama_data:

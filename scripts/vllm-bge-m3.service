@@ -1,0 +1,34 @@
+# 模板：安装前替换 your-user / 模型路径 / CUDA_VISIBLE_DEVICES / 日志路径
+[Unit]
+Description=vLLM serving bge-m3 embedding model (port 8001, GPU shared with Qwen3-4B)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user
+
+# 与 vllm-qwen3-4b 同卡示例：bge util 0.10 + Qwen util 0.70 = 0.80，余 ~20% 给 CUDA 上下文与碎片。
+Environment=CUDA_VISIBLE_DEVICES=4
+Environment=HOME=/home/your-user
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=VLLM_LOGGING_LEVEL=INFO
+
+ExecStart=/home/your-user/venvs/vllm/bin/vllm serve /home/your-user/models/bge-m3 \
+  --served-model-name bge-m3 \
+  --host 0.0.0.0 \
+  --dtype float16 \
+  --gpu-memory-utilization 0.1 \
+  --port 8001
+
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+StandardOutput=append:/home/your-user/bge_m3.log
+StandardError=append:/home/your-user/bge_m3.log
+
+[Install]
+WantedBy=multi-user.target

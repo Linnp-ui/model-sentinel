@@ -1,0 +1,34 @@
+/* 顶部常驻：滚动长表格时 Header + 状态灯始终可见（antd Header 默认高 64px） */
+.app-header { position: sticky; top: 0; z-index: 10; }
+.app-statusbar { position: sticky; top: 64px; z-index: 9; }
+
+/* 状态灯异常：红色 Tag 脉冲提示（系统偏好减动效时关闭） */
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.status-critical { animation: status-pulse 2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .status-critical { animation: none; }
+}
+
+/* 页面 Content padding=24；统一所有卡片（含 size=small）head 为同一格式：
+   antd small 卡默认 head min-height=38px/font=14px/body=12px，
+   normal 卡 min-height=56px/font=16px/body=24px —— 全部对齐到 normal 值 */
+.ant-card-head {
+  padding-inline-start: 24px !important;
+  padding-inline-end: 24px !important;
+  min-height: 56px !important;
+  font-size: 16px !important;
+}
+.ant-card-head-title { padding: 0 !important; }
+/* 表格单元格左侧留白 +6px（small 表基础 padding 8px → 14px） */
+.ant-table-cell { padding-left: 14px !important; }
+/* L2 运行配置块（审查模型卡片内）垂直居中 */
+.ant-card-body:has(> [data-testid="l2cfg-section"]) {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  margin-bottom: 12px;
+}
+.ant-card-body > [data-testid="l2cfg-section"] { width: 100%; }

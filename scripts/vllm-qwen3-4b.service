@@ -1,0 +1,39 @@
+# 模板：安装前替换 your-user / 模型路径 / CUDA_VISIBLE_DEVICES / 日志路径
+[Unit]
+Description=Qwen3-4B-Instruct-2507 via vLLM (L2 confidential classifier, port 8002, TP1 single-card（示例 GPU）)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user
+
+# 与 bge-m3 同卡示例：Qwen util 0.70 + bge util 0.10 = 0.80，余 ~20% 给 CUDA 上下文与碎片。
+# L2 prompt 短（classify，max-model-len 2048 / max-num-seqs 32），0.70 的 KV 池足够。
+Environment=CUDA_VISIBLE_DEVICES=4
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=VLLM_LOGGING_LEVEL=INFO
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ExecStart=/home/your-user/venvs/vllm/bin/vllm serve /home/your-user/models/Qwen3-4B-Instruct-2507 \
+  --served-model-name Qwen3-4B-Instruct-2507 \
+  --host 0.0.0.0 \
+  --port 8002 \
+  --dtype bfloat16 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.70 \
+  --max-model-len 2048 \
+  --enable-prefix-caching \
+  --max-num-seqs 32
+
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+StandardOutput=append:/home/your-user/gateway/qwen3_4b.log
+StandardError=append:/home/your-user/gateway/qwen3_4b.log
+
+[Install]
+WantedBy=multi-user.target

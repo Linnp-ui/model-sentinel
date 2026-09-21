@@ -1,0 +1,32 @@
+routing:
+  default_external: deepseek
+  default_local: vllm_local
+  default_embedding: bge_m3
+  on_block: fallback_local
+  on_missing_key: reject
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    default_model: deepseek-v4-flash
+    local: false
+    timeout: 60
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    default_model: deepseek/deepseek-chat
+    local: false
+    timeout: 60
+  vllm_local:
+    base_url: ${OLLAMA_BASE_URL:http://10.0.0.10:8000/v1}
+    api_key_env: OLLAMA_API_KEY
+    default_model: qwen2.5:7b
+    local: true
+    timeout: 120
+  bge_m3:
+    kind: embedding
+    base_url: ${BGE_BASE_URL:http://10.0.0.10:8001/v1}
+    api_key_env: BGE_API_KEY
+    default_model: bge-m3
+    local: true
+    timeout: 30

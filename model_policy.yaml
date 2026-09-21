@@ -1,0 +1,35 @@
+model_policy:
+  external_candidates:
+  - provider: deepseek
+    model: deepseek-flash
+    price_per_1m_in: 0.04
+    price_per_1m_out: 2.0
+    context_length: 1000000
+    rate: 1.0
+    note: deepseek 官方
+    enabled: true
+    rank: 1
+  - provider: deepseek
+    model: deepseek-v4-pro
+    price_per_1m_in: 0.15
+    price_per_1m_out: 4.5
+    context_length: 1000000
+    rate: 1.0
+    note: ''
+    enabled: true
+    rank: 2
+  internal_models:
+  - provider: vllm_local
+    model: qwen2.5:7b
+    note: 主力本地模型（内容不出境降级目标）
+    enabled: true
+  load_balance_mode: none
+  review_model:
+    threshold: 0.7
+    scopes:
+    - last_user
+    - tool
+    - tail
+    chunk_chars: 1200
+    budget_chars: 5000
+    note: ''
