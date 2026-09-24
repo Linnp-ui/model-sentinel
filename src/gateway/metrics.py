@@ -29,7 +29,6 @@ def get_current_status() -> int:
 class Metrics:
     _instance = None
     _lock = threading.Lock()
-
     def __new__(cls):
         with cls._lock:
             if cls._instance is None:
@@ -498,7 +497,6 @@ class Metrics:
                 },
                 "tokens": dict(self._tokens),
             }
-
 
 
 _m: Metrics | None = None

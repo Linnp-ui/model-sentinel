@@ -1,25 +1,10 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Statistic, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col, List,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
-import { api, errText } from '../api.js';
+import React, { useEffect, useState, useCallback } from 'react';
+import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, List } from 'antd';
+import { StopOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { api, errText, RANGES } from '../api.js';
 
 const { Text } = Typography;
-// ---------------- 调节策略建议（规则 1/2/3 用面板窗口、KEY 分级另用独立窗口） ----------------
-const RANGES = [
-  { hours: 24, label: '最近 24 小时' },
-  { hours: 168, label: '最近 7 天' },
-  { hours: 720, label: '最近 30 天' },
-];
+// ---------------- 调节策略建议（总览 + KEY 黑白名单页共用；onApplied 供宿主刷新自己的表格） ----------------
 const RANGE_LABEL = (h) => (RANGES.find((r) => r.hours === h) || {}).label || `最近 ${h} 小时`;
 const sugTitleOf = (meta, h) => {
   const base = '调节策略建议 · 触发 = 拦截 ∪ 本地路由';
@@ -29,7 +14,6 @@ const sugTitleOf = (meta, h) => {
     : `${base}（${RANGE_LABEL(h)}）`;
 };
 const sevColor = { high: 'red', warn: 'orange', info: 'blue' };
-// 自包含建议卡（总览 + KEY 黑白名单页共用）；onApplied 供宿主刷新自己的表格
 export function SuggestionCard({ onApplied }) {
   const [hours, setHours] = useState(168);
   const [sug, setSug] = useState([]);
@@ -145,7 +129,6 @@ export default function KeyRulesPage() {
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
-      <SuggestionCard onApplied={load} />
       <Alert type="info" showIcon
         message="默认放行所有 KEY；黑名单命中即拦截（403），且黑名单优先于白名单（同 KEY 双规则时拉黑即时生效）。按 Bearer key 原文精确匹配。" />
       <Space>

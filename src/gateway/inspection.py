@@ -38,19 +38,17 @@ KEYWORD_WEIGHTS = {
     "合同": 20, "投标": 20, "中标": 20, "底价": 20, "税率": 20,
     "银行卡": 20, "密码": 20, "手机号": 20, "住址": 20, "图号": 20,
     "人事档案": 20, "工艺参数": 20, "会议纪要": 20,
+    # 2026-09-23 补（160 条安全矩阵漏网分析）：薪酬口语/英文财薪/分红/图纸口语/密钥残缺/
+    # 电话/通讯录指代。英文词仅小写形态（匹配为原文子串，不 lower）；全 20 档只进灰不直拦。
+    "涨薪": 20, "年终": 20, "绩效": 20, "分红": 20,
+    "salary": 20, "bonus": 20, "revenue": 20, "package": 20, "offer": 20, "headcount": 20,
+    "配筋": 20, "开挖": 20, "切削": 20, "HRB": 20,
+    "通讯录": 20, "花名册": 20, "电话": 20, "别外传": 20,
+    "密钥": 20, "token": 20, "password": 20, "AKIA": 20,
 }
 
 RISK_THRESHOLD_ROUTE_LOCAL = 60  # >=60 -> route_local
 RISK_THRESHOLD_BLOCK = 150        # >=150 -> block (override to block)
-
-
-def shannon_entropy(s: str) -> float:
-    if not s:
-        return 0
-    from collections import Counter
-    c = Counter(s)
-    l = len(s)
-    return -sum((v/l) * math.log2(v/l) for v in c.values())
 
 
 def luhn_valid(card: str) -> bool:
@@ -236,14 +234,12 @@ def inspect_text(text: str) -> Dict:
     digit_text = _strip_pii_separators(pii_text)
     def _emit(name, val, start, via):
         nonlocal pii_count, weighted_count
-        entropy = shannon_entropy(val) if name in ("aws_key", "ant_api_key", "gh_token") else 0
         w = PII_WEIGHTS.get(name, 0)
         findings.append({
             "type": name,
             "value_preview": val[:6] + "***",
             "start": start,
             "end": start + len(val),
-            "entropy": round(entropy, 2),
             "severity": "L3" if w >= 70 else ("L2" if w >= 40 else "L1"),
             "weight": w,
             "via": via,
@@ -256,8 +252,6 @@ def inspect_text(text: str) -> Dict:
         layer_digits = _strip_pii_separators(layer_text)
         for name, pat in PATTERNS.items():
             match_text = layer_digits if name in ("idcard", "bankcard", "phone") else layer_text
-            if name == "email" and "@" not in match_text:
-                continue  # P0: 无 @ 不可能命中，跳过回溯风险
             for m in pat.finditer(match_text):
                 val = m.group(0)
                 if name == "bankcard" and not luhn_valid(val):
@@ -278,7 +272,6 @@ def inspect_text(text: str) -> Dict:
             keyword_score += w
 
     risk_score = min(200, weighted_count + keyword_score)
-
     severity = "LOW"
     if risk_score >= RISK_THRESHOLD_BLOCK:
         severity = "CRITICAL"

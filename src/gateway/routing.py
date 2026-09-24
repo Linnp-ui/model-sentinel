@@ -31,7 +31,7 @@ from .provider_keys import (
     note_rejected as _note_rejected,
     note_exhausted as _note_exhausted,
 )
-from .circuit_breaker import get_breaker, CircuitOpenError
+from .circuit_breaker import get_breaker
 from .user_models import find_provider
 from .llms.registry import get_llm_handler
 from .llms.bridges import (
@@ -220,11 +220,15 @@ async def aclose_clients() -> None:
 class RoutingError(Exception):
     """路由层错误，由 main.py 转成 4xx/5xx 响应"""
 
-    def __init__(self, message: str, status_code: int = 502, type_: str = ""):
+    def __init__(self, message: str, status_code: int = 502, type_: str = "",
+                 provider: str = ""):
         super().__init__(message)
         self.status_code = status_code
         # 供 main.py 生成 detail.type（缺省回落 routing_error，保持旧报文兼容）
         self.type_ = type_ or ""
+        # 别名层失败（无可用候选）尚未接触任何 provider：填别名名，避免信封
+        # 沿用 resolve() 预钉的默认 provider（曾把 local-model 503 误标 deepseek）
+        self.provider = provider or ""
 
 
 class _ResponsesUnsupported(Exception):
@@ -253,7 +257,8 @@ async def _responses_direct_stream(
     首字节前命中 fallback_codes 或连接失败 ⇒ raise _ResponsesUnsupported，
     由调用方回退 chat 桥接；其余 >=400 抛 RoutingError（不静默吞掉）。
     """
-    if not prov.local and not _has_key(prov, ukey):
+    # 外网转发只看本次解析出的凭据（ukey），不看 prov.configured（库存≠本请求有权用，T44 坑见 gotchas）
+    if not prov.local and not ukey:
         raise RoutingError(f"provider {prov.name} 未配置密钥", 503,
                             type_="provider_not_configured")
     client = _get_client(prov.local)
@@ -383,15 +388,6 @@ def _gateway_upstream_key(identity, prov: Provider | None = None) -> str:
         _note_exhausted(prov.name)
     return key
 
-
-def _has_key(prov: Provider, override: str) -> bool:
-    """外网 provider 本次请求是否具备真实转发条件。
-
-    **只看本次解析出的凭据**（``upstream_key()`` 的返回值）。``prov.configured``
-    是「网关侧有库存」，不是「本请求有权用」；混用会让未登记身份（env 共享
-    dev key / 验签放行 / 匿名）也白吃公司额度（T44 生产实测 2026-09-17）。
-    """
-    return bool(override)
 
 
 def resolve(
@@ -608,7 +604,7 @@ def _alias_context(payload: Dict[str, Any], decision: Dict[str, Any],
 
 def _alias_resolve(payload: Dict[str, Any], decision: Dict[str, Any],
                    headers: Mapping[str, str] | None):
-    """别名组 -> (prov, model, alias)；非别名/不允许别名时返回 None。
+    """别名组 -> (prov, model, alias, idx)；非别名/不允许别名时返回 None。
 
     抽成公共函数，是为了让**所有**端点共用同一份逻辑。
     2026-09-16 生产事故：`route_responses` / `route_responses_stream` 直接调
@@ -626,7 +622,8 @@ def _alias_resolve(payload: Dict[str, Any], decision: Dict[str, Any],
     from .alias_router import alias_candidates as _alias_candidates
     _c0 = _alias_candidates(alias)
     if not _c0:
-        raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503)
+        raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503,
+                               provider=alias["name"])
     _c = _c0[0]
     cfg = load_routing()
     prov = cfg.get(_c["provider"]) or find_provider(_c["provider"])
@@ -635,7 +632,7 @@ def _alias_resolve(payload: Dict[str, Any], decision: Dict[str, Any],
     _alias_ctx_start(alias["name"])
     from .alias_router import ctx_set_current as _alias_setcur
     _alias_setcur(prov.name, _c["model"], prov.local)
-    return prov, _c["model"], alias
+    return prov, _c["model"], alias, _c["idx"]
 
 
 def _mp_fallback_enabled() -> bool:
@@ -674,22 +671,12 @@ async def route_chat(
     # external_candidates()——全是外网 provider——本地故障时切过去等于把敏感原文转发出境，
     # 所以这里显式禁用切换，失败即 fail-loud。
     _pinned_local = (decision or {}).get("action", "allow") in ("route_local", "block")
-    alias = _alias_context(payload, decision, headers)
-    if alias is not None:
-        from .alias_router import alias_candidates as _alias_candidates
-        _c0 = _alias_candidates(alias)
-        if not _c0:
-            raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503)
-        _c = _c0[0]
-        prov = cfg.get(_c["provider"]) or find_provider(_c["provider"])
-        if prov is None:
-            raise RoutingError(f"alias {alias['name']}: unknown provider {_c['provider']}", 503)
-        model = _c["model"]
-        _alias_ctx_start(alias["name"])
-        from .alias_router import ctx_set_current as _alias_setcur
-        _alias_setcur(prov.name, model, prov.local)
-        _alias_next = _c["idx"] + 1
+    _ar = _alias_resolve(payload, decision, headers)
+    if _ar is not None:
+        prov, model, alias, _idx0 = _ar
+        _alias_next = _idx0 + 1
     else:
+        alias = None
         prov, model, _ = resolve(decision, payload, headers, kind="chat")
 
     # 凭据解析必须在 prov 定了之后：网关回落是 **per-provider** 的。原实现恒取
@@ -826,7 +813,8 @@ async def route_chat_stream(
     _alias_ctx_start(alias["name"])
     cands = alias_candidates(alias)
     if not cands:
-        raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503)
+        raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503,
+                               provider=alias["name"])
     last_exc: RoutingError | None = None
     cfg = load_routing()
     ukey = upstream_key(headers)
@@ -982,7 +970,8 @@ async def route_messages(
         _alias_ctx_start(alias["name"])
         cands = alias_candidates(alias)
         if not cands:
-            raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503)
+            raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503,
+                               provider=alias["name"])
         last_exc: RoutingError | None = None
         for cand in cands:
             pcfg = cfg.get(cand["provider"]) or find_provider(cand["provider"])
@@ -1096,7 +1085,8 @@ async def route_messages_stream(
     _alias_ctx_start(alias["name"])
     cands = alias_candidates(alias)
     if not cands:
-        raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503)
+        raise RoutingError(f"alias {alias['name']}: no available candidate (circuit open)", 503,
+                               provider=alias["name"])
     last_exc: RoutingError | None = None
     cfg = load_routing()
     ukey = upstream_key(headers)
@@ -1235,7 +1225,7 @@ async def route_responses(
     cfg = load_routing()
     _ar = _alias_resolve(body, decision, headers)
     if _ar is not None:
-        prov, model, _alias = _ar
+        prov, model, _alias, _idx = _ar
     else:
         prov, model, _ = resolve(decision, {"model": str(body.get("model") or "")}, headers, kind="chat")
     ukey = upstream_key(headers, prov=prov)
@@ -1352,7 +1342,7 @@ async def route_responses_stream(
     cfg = load_routing()
     _ar = _alias_resolve(body, decision, headers)
     if _ar is not None:
-        prov, model, _alias = _ar
+        prov, model, _alias, _idx = _ar
     else:
         prov, model, _ = resolve(decision, {"model": str(body.get("model") or "")}, headers, kind="chat")
     ukey = upstream_key(headers, prov=prov)

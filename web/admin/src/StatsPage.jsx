@@ -1,48 +1,30 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import {
-  Table, Button, Tag, Space, message, Card, Statistic, Select,
-  Popconfirm, Alert, Tooltip, Typography, Row, Col,
-} from 'antd';
+import { createPortal } from 'react-dom';
+import { Button, Space, message, Card, Statistic, Select, Popconfirm, Alert, Tooltip, Typography, Row, Col, Spin } from 'antd';
 import { ReloadOutlined, DeleteOutlined } from '@ant-design/icons';
 import { ruleZh } from './ruleNames.jsx';
+import MetricsSection from './components/MetricsSection.jsx';
+import { api, errText, RANGES } from './api.js';
 
 const { Text } = Typography;
 
-const api = async (path, opts = {}) => {
-  const r = await fetch(`/admin/api${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
-  if (r.status === 401 || r.status === 302) {
-    window.location.href = '/admin/login?next=/admin/app';
-    throw new Error('未登录');
-  }
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail) || `HTTP ${r.status}`);
-  return body;
-};
-
-const apiAbs = async (path, opts = {}) => {
-  const r = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
-  if (r.status === 401 || r.status === 302) {
-    window.location.href = '/admin/login?next=/admin/app';
-    throw new Error('未登录');
-  }
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail) || `HTTP ${r.status}`);
-  return body;
+// 规则展示名：request_log.blocked_reason 带 l1:/l2:[scope:] 前缀，ruleZh 表无前缀键
+const ruleLabel = (r) => {
+  if (!r || r === '(unknown)') return '放行（无规则命中）';
+  const m2 = String(r).match(/^l2:[^:]+:(.+)$/);
+  if (m2) return `L2 判定：${m2[1]}`;
+  return ruleZh(String(r).replace(/^l1:/, '').replace(/^l2:/, ''));
 };
 
 // 环形图（占比，中间显示总量）
 const DONUT_COLORS = ['#1677ff', '#52c41a', '#faad14', '#ff4d4f', '#722ed1',
   '#13c2c2', '#eb2f96', '#fa8c16', '#2f54eb', '#a0d911'];
 
-function DonutChart({ items, labelKey, testid }) {
+// fmt：数值格式化（金额传 v => `¥${v.toFixed(2)}`；缺省原样显示）
+function DonutChart({ items, labelKey, testid, fmt }) {
   if (!items || !items.length) return <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Text type="secondary">暂无数据</Text></div>;
   const total = items.reduce((s, x) => s + (x.count || 0), 0) || 1;
+  const f = fmt || ((v) => String(v));
   const R = 70, C = 2 * Math.PI * R;
   let acc = 0;
   const segs = items.map((x, i) => {
@@ -64,18 +46,64 @@ function DonutChart({ items, labelKey, testid }) {
             <title>{`${s.label}：${s.count}（${(s.f * 100).toFixed(1)}%）`}</title>
           </circle>
         ))}
-        <text x="90" y="86" textAnchor="middle" fontSize="22" fontWeight="700">{total}</text>
+        <text x="90" y="86" textAnchor="middle" fontSize="22" fontWeight="700">{f(total)}</text>
         <text x="90" y="106" textAnchor="middle" fontSize="12" fill="#999">总量</text>
       </svg>
       <div style={{ flex: 1, minWidth: 200, height: 180, overflowY: 'auto' }}>
         {segs.map((s) => (
           <div key={String(s.label)} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, fontSize: 12 }}>
             <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color }} />
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={s.label}>{s.label || '—'}</span>
-            <Text type="secondary" style={{ fontSize: 12 }}>{s.count}（{(s.f * 100).toFixed(1)}%）</Text>
+            <span style={{ flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={s.label}>{s.label || '—'}</span>
+            <Text type="secondary" style={{ fontSize: 12 }}>{f(s.count)}（{(s.f * 100).toFixed(1)}%）</Text>
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// 按天计费竖向柱状图（北京日 × 金额，仅已定价行，与 daily_total 同口径）
+function BillDailyBars({ daily }) {
+  if (!daily || !daily.length) return <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Text type="secondary">暂无数据</Text></div>;
+  const byDay = {};
+  daily.forEach((r) => { byDay[r.day] = (byDay[r.day] || 0) + (r.cost || 0); });
+  const days = Object.keys(byDay).sort();
+  const vals = days.map((d) => byDay[d]);
+  const W = 900, H = 220, padL = 48, padR = 10, padT = 24, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxV = Math.max(0.0001, ...vals);
+  const slot = plotW / days.length;
+  const bw = Math.min(42, slot * 0.7);
+  const step = Math.ceil(days.length / 15);
+  const y = (v) => padT + plotH * (1 - v / maxV);
+  return (
+    <div style={{ overflowX: 'auto' }}>
+    <svg data-testid="billing-daily-bars" viewBox={`0 0 ${W} ${H}`}
+      style={{ display: 'block', width: '100%', minWidth: days.length > 10 ? days.length * 38 : undefined }}>
+      {[0, 0.5, 1].map((g) => (
+        <g key={g}>
+          <line x1={padL} x2={W - padR} y1={y(maxV * g)} y2={y(maxV * g)} stroke="#f0f0f0" />
+          <text x={padL - 6} y={y(maxV * g) + 4} textAnchor="end" fontSize="10" fill="#999">¥{(maxV * g).toFixed(maxV < 1 ? 2 : 0)}</text>
+        </g>
+      ))}
+      {days.map((d, i) => {
+        const v = vals[i];
+        const x = padL + slot * i + (slot - bw) / 2;
+        return (
+          <g key={d}>
+            <rect x={x} y={y(v)} width={bw} height={Math.max(padT + plotH - y(v), v > 0 ? 2 : 0)} fill="#1677ff" rx="2">
+              <title>{`${d}：¥${v.toFixed(4)}`}</title>
+            </rect>
+            {days.length <= 16 && v > 0 && (
+              <text x={x + bw / 2} y={y(v) - 4} textAnchor="middle" fontSize="10" fill="#666">¥{v.toFixed(v < 1 ? 2 : 0)}</text>
+            )}
+            {i % step === 0 && (
+              <text x={x + bw / 2} y={H - padB + 15} textAnchor="middle" fontSize="10" fill="#999">{d.slice(5)}</text>
+            )}
+          </g>
+        );
+      })}
+    </svg>
     </div>
   );
 }
@@ -113,14 +141,6 @@ function TrendBars({ slots, counts, routes, blocks }) {
     </svg>
   );
 }
-
-const errText = (e) => (Array.isArray(e) ? e.map(x => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ') : String(e.message || e));
-
-const RANGES = [
-  { hours: 24, label: '最近 24 小时' },
-  { hours: 168, label: '最近 7 天' },
-  { hours: 720, label: '最近 30 天' },
-];
 
 // 建议卡片标题：明示「规则 1/2/3 用面板窗口、KEY 分级另用独立窗口」这个双窗口事实
 // （2026-09-16 B 案：触发口径改为「异常处置 = 拦截 ∪ 本地路由」）。
@@ -177,26 +197,54 @@ function KeyModelDonut({ rows }) {
 export default function StatsPage() {
   const [hours, setHours] = useState(168);
   const [ov, setOv] = useState(null);
-  const [ana, setAna] = useState(null);
+  const [ts, setTs] = useState(null);
+  const [provTop, setProvTop] = useState([]);
+  const [ruleTop, setRuleTop] = useState([]);
   const [loading, setLoading] = useState(false);
   const [keyModels, setKeyModels] = useState([]);
   const [keyCalls, setKeyCalls] = useState([]);
+  const [billing, setBilling] = useState(null);
+  // 影子（laya）汇总：独立数据源（审计热缓存），失败不拖累主统计
+  const [shadow, setShadow] = useState(null);
 
+  // 单一数据源 request_log：KPI 卡 / 趋势 / Top 榜同窗口同口径，页面数字不再打架
+  // 单端点 /stats/summary 单遍聚合（后端 7 端点合并，口径与各自端点逐字段一致）
   const loadAll = useCallback(async (h = hours) => {
     setLoading(true);
     try {
-      const [o, a, m, k] = await Promise.all([
-        api(`/stats/overview?hours=${h}`),
-        apiAbs(`/admin/analytics/data?limit=5000&since=${encodeURIComponent(new Date(Date.now() - h * 3600 * 1000).toISOString())}`),
-        api(`/stats/key-model?hours=${h}&top=20`),
-        api(`/stats/group?dim=key_name&hours=${h}`),
-      ]);
-      setOv(o); setAna(a); setKeyModels(m.items || []); setKeyCalls(k.items || []);
+      const d = await api(`/stats/summary?hours=${h}&top=20`);
+      const [o, m, k, t, pg, rg, b] = [
+        d.overview,
+        { items: d.key_model },
+        { items: d.group_key_name },
+        d.timeseries,
+        { items: d.group_provider },
+        { items: d.group_rule },
+        d.billing,
+      ];
+      setOv(o);
+      setTs(t || { slots: [], counts: [], routes: [], blocks: [] });
+      setProvTop((pg.items || []).slice(0, 8).map((g) => ({ label: g.label, count: g.calls })));
+      setRuleTop((rg.items || []).slice(0, 10).map((g) => ({ label: ruleLabel(g.label), count: g.calls })));
+      setKeyModels(m.items || []); setKeyCalls(k.items || []); setBilling(b);
     } catch (e) { message.error(errText(e)); }
     finally { setLoading(false); }
+    try {
+      setShadow(await api(`/l2-shadow-stats?hours=${h}`));
+    } catch (e) { setShadow(null); }
   }, [hours]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
+
+  // KEY × 金额占比环图数据（仅已定价金额>0 的 KEY，降序）
+  const billKeyCosts = (() => {
+    const byKey = {};
+    (billing?.items || []).forEach((it) => { byKey[it.key] = (byKey[it.key] || 0) + it.cost; });
+    return Object.entries(byKey).filter(([, c]) => c > 0)
+      .map(([label, count]) => ({ label, count: Math.round(count * 10000) / 10000 }))
+      .sort((a, b) => b.count - a.count);
+  })();
+
 
 
 
@@ -218,15 +266,22 @@ export default function StatsPage() {
 
   return (
     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-      <Space size="middle" wrap>
-        <Select value={hours} onChange={(v) => setHours(v)} style={{ width: 150 }}
-          options={RANGES.map(r => ({ value: r.hours, label: r.label }))} />
-        <Button icon={<ReloadOutlined />} onClick={() => loadAll()} loading={loading}>刷新</Button>
-        <Popconfirm title="清理 90 天前的明细？" onConfirm={cleanup}>
-          <Button icon={<DeleteOutlined />}>清理过期明细</Button>
-        </Popconfirm>
-      </Space>
+      {/* 工具栏：Portal 进标题右侧（#page-toolbar-slot），标题栏本就常驻，无需吸顶；切页卸载自动清空 */}
+      {typeof document !== 'undefined' && document.getElementById('page-toolbar-slot')
+        ? createPortal((
+          <Space size="middle">
+            <Select size="small" value={hours} onChange={(v) => setHours(v)} style={{ width: 130 }}
+              options={RANGES.map(r => ({ value: r.hours, label: r.label }))} />
+            <Button size="small" icon={<ReloadOutlined />} onClick={() => loadAll()} loading={loading}>刷新</Button>
+            <Popconfirm title="清理 90 天前的明细？" onConfirm={cleanup}>
+              <Button size="small" icon={<DeleteOutlined />}>清理过期明细</Button>
+            </Popconfirm>
+          </Space>
+        ), document.getElementById('page-toolbar-slot'))
+        : null}
 
+      <Spin spinning={loading || !ov} tip="加载中…" size="large">
+      <div style={{ width: '100%' }}>
       <Row gutter={[12, 12]}>
         <Col flex={1}>
           <Card data-testid="stats-ov-total" styles={{ body: { padding: '12px 16px', height: 104 } }}>
@@ -248,7 +303,7 @@ export default function StatsPage() {
         </Col>
         <Col flex={1}>
           <Card data-testid="stats-ov-avgms" styles={{ body: { padding: '12px 16px', height: 104 } }}>
-            <Statistic title={<Tooltip title="口径：request_log.duration_ms 均值，端到端总耗时（含上游生成）；网关自身耗时看观测页 P50/P95/P99">平均总耗时</Tooltip>}
+            <Statistic title={<Tooltip title="口径：request_log.duration_ms 均值，端到端总耗时（含上游生成）；网关自身耗时看下方运行指标 P50/P95/P99">平均总耗时</Tooltip>}
               value={ov ? ov.avg_ms : '-'} suffix="ms" valueStyle={{ fontSize: 24 }} />
           </Card>
         </Col>
@@ -259,24 +314,24 @@ export default function StatsPage() {
         </Col>
       </Row>
 
-      {ana && (
+      {ov && (
         <>
-          <Card title="时间趋势（蓝=放行 橙=本地路由 红=拦截）"
+          <Card title="时间趋势（蓝=放行 橙=本地路由 红=拦截）" style={{ marginTop: 12 }}
             extra={<Text type="secondary" style={{ fontSize: 12 }}>
-              本窗口 {ana.c_allow} 放行 / {ana.c_route} 本地路由 / {ana.c_block} 拦截（含 403）
+              本窗口 {ov.total - ov.blocked - ov.local_routed} 放行 / {ov.local_routed} 本地路由 / {ov.blocked} 拦截
             </Text>}>
-            <TrendBars slots={ana.time_slots} counts={ana.time_counts} routes={ana.time_route} blocks={ana.time_block} />
+            <TrendBars slots={ts.slots} counts={ts.counts} routes={ts.routes} blocks={ts.blocks} />
           </Card>
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'stretch' }}>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'stretch', marginTop: 12 }}>
             <Card title="Provider Top8"
               style={{ minWidth: 380, flex: 1, display: 'flex', flexDirection: 'column' }}
               styles={{ body: { flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' } }}>
-              <DonutChart items={ana.provider_top} labelKey="provider" />
+              <DonutChart items={provTop} labelKey="label" />
             </Card>
             <Card title="规则 Top10"
               style={{ minWidth: 380, flex: 1, display: 'flex', flexDirection: 'column' }}
               styles={{ body: { flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' } }}>
-              <DonutChart items={(ana.rule_top || []).map((x) => ({ ...x, rule: ruleZh(x.rule) }))} labelKey="rule" />
+              <DonutChart items={ruleTop} labelKey="label" />
             </Card>
             <Card data-testid="stats-keymodel-card" title="KEY × 模型 Token 占比"
               style={{ minWidth: 380, flex: 1, display: 'flex', flexDirection: 'column' }}
@@ -289,8 +344,62 @@ export default function StatsPage() {
               <KeyActionDonut rows={keyCalls} />
             </Card>
           </div>
+          <MetricsSection hours={hours} />
+          <Card title="影子（laya）汇总" style={{ marginTop: 12 }}
+            extra={<Text type="secondary" style={{ fontSize: 12 }}>
+              数据源审计热缓存（近 5000 条）；只有进 L2 的灰区流量才有影子
+            </Text>}>
+            {!shadow || !shadow.shadowed ? (
+              <Alert type="info" showIcon
+                message="本窗口暂无影子数据（影子只在进 L2 的灰区流量上产生；backend=laya 时影子自动停）" />
+            ) : (
+              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+                <Space size="large" wrap>
+                  <Statistic title={<Tooltip title="口径：主影 label 相同 / 可比条数（主判定降级的兜底项不计入）">主影一致率</Tooltip>}
+                    value={shadow.agree_rate == null ? '-' : (shadow.agree_rate * 100).toFixed(1)} suffix="%"
+                    valueStyle={{ fontSize: 24 }} />
+                  <Statistic title="影子样本" value={`${shadow.agree}/${shadow.compared}`}
+                    valueStyle={{ fontSize: 24 }} />
+                  <Statistic title={<Tooltip title="口径：有影子打标 / 进 L2 的条数">影子覆盖率</Tooltip>}
+                    value={shadow.l2_total ? (shadow.shadowed / shadow.l2_total * 100).toFixed(1) : '-'} suffix="%"
+                    valueStyle={{ fontSize: 24 }} />
+                  <Statistic title="影子失败" value={shadow.shadow_degraded} valueStyle={{ fontSize: 24 }} />
+                </Space>
+                <div style={{ flex: 1, minWidth: 380 }}>
+                  <DonutChart
+                    items={[
+                      { label: '主密·影密', count: shadow.cells.cc, color: '#52c41a' },
+                      { label: '主放·影放', count: shadow.cells.nn, color: '#1677ff' },
+                      { label: '主密·影放（影子漏报嫌疑）', count: shadow.cells.cn, color: '#faad14' },
+                      { label: '主放·影密（影子误报嫌疑）', count: shadow.cells.nc, color: '#ff4d4f' },
+                    ]}
+                    labelKey="label" testid="shadow-cells-donut" />
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    主判定降级 {shadow.main_degraded} 条未计入一致率；影子样本主判定平均延迟 {shadow.avg_main_latency_ms ?? '?'}ms
+                  </Text>
+                </div>
+              </div>
+            )}
+          </Card>
+          <Card title={`Token 计费${billing ? `（合计 ¥${billing.total_cost}）` : ''}`} style={{ marginTop: 12 }}
+            extra={<Text type="secondary" style={{ fontSize: 12 }}>内部分摊口径≠上游账单；缓存单价未配按全价（高估）；上游不回用量记0（少计）</Text>}>
+            <div style={{ marginBottom: 12, display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+              <div style={{ flex: '0 0 420px' }}>
+                <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>KEY × 金额占比（仅已定价）</Text>
+                {billKeyCosts.length
+                  ? <DonutChart items={billKeyCosts} labelKey="label" testid="billing-key-donut" fmt={(v) => `¥${v.toFixed(2)}`} />
+                  : <Text type="secondary" style={{ fontSize: 12 }}>本窗口暂无计费金额（全部未定价或无调用）</Text>}
+              </div>
+              <div style={{ flex: 1, minWidth: 380 }}>
+                <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>每日金额（北京时间，仅已定价）</Text>
+                <BillDailyBars daily={billing ? billing.daily : []} />
+              </div>
+            </div>
+          </Card>
         </>
       )}
+      </div>
+      </Spin>
 
     </Space>
   );

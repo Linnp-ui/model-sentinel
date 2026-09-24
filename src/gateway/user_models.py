@@ -51,7 +51,6 @@ class UserModel:
     default_model: str = ""
     owner: str = "anonymous"
     created_at: float = field(default_factory=time.time)
-
     def to_provider(self) -> Provider:
         return Provider(
             name=self.name,
@@ -86,7 +85,6 @@ class UserModelStore:
         if url:
             try:
                 import redis  # type: ignore
-
                 self._redis = redis.from_url(url, decode_responses=True)
                 self._load_from_redis()
             except Exception:

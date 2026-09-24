@@ -145,33 +145,3 @@ def responses_should_mark(rule_name: str | None, action: str | None,
         return True
     return rule_name in _FILE_MARK_RULES
 
-
-# ---------------------------------------------------------------------------
-# PATCH \u8bf4\u660e\uff08wb \u5728 main.py / file_inspector.py \u843d\uff0c\u4e0d\u52a8\u5176\u4ed6\u903b\u8f91\uff09
-#
-# Hunk 1 -- main._review_text \u589e\u53ef\u9009\u53c2\u6570\uff08\u517c\u5bb9 chat/messages \u8001\u8c03\u7528\uff09\u003a
-#   async def _review_text(text, request=None, extra_findings=None,
-#                          l2_text=None, l2_chunks=None, file_ctx=None):
-#       ...
-#       _file = {"ext": "", "filename": "", "headers": [], "sheet_names": [], "text": ""}
-#       if file_ctx:
-#           for _k in ("ext", "filename"):
-#               if file_ctx.get(_k):
-#                   _file[_k] = file_ctx[_k]
-#           for _k in ("headers", "sheet_names"):
-#               if file_ctx.get(_k):
-#                   _file[_k] = list(file_ctx[_k])
-#       ctx = {"text": text, "file": _file, "findings": text_findings,
-#              "session": {"confidential": session_conf}}
-#
-# Hunk 2 -- main.responses_api\uff0cinline \u626b\u63cf\u540e\u63a5\u7ebf\u003a
-#   from .responses_filectx import extract_responses_filectx
-#   ...
-#   file_ctx = extract_responses_filectx(body)
-#   decision, text_findings, l2_result = await _review_text(
-#       text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-#       l2_chunks=l2_blocks, file_ctx=file_ctx)
-#
-# \u9a8c\u6536\uff1atest_responses_path_gap_financial_needs_file_ctx \u6539\u4e3a\u4f20 file_ctx
-# \u5373\u7eff\uff1bpolicy_rules \u6a21\u5757 11 \u4e2a\u5168\u7eff\u540e\u8ddf\u7740\u90e8\u7f72\u9a8c\u6536\u3002
-# ---------------------------------------------------------------------------

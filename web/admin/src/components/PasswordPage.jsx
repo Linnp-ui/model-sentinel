@@ -1,19 +1,8 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Statistic, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
+import React, { useEffect, useState } from 'react';
+import { Button, Input, Form, message, Alert, Card } from 'antd';
+import { LockOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';
 
-const { Text } = Typography;
 // ---------------- 1.4 管理员密码 ----------------
 export default function PasswordPage() {
   const [form] = Form.useForm();

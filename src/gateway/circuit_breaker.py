@@ -23,14 +23,11 @@ class CircuitBreaker:
 
     Thread-safe. Lock granularity: one lock per provider (dict of locks).
     """
-
     STATE_CLOSED = "closed"
     STATE_OPEN = "open"
     STATE_HALF_OPEN = "half_open"
-
     _instance: Optional["CircuitBreaker"] = None
     _instance_lock = threading.Lock()
-
     def __new__(cls):
         with cls._instance_lock:
             if cls._instance is None:
@@ -44,8 +41,6 @@ class CircuitBreaker:
         self._states: Dict[str, dict] = {}
         # failure timestamps (deque) for sliding window
         self._failures: Dict[str, deque] = {}
-        # half-open success counter
-        self._half_open_successes: Dict[str, int] = {}
         # snapshot for /admin
         self._snapshot_lock = threading.Lock()
 
@@ -186,19 +181,9 @@ class CircuitBreaker:
             if provider:
                 self._states.pop(provider, None)
                 self._failures.pop(provider, None)
-                self._half_open_successes.pop(provider, None)
             else:
                 self._states.clear()
                 self._failures.clear()
-                self._half_open_successes.clear()
-
-
-class CircuitOpenError(Exception):
-    """Raised when the circuit for a provider is OPEN and recovery cooldown is not yet elapsed."""
-    def __init__(self, provider: str, retry_after: float = 0.0):
-        self.provider = provider
-        self.retry_after = retry_after
-        super().__init__(f"circuit open for {provider} (retry after {retry_after:.1f}s)")
 
 
 def get_breaker() -> CircuitBreaker:

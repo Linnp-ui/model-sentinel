@@ -9,6 +9,14 @@ export default defineConfig({
   build: {
     outDir: '../../static/admin',
     emptyOutDir: true,
+    // vendor 单独分包：react/antd 不随业务代码变 hash，跨版本浏览器缓存命中
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom', 'antd', '@ant-design/icons'],
+        },
+      },
+    },
   },
   server: {
     port: 5175,

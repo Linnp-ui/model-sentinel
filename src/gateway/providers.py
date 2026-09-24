@@ -28,8 +28,6 @@ DEFAULT_ROUTING_FILE = Path(
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 
-_PROVIDER_FIELDS = set()
-
 
 def _expand_env(value: Any) -> Any:
     """递归展开字符串里的 ${VAR} / ${VAR:default}"""

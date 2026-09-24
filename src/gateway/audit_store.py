@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
+from urllib.parse import urlsplit
 
 try:
     import redis
@@ -33,26 +34,15 @@ MYSQL_RETRY_INTERVAL = 60.0  # seconds, auto-recover MySQL after 3 failures
 
 
 def _parse_mysql_url(url: str) -> Optional[dict]:
-    """mysql://user:pass@host:port/db or mysql+pymysql://..."""
+    """mysql://user:pass@host:port/db or mysql+pymysql://...（必须带 user:pass）"""
     if not url:
         return None
-    url = url.strip()
-    for prefix in ("mysql+pymysql://", "mysql://"):
-        if url.startswith(prefix):
-            url = url[len(prefix):]
-            break
-    else:
+    u = urlsplit(url.strip())
+    if u.scheme not in ("mysql", "mysql+pymysql") or not u.hostname or not u.username:
         return None
-    if "@" not in url or "/" not in url:
-        return None
-    creds, rest = url.split("@", 1)
-    user, password = creds.split(":", 1) if ":" in creds else (creds, "")
-    host_db = rest.split("/", 1)
-    host_port = host_db[0].split(":")
-    host = host_port[0]
-    port = int(host_port[1]) if len(host_port) > 1 else 3306
-    db = host_db[1].split("?")[0] if len(host_db) > 1 else ""
-    return {"host": host, "port": port, "user": user, "password": password, "database": db}
+    return {"host": u.hostname, "port": u.port or 3306,
+            "user": u.username, "password": u.password or "",
+            "database": (u.path or "").lstrip("/").split("?")[0]}
 
 
 class _MySQLWriter:
@@ -64,9 +54,11 @@ class _MySQLWriter:
         self._stop = threading.Event()
         self._disabled = False
         self._disabled_since: Optional[float] = None
-        self._err_count: int = 0
+        self._err_count = 0
         self._thread: Optional[threading.Thread] = None
         self._last_error: Optional[str] = None
+        self._has_l2 = False  # audit_logs.l2 列存在性（l2/影子 JSON 落库，见 _ensure_l2_column）
+        self._l2_ensure_ts = 0.0
         self._start()
 
     def _start(self):
@@ -105,6 +97,33 @@ class _MySQLWriter:
             autocommit=False,
         )
 
+    def _ensure_l2_column(self) -> None:
+        """audit_logs.l2 列自检：缺则 ALTER 补上（MySQL 无 ADD COLUMN IF NOT EXISTS）。
+
+        l2（主判 + 影子 shadow_*）此前只落 Redis 热缓存（5000 条 ≈2 天），超窗即丢，
+        影子统计/训练原料无从回看。60s 节流重试；失败保持 _has_l2=False 继续按
+        无 l2 列写（fail-open，不拖垮主写入）。"""
+        now = time.time()
+        if self._has_l2 or now - self._l2_ensure_ts < 60:
+            return
+        self._l2_ensure_ts = now
+        try:
+            conn = self._connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='audit_logs' AND COLUMN_NAME='l2'",
+                        (self.cfg["database"],))
+                    if not cur.fetchone()[0]:
+                        cur.execute("ALTER TABLE audit_logs ADD COLUMN l2 MEDIUMTEXT NULL")
+                        conn.commit()
+            finally:
+                conn.close()
+            self._has_l2 = True
+        except Exception:
+            self._has_l2 = False
+
     def _run(self):
         while not self._stop.is_set():
             batch: list[dict] = []
@@ -136,6 +155,7 @@ class _MySQLWriter:
     def _flush(self, batch: list[dict]) -> None:
         if not batch:
             return
+        self._ensure_l2_column()
         conn = None
         try:
             conn = self._connect()
@@ -181,7 +201,7 @@ class _MySQLWriter:
             _risk = entry.get("risk_score")
             if _risk is not None:
                 _risk = int(_risk)
-            return (
+            row = (
                 ts,
                 str(entry.get("id") or "")[:32],
                 str(entry.get("type") or "")[:16],
@@ -201,6 +221,11 @@ class _MySQLWriter:
                 str(entry.get("filename") or "")[:255] or None,
                 _risk,
             )
+            if self._has_l2:  # 必须与 _insert_sql 同条件，否则列值数不配（1136 整批失败）
+                row = row + (
+                    json.dumps(entry.get("l2"), ensure_ascii=False)
+                    if isinstance(entry.get("l2"), dict) else None,)
+            return row
         except Exception:
             return None
 
@@ -209,13 +234,15 @@ class _MySQLWriter:
         # 护栏：tests/test_audit_key_column.py::test_mysql_writer_column_order_matches_row_values
         # （历史 bug：requested_model 排在第 14 位，而 SQL 里在第 8 位，导致
         #  layer='L1' 落进 local_flag 列，MySQL 报 1366 整行插入失败）
-        return (
-            "INSERT INTO audit_logs "
-            "(ts, req_id, type, action, rule, provider, model, requested_model, local_flag, layer, "
-            " downgraded_from, override_denied, text_preview, findings_json, "
-            " client_ip, token_masked, filename, risk_score) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
-        )
+        cols = ("ts, req_id, type, action, rule, provider, model, requested_model, local_flag, layer, "
+                "downgraded_from, override_denied, text_preview, findings_json, "
+                "client_ip, token_masked, filename, risk_score")
+        n = 18
+        if self._has_l2:
+            cols += ", l2"
+            n = 19
+        return (f"INSERT INTO audit_logs ({cols}) "
+                f"VALUES ({','.join(['%s'] * n)})")
 
     def shutdown(self):
         self._stop.set()
@@ -235,11 +262,6 @@ class _MySQLWriter:
             "cfg": {"host": self.cfg["host"], "port": self.cfg["port"], "database": self.cfg["database"]},
         }
 
-    def reset(self) -> None:
-        self._disabled = False
-        self._disabled_since = None
-        self._err_count = 0
-        self._last_error = None
 
     @staticmethod
     def query(cfg: dict, since: Optional[datetime] = None, until: Optional[datetime] = None,
@@ -285,6 +307,11 @@ class _MySQLWriter:
                 if isinstance(r.get("findings_json"), str):
                     try:
                         r["findings_json"] = json.loads(r["findings_json"])
+                    except Exception:
+                        pass
+                if isinstance(r.get("l2"), str):
+                    try:
+                        r["l2"] = json.loads(r["l2"])
                     except Exception:
                         pass
             # Return oldest-first for CSV/log order
@@ -514,19 +541,6 @@ class AuditStore:
             return -1
         return _MySQLWriter.cleanup_old(self._mysql_cfg, days)
 
-    def reset(self) -> dict:
-        if self._r_disabled:
-            self._r_disabled = False
-            self._r_disabled_since = None
-            self._try_connect_redis()
-        if self._mysql_writer is not None:
-            self._mysql_writer.reset()
-        elif self._mysql_cfg is not None:
-            try:
-                self._mysql_writer = _MySQLWriter(self._mysql_cfg)
-            except Exception:
-                pass
-        return {"backend": self.backend(), "mysql": self.mysql_status(), "redis": {"connected": self._r is not None, "url": self._r_url}}
 
 
 _store: Optional[AuditStore] = None

@@ -1,20 +1,10 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Statistic, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, Slider, Checkbox, Tooltip, Row, Col } from 'antd';
+import { ReloadOutlined, RobotOutlined, ExperimentOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';
 
 const { Text } = Typography;
-import { ruleZh, RULE_ZH } from '../ruleNames.jsx';
+import { ruleZh } from '../ruleNames.jsx';
 import { L2PromptsSection } from './ModelPolicyPage.jsx';
 // ---------------- 5.1/5.2/5.3 规则管理 ----------------
 // ---------------- L2 拦截配置（scope 两档 + 判密阈值；持久化 model_policy.yaml，热重载生效） ----------------
@@ -59,7 +49,10 @@ function L2RulesCard() {
   return (
     <Card title="L2 拦截配置">
       <div style={{ marginBottom: 12 }}>
-        <Text strong style={{ display: 'block', marginBottom: 16 }}>判定档（命中 CONFIDENTIAL → 本地路由拦截）</Text>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <Text strong>判定档（命中 CONFIDENTIAL → 本地路由拦截）</Text>
+          <Button type="primary" loading={saving} data-testid="l2rules-save" onClick={save}>保存</Button>
+        </div>
         <Space wrap>
           {L2_SCOPE_META.map((m) => (
             <Tooltip key={m.key} title={m.tip}>
@@ -76,9 +69,6 @@ function L2RulesCard() {
         <Slider style={{ width: 220 }} min={0} max={1} step={0.05}
           value={rm.threshold} onChange={(v) => setRm((c) => ({ ...c, threshold: v }))} />
       </Space>
-      <div style={{ margin: '8px 0 16px' }}>
-        <Button type="primary" loading={saving} data-testid="l2rules-save" onClick={save}>保存</Button>
-      </div>
       <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid #f0f0f0' }}>
         <L2PromptsSection />
       </div>
@@ -265,10 +255,10 @@ export default function RulesPage() {
 
   const cols = [
     { title: '优先级', dataIndex: 'priority', width: 80, sorter: (a, b) => a.priority - b.priority },
-    { title: '名称', dataIndex: 'name', render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
+    { title: '名称', dataIndex: 'name', width: 190, ellipsis: true, render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
     { title: '动作', dataIndex: 'action', width: 110,
       render: (v) => <Tag color={v === 'block' ? 'red' : v === 'route_local' ? 'orange' : 'green'}>{v}</Tag> },
-    { title: '条件', dataIndex: 'when', ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
+    { title: '条件', dataIndex: 'when', width: 450, ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
     { title: '说明', dataIndex: 'description', ellipsis: true },
     { title: '操作', width: 150,
       render: (_, rec) => (
@@ -298,9 +288,9 @@ export default function RulesPage() {
 
       <Row gutter={[12, 12]}>
         <Col span={12}>
-          <Card title="L1 规则测试">
+          <Card title="L1 规则测试" style={{ height: '100%' }}>
             <Space direction="vertical" style={{ width: '100%' }}>
-              <Input.TextArea id="l1test-text" rows={2} placeholder="模拟提示词内容…" />
+              <Input.TextArea id="l1test-text" rows={3} placeholder="模拟提示词内容…" />
               <Space wrap>
                 <Input id="l1test-filename" style={{ width: 200 }} placeholder="模拟文件名（可选）" />
                 <Input id="l1test-size" style={{ width: 130 }} placeholder="文件大小(bytes，可选)" />
@@ -316,7 +306,7 @@ export default function RulesPage() {
           </Card>
         </Col>
         <Col span={12}>
-          <Card title="L2 规则测试">
+          <Card title="L2 规则测试" style={{ height: '100%' }}>
             <Space direction="vertical" style={{ width: '100%' }}>
               <Input.TextArea rows={3} value={l2Input} onChange={(e) => setL2Input(e.target.value)}
                 placeholder="粘贴待识别内容，查看 L2 审查判定（label / confidence / reason）…" />

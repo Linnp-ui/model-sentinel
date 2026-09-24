@@ -1,0 +1,34 @@
+[Unit]
+Description=Laya multilingual decision model (L2 confidential classifier, port 8003, GPU 5)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user
+Environment=CUDA_VISIBLE_DEVICES=5
+# 2026-09-24 切到微调 v9（+文件名提及mention-only/正式中文镜像对；真实 23 条 19/23
+# 与 v8 同分错集不同：mention-only FN 修好（生产 codex Files-mentioned 真形态），
+# 代价是两条退化样本（重复样板/截断样板）回退；swap/长表/灰区回归探针 7/7 全过）。
+# 同日修服务渲染：空 文件名/Sheet/表头 字段不再渲染（空前缀把 v8 CAP 0.013 抬到
+# 0.96，灰区误报放大器）。回退链：v8 → v5 → v4 → 零样本 `.../laya/multilingual`
+Environment=LAYA_MODEL_PATH=/home/your-user/models/laya-finetuned-confidential-v9
+Environment=USE_TF=0
+# 运行时禁 huggingface_hub 外联（权重已本地，load 只读本地目录）
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ExecStart=/home/your-user/venvs/laya/bin/python /home/your-user/gateway/scripts/laya_l2_server.py
+
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+StandardOutput=append:/home/your-user/gateway/laya_l2.log
+StandardError=append:/home/your-user/gateway/laya_l2.log
+
+[Install]
+WantedBy=multi-user.target

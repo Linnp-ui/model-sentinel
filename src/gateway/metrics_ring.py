@@ -142,10 +142,10 @@ class Ring:
 
     async def probe_l2(self):
         from . import small_model
-        if not getattr(small_model, "SMALL_MODEL_ENABLED", True):
+        if not small_model.l2_enabled():
             self._l2_up = None
             return
-        u = urlsplit(small_model.SMALL_MODEL_URL)
+        u = urlsplit(small_model.l2_url())
         try:
             import httpx
             # 小模型在内网：必须绕过系统代理（与 small_model._get_client 对齐），

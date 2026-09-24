@@ -1,17 +1,7 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
-import { api, errText } from '../api.js';
+import React, { useEffect, useState, useCallback } from 'react';
+import { Table, Button, Input, Modal, Form, Tag, Space, message, Popconfirm, Typography, Alert } from 'antd';
+import { ImportOutlined, KeyOutlined, ReloadOutlined, CopyOutlined } from '@ant-design/icons';
+import { api, errText, copyText } from '../api.js';
 
 const { Text } = Typography;
 // ---------------- 4.2 API KEY 管理 ----------------
@@ -95,9 +85,9 @@ export default function KeysPage() {
 
 
   const cols = [
-    { title: '名称（人员）', dataIndex: 'name' },
-    { title: 'KEY', dataIndex: 'key_masked', render: (v) => <Text code>{v}</Text> },
-    { title: '备注', dataIndex: 'note', width: 400, ellipsis: true },
+    { title: '名称（人员）', dataIndex: 'name', width: 140, ellipsis: true },
+    { title: 'KEY', dataIndex: 'key_masked', width: 170, render: (v) => <Text code>{v}</Text> },
+    { title: '备注', dataIndex: 'note', width: 600, ellipsis: true },
     { title: '状态', dataIndex: 'disabled', width: 72, render: (v, rec) => (<Tag data-testid={`keys-status-${rec.id}`} color={v ? 'red' : 'green'}>{v ? '停用' : '启用'}</Tag>) },
     { title: '登记时间', dataIndex: 'created_at' },
     {
@@ -162,25 +152,7 @@ export default function KeysPage() {
                   e.stopPropagation();
                   const txt = genResult.key_plain;
                   if (!txt) { message.error('复制失败，无内容'); return; }
-                  const fail = () => message.error('复制失败，请手动选中复制');
-                  const done = () => message.success('已复制到剪贴板');
-                  if (navigator.clipboard) {
-                    navigator.clipboard.writeText(txt).then(done, fail);
-                  } else {
-                    try {
-                      const ta = document.createElement('textarea');
-                      ta.value = txt;
-                      ta.style.position = 'fixed';
-                      ta.style.left = '-9999px';
-                      ta.style.top = '-9999px';
-                      ta.style.opacity = '0';
-                      document.body.appendChild(ta);
-                      ta.select();
-                      const ok = document.execCommand('copy');
-                      document.body.removeChild(ta);
-                      if (ok) done(); else fail();
-                    } catch { fail(); }
-                  }
+                  copyText(txt, '已复制到剪贴板', '复制失败，请手动选中复制');
                 }}
               >
                 复制

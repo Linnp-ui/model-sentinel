@@ -4,7 +4,7 @@
 2 IP 黑白名单、3.x 请求明细落库。
 
 设计约束：
-- 双后端：DATABASE_URL 配置了 postgresql+psycopg:// 时用 Postgres（SQLAlchemy Core）；
+- 双后端：ADMIN_DB_URL/DATABASE_URL 配置了 mysql:// 时用 MySQL（SQLAlchemy Core）；
   未配置或连接失败时自动降级为线程安全的内存后端（本地开发/测试零依赖）。
 - 密码哈希用 hashlib.scrypt（stdlib），格式 scrypt$salt_hex$hash_hex，
   规避 passlib+bcrypt 4.x 的已知兼容问题。
@@ -29,10 +29,12 @@ from sqlalchemy import (
     Column,
     DateTime,
     Integer,
+    Index,
     MetaData,
     String,
     Table,
     Text,
+    case,
     create_engine,
     func,
     insert,
@@ -99,6 +101,11 @@ request_log = Table(
     Column("upstream_ms", Integer, nullable=False, default=0),
     Column("prompt_tokens", Integer, nullable=False, default=0),
     Column("completion_tokens", Integer, nullable=False, default=0),
+    Column("cached_tokens", Integer, nullable=False, default=0),
+    Column("cache_creation_tokens", Integer, nullable=False, default=0),
+    # ts 是时间窗查询/清理的唯一过滤列（P99 tick 每 10s、_log_rows、purge），
+    # 无索引 = 全表扫 + filesort（EXPLAIN type=ALL）
+    Index("idx_request_log_ts", "ts"),
 )
 
 
@@ -213,6 +220,20 @@ def _ts_beijing(ts) -> str:
         return s
 
 
+def _real_model_label(routes: dict, provider: str, model: str) -> str:
+    """实际模型标签（`provider/model`；别名按当前别名组主候选解析）。
+
+    stats_key_model 与 stats_billing 共用。别名按**当前**主候选解析，
+    历史改名会有小偏差（计费/占比口径声明，不修）。
+    """
+    m = (model or "").strip()
+    p = (provider or "").strip()
+    cands = ((routes or {}).get(m.lower()) or {}).get("candidates") or []
+    if cands:
+        return f"{cands[0]['provider']}/{cands[0]['model']}"
+    return f"{p}/{m}" if p else (m or "(unknown)")
+
+
 def _parse_ts(s):
     """Parse "YYYY-MM-DD HH:MM:SS" (or ISO/date) to datetime; None if unparseable."""
     if s is None:
@@ -236,7 +257,7 @@ def _parse_ts(s):
 
 
 class AdminStore:
-    """单例存储。backend: 'postgres' | 'memory'。"""
+    """单例存储。backend: 'mysql' | 'memory'。"""
 
     _instance = None
     _lock = threading.Lock()
@@ -273,6 +294,8 @@ class AdminStore:
         self._ops_seq = 1
         self._entry_cache: dict[str, tuple[float, int, tuple]] = {}  # P1: key -> (ts, ver, entry)
         self._entry_ver: int = 0
+        self._window_cache: Optional[tuple] = None  # (key, ts, raw_rows) 时间窗拉取去重
+        self._window_lock = threading.Lock()
         self._try_connect()
 
     def _try_connect(self):
@@ -280,23 +303,18 @@ class AdminStore:
         url = (os.getenv("ADMIN_DB_URL", "") or os.getenv("DATABASE_URL", "") or "").strip()
         if not url:
             return
-        if url.startswith("postgresql+psycopg://"):
-            pass  # psycopg3 async/sync 均可，SQLAlchemy 走 sync
-        elif url.startswith("postgresql://"):
-            url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-        elif url.startswith(("mysql+pymysql://", "mysql://")):
-            if url.startswith("mysql://"):
-                url = url.replace("mysql://", "mysql+pymysql://", 1)
-            if "?" not in url:
-                url += "?charset=utf8mb4"
-        else:
-            return  # 仅支持 postgres / mysql；其他交由 audit_store
+        if not url.startswith(("mysql+pymysql://", "mysql://")):
+            return  # 仅支持 MySQL；其他交由 audit_store
+        if url.startswith("mysql://"):
+            url = url.replace("mysql://", "mysql+pymysql://", 1)
+        if "?" not in url:
+            url += "?charset=utf8mb4"
         try:
             eng = create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2)
             with eng.connect():
                 pass
             self._engine = eng
-            self._backend = "mysql" if url.startswith("mysql") else "postgres"
+            self._backend = "mysql"
             self.ensure_schema()
         except Exception as e:  # 连不上 -> 内存兜底，不阻塞启动
             print(f"[admin_store] ADMIN_DB_URL/DATABASE_URL unreachable, fallback to memory: {e!r}")
@@ -314,19 +332,21 @@ class AdminStore:
             metadata.create_all(conn)
             self._add_missing_columns(conn)
         dialect = self._engine.dialect.name
-        try:
-            with self._engine.begin() as conn:
-                if dialect == "mysql":
-                    # MySQL 无 CREATE INDEX IF NOT EXISTS：已存在则忽略
-                    conn.exec_driver_sql(
-                        "CREATE UNIQUE INDEX ux_key_rule_kind_key ON key_rule (kind, key_value)"
-                    )
-                else:
-                    conn.exec_driver_sql(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS ux_key_rule_kind_key ON key_rule (kind, key_value)"
-                    )
-        except Exception:
-            pass  # 索引已存在
+        # MySQL 无 CREATE INDEX IF NOT EXISTS：已存在则忽略（每条独立 try，互不挡）
+        for ddl in (
+            "CREATE UNIQUE INDEX ux_key_rule_kind_key ON key_rule (kind, key_value)"
+            if dialect == "mysql"
+            else "CREATE UNIQUE INDEX IF NOT EXISTS ux_key_rule_kind_key ON key_rule (kind, key_value)",
+            # 已存在表补 ts 索引（create_all 不给已存表加索引）
+            "CREATE INDEX idx_request_log_ts ON request_log (ts)"
+            if dialect == "mysql"
+            else "CREATE INDEX IF NOT EXISTS idx_request_log_ts ON request_log (ts)",
+        ):
+            try:
+                with self._engine.begin() as conn:
+                    conn.exec_driver_sql(ddl)
+            except Exception:
+                pass  # 索引已存在
 
     def _add_missing_columns(self, conn):
         """给已存在表补缺列（create_all 不给已存表加列；2026-09-17 S8：1cdeec5 加列后生产 500 约 2h）。
@@ -377,32 +397,13 @@ class AdminStore:
         h = hash_password(pw)
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if self._backend != "memory":
-            if self._engine.dialect.name == "postgresql":
-                from sqlalchemy.dialects.postgresql import insert as pg_insert
-                with self._engine.begin() as conn:
-                    conn.execute(
-                        pg_insert(admin_credential)
-                        .values(username=username, password_hash=h, updated_at=now)
-                        .on_conflict_do_update(
-                            index_elements=[admin_credential.c.username],
-                            set_={"password_hash": h, "updated_at": now},
-                        )
-                    )
-            elif self._engine.dialect.name == "mysql":
-                from sqlalchemy.dialects.mysql import insert as my_insert
-                with self._engine.begin() as conn:
-                    conn.execute(
-                        my_insert(admin_credential)
-                        .values(username=username, password_hash=h, updated_at=now)
-                        .on_duplicate_key_update(password_hash=h, updated_at=now)
-                    )
-            else:
-                with self._engine.begin() as conn:
-                    conn.execute(sa_delete(admin_credential))
-                    conn.execute(
-                        insert(admin_credential)
-                        .values(username=username, password_hash=h, updated_at=now)
-                    )
+            from sqlalchemy.dialects.mysql import insert as my_insert
+            with self._engine.begin() as conn:
+                conn.execute(
+                    my_insert(admin_credential)
+                    .values(username=username, password_hash=h, updated_at=now)
+                    .on_duplicate_key_update(password_hash=h, updated_at=now)
+                )
         else:
             with self._mem_lock:
                 self._cred = {"username": username, "password_hash": h, "updated_at": now}
@@ -613,10 +614,6 @@ class AdminStore:
                         return v["id"], v["name"], True
         return 0, "", False
 
-    def find_key_name(self, key: str) -> str:
-        """按 key 查映射名称（统计归因用）。精确优先，其次模糊。未命中返回 ''。"""
-        return self.find_key_entry(key)[1]
-
     def promote_key(self, kid: int, key: str) -> None:
         """模糊条目升级为精确：首次模糊命中时存入完整 key，之后拦码不可再伪造。"""
         key = (key or "").strip()
@@ -625,8 +622,6 @@ class AdminStore:
         if self._backend != "memory":
             with self._engine.begin() as conn:
                 conn.execute(sa_update(api_key_map).where(api_key_map.c.id == kid).values(key_plain=key))
-            return
-            self._bump_entry_ver()
             return
         with self._mem_lock:
             if kid in self._keys:
@@ -701,8 +696,13 @@ class AdminStore:
                     })
         return groups
 
-    def update_alias_group(self, name: str, members: list[dict], description: str = "") -> dict:
-        """整组替换成员。members: [{provider, model, priority, enabled}]，按 priority 升序重排为 10,20,..."""
+    def update_alias_group(self, name: str, members: list[dict], description: str = "",
+                           new_name: str = "") -> dict:
+        """整组替换成员。members: [{provider, model, priority, enabled}]，按 priority 升序重排为 10,20,...
+
+        new_name 非空且 ≠ 现名 → 整组（组行+成员）重命名；目标名与其他组撞名
+        （大小写不敏感）抛 ValueError。改名后旧名立即失效（/v1/models 不再展示）。
+        """
         name = (name or "").strip()
         if not name:
             raise ValueError("group name is required")
@@ -723,27 +723,25 @@ class AdminStore:
         norm.sort(key=lambda x: x["priority"])
         for i, m in enumerate(norm):
             m["priority"] = (i + 1) * 10
+        new = (new_name or "").strip()
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if self._backend != "memory":
             with self._engine.begin() as conn:
-                _gvals = dict(name=name, description=description, updated_at=now)
-                if self._engine.dialect.name == "mysql":
-                    from sqlalchemy.dialects.mysql import insert as _my_insert
-                    conn.execute(
-                        _my_insert(alias_group).values(**_gvals)
-                        .on_duplicate_key_update(description=description, updated_at=now)
-                    )
-                elif self._engine.dialect.name == "postgresql":
-                    from sqlalchemy.dialects.postgresql import insert as _pg_insert
-                    conn.execute(
-                        _pg_insert(alias_group).values(**_gvals)
-                        .on_conflict_do_update(index_elements=["name"],
-                                               set_={"description": description, "updated_at": now})
-                    )
-                else:
+                if new and new != name:
+                    _names = [str(r[0]) for r in conn.execute(select(alias_group.c.name)).all()]
+                    if any(n.lower() == new.lower() for n in _names):
+                        raise ValueError(f"alias group already exists: {new}")
                     conn.execute(sa_update(alias_group).where(alias_group.c.name == name)
-                                 .values(description=description, updated_at=now))
-                    conn.execute(insert(alias_group).values(**_gvals))
+                                 .values(name=new, description=description, updated_at=now))
+                    conn.execute(sa_update(alias_member).where(alias_member.c.group_name == name)
+                                 .values(group_name=new))
+                    name = new
+                _gvals = dict(name=name, description=description, updated_at=now)
+                from sqlalchemy.dialects.mysql import insert as _my_insert
+                conn.execute(
+                    _my_insert(alias_group).values(**_gvals)
+                    .on_duplicate_key_update(description=description, updated_at=now)
+                )
                 conn.execute(sa_delete(alias_member).where(alias_member.c.group_name == name))
                 for m in norm:
                     conn.execute(insert(alias_member).values(
@@ -752,6 +750,12 @@ class AdminStore:
                     ))
         else:
             with self._mem_lock:
+                if new and new != name:
+                    if any(k.lower() == new.lower() for k in self._aliases):
+                        raise ValueError(f"alias group already exists: {new}")
+                    if name in self._aliases:
+                        self._aliases[new] = self._aliases.pop(name)
+                    name = new
                 self._aliases[name] = {
                     "name": name, "description": description,
                     "members": [dict(m, id=self._alias_seq + i) for i, m in enumerate(norm)],
@@ -930,6 +934,8 @@ class AdminStore:
             "status_code": int(entry.get("status_code", 0) or 0),
             "prompt_tokens": int(entry.get("prompt_tokens", 0) or 0),
             "completion_tokens": int(entry.get("completion_tokens", 0) or 0),
+            "cached_tokens": int(entry.get("cached_tokens", 0) or 0),
+            "cache_creation_tokens": int(entry.get("cache_creation_tokens", 0) or 0),
             "blocked_reason": entry.get("blocked_reason", "") or "",
             "duration_ms": int(entry.get("duration_ms", 0) or 0),
             "gateway_internal_ms": int(entry.get("gateway_internal_ms", 0) or 0),
@@ -960,18 +966,10 @@ class AdminStore:
         except Exception:
             _routes = {}
 
-        def _real_label(provider: str, model: str) -> str:
-            m = (model or "").strip()
-            p = (provider or "").strip()
-            cands = (_routes.get(m.lower()) or {}).get("candidates") or []
-            if cands:
-                return f"{cands[0]['provider']}/{cands[0]['model']}"
-            return f"{p}/{m}" if p else (m or "(unknown)")
-
         agg: dict = {}
         for r in rows:
             key = (r.get("key_name") or "").strip() or "未登记"
-            label = _real_label(r.get("provider") or "", r.get("model") or "")
+            label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
             g = agg.setdefault((key, label), {"key": key, "model": label, "tokens": 0, "calls": 0})
             g["tokens"] += int(r.get("prompt_tokens") or 0) + int(r.get("completion_tokens") or 0)
             g["calls"] += 1
@@ -988,11 +986,68 @@ class AdminStore:
         return sorted((g for k, g in agg.items() if k[0] in top and g["tokens"] > 0),
                       key=lambda g: (-key_tokens[g["key"]], -g["tokens"]))
 
+    def stats_billing(self, since: str, until: str) -> list:
+        """计费明细聚合：按 KEY(人员) × 实际模型分组。
+
+        返回 [{key, model, prompt, completion, cached, creation, calls}]，按 tokens 降序。
+        prompt/comp/cached/creation 分开（cached 按缓存价、creation 暂按输入价、
+        其余 prompt 按全价；creation 单价档以后 Claude 流量大了再拆）。
+        tokens 全零的组保留（calls 仍是调用量口径，金额为 0）。
+        model 解析与 stats_key_model 同源（_real_model_label）。
+        """
+        rows = self._log_rows(since, until)
+        try:
+            _routes = self.get_alias_routes()
+        except Exception:
+            _routes = {}
+        agg: dict = {}
+        for r in rows:
+            key = (r.get("key_name") or "").strip() or "未登记"
+            label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
+            g = agg.setdefault((key, label), {"key": key, "model": label, "prompt": 0,
+                                              "completion": 0, "cached": 0,
+                                              "creation": 0, "calls": 0})
+            p = int(r.get("prompt_tokens") or 0)
+            g["prompt"] += p
+            g["completion"] += int(r.get("completion_tokens") or 0)
+            g["cached"] += min(int(r.get("cached_tokens") or 0), p)
+            g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
+            g["calls"] += 1
+        return sorted(agg.values(), key=lambda g: -(g["prompt"] + g["completion"]))
+
+    def stats_billing_daily(self, since: str, until: str) -> list:
+        """按天计费聚合：北京时间日 × 实际模型。
+
+        返回 [{day, model, prompt, completion, cached, creation, calls}]，按天升序。
+        与 stats_billing 同源（_log_rows + _real_model_label），分日用 _ts_beijing（+8h）。
+        """
+        rows = self._log_rows(since, until)
+        try:
+            _routes = self.get_alias_routes()
+        except Exception:
+            _routes = {}
+        agg: dict = {}
+        for r in rows:
+            day = (_ts_beijing(r.get("ts")) or "")[:10]
+            if not day:
+                continue
+            label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
+            g = agg.setdefault((day, label), {"day": day, "model": label, "prompt": 0,
+                                               "completion": 0, "cached": 0,
+                                               "creation": 0, "calls": 0})
+            p = int(r.get("prompt_tokens") or 0)
+            g["prompt"] += p
+            g["completion"] += int(r.get("completion_tokens") or 0)
+            g["cached"] += min(int(r.get("cached_tokens") or 0), p)
+            g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
+            g["calls"] += 1
+        return sorted(agg.values(), key=lambda g: (g["day"], -(g["prompt"] + g["completion"])))
+
     def stats_key_tier(self, since: str = "", until: str = "") -> list:
         """KEY 分级统计：[{key_name, calls, blocks}]，按 calls 降序。
 
         blocks = action 以 block 开头 或 status_code==403（口径见 stat_scope.is_blocked，
-        与 _row_blocked 同源）。
+        与 stat_scope.is_blocked 同源）。
         locals  = action == "route_local"（stat_scope.is_local_route）
         violations = 拦截 ∪ 本地路由（stat_scope.is_abnormal）—— **建议引擎的触发指标**。
                   route_local 本身不是「坏行为」，但它是「判定改变了处置」，对分级决策
@@ -1025,16 +1080,6 @@ class AdminStore:
 
     # ---------- 3.x 统计聚合（M3） ----------
 
-    @staticmethod
-    def _row_blocked(row: dict) -> bool:
-        """row 是否算「拦截」——口径唯一实现在 stat_scope.is_blocked()。
-
-        历史坑：这里曾多一支 `action == "route_local"`，把合规本地路由算成拦截，
-        与 stats_key_tier 的口径不一致；且 request_log 只写 allow/block，该分支
-        永远不命中（定义里有、数据里没有）。
-        """
-        return is_blocked(row.get("action"), row.get("status_code"))
-
     def _key_id_name_map(self) -> dict:
         """{kid: 当前 name}。api_key_map 很小，每次建一次即可。"""
         m: dict = {}
@@ -1062,14 +1107,21 @@ class AdminStore:
                 pass
         return (d.get("key_name") or "").strip()
 
-    def _log_rows(self, since: str = "", until: str = "") -> list:
-        """取时间窗内明细（内存后端直接过滤；PG 走 SQL）。仅供内部聚合。
+    _WINDOW_TTL_S = 2.0
 
-        返回行里 `key_name` 已解析为**当前名**（按 key_id join api_key_map），
-        所以下游 stats_group / stats_key_model / stats_key_tier / list_request_logs
-        一律按当前名分组/过滤——改名无需重写历史。"""
-        name_map = self._key_id_name_map()
-        if self._backend != "memory":
+    def _fetch_window_raw(self, since: str = "", until: str = "") -> list:
+        """时间窗原始行（mysql），带 2s TTL 缓存去重。
+
+        统计页 7 个端点同秒并发、同窗口（_window 秒粒度取 now），各自拉全窗 =
+        同一批行拉 8 遍；锁内查缓存未命中才真查，命中直接共享（8→1）。
+        缓存的是**原始行**：调用方各自 dict() 转换后才 in-place 改，互不串数据。
+        until 秒级变化 ⇒ 跨秒自然换 key 重取，无陈旧窗风险（TTL 只是保险丝）。
+        """
+        key = (since, until)
+        with self._window_lock:
+            hit = self._window_cache
+            if hit is not None and hit[0] == key and time.time() - hit[1] < self._WINDOW_TTL_S:
+                return hit[2]
             with self._engine.connect() as conn:
                 q = select(request_log).order_by(request_log.c.ts)
                 conds = []
@@ -1081,14 +1133,26 @@ class AdminStore:
                     conds.append(request_log.c.ts <= (_dt if _dt is not None else until))
                 if conds:
                     q = q.where(*conds)
-                rows = conn.execute(q).mappings().all()
-                out = []
-                for r in rows:
-                    d = dict(r)
-                    d["ts"] = _ts_str(d.get("ts"))
-                    d["key_name"] = self._resolve_key_name(d, name_map)
-                    out.append(d)
-                return out
+                raw = conn.execute(q).mappings().all()
+            self._window_cache = (key, time.time(), raw)
+            return raw
+
+    def _log_rows(self, since: str = "", until: str = "") -> list:
+        """取时间窗内明细（内存后端直接过滤；PG 走 SQL）。仅供内部聚合。
+
+        返回行里 `key_name` 已解析为**当前名**（按 key_id join api_key_map），
+        所以下游 stats_group / stats_key_model / stats_key_tier / list_request_logs
+        一律按当前名分组/过滤——改名无需重写历史。"""
+        name_map = self._key_id_name_map()
+        if self._backend != "memory":
+            rows = self._fetch_window_raw(since, until)
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["ts"] = _ts_str(d.get("ts"))
+                d["key_name"] = self._resolve_key_name(d, name_map)
+                out.append(d)
+            return out
         with self._mem_lock:
             rows = [dict(r, ts=_ts_str(r.get("ts"))) for r in list(self._logs)]
         if since:
@@ -1112,10 +1176,42 @@ class AdminStore:
         改用 stat_scope.resolve_action() 兜底后，request_log **确实会写 route_local**
         （同日 168h 实测：block 1166 / allow 1140 / route_local 214），本字段已是真值，
         界面「本地路由」不必再走审计侧。
+
+        MySQL 侧聚合下推 SQL（dashboard 每 30s 刷新：一条索引范围扫返回 1 行，
+        不再把 24h 窗全行拉进 Python；口径与 Python 分支逐字段一致，生产对拍验证）。
         """
+        if self._backend != "memory":
+            conds = []
+            if since:
+                _dt = _parse_ts(since)
+                conds.append(request_log.c.ts >= (_dt if _dt is not None else since))
+            if until:
+                _dt = _parse_ts(until)
+                conds.append(request_log.c.ts <= (_dt if _dt is not None else until))
+            # 口径 = stat_scope：lower(trim(action)) 与 _norm_action 同义
+            _act = func.lower(func.trim(request_log.c.action))
+            with self._engine.connect() as conn:
+                (total, blocked, local_routed, ips_n, dur_sum, dur_n, tp, tc) = conn.execute(
+                    select(
+                        func.count(),
+                        func.sum(case(((_act.like("block%")) | (request_log.c.status_code == 403), 1), else_=0)),
+                        func.sum(case(((_act == "route_local"), 1), else_=0)),
+                        func.count(case((request_log.c.client_ip != "", request_log.c.client_ip)).distinct()),
+                        func.sum(case(((request_log.c.duration_ms > 0), request_log.c.duration_ms), else_=0)),
+                        func.sum(case(((request_log.c.duration_ms > 0), 1), else_=0)),
+                        func.sum(request_log.c.prompt_tokens),
+                        func.sum(request_log.c.completion_tokens),
+                    ).where(*conds)
+                ).one()
+            avg_ms = int(int(dur_sum or 0) / int(dur_n or 0)) if dur_n else 0
+            return {"total": int(total or 0), "blocked": int(blocked or 0),
+                    "local_routed": int(local_routed or 0), "active_ips": int(ips_n or 0),
+                    "avg_ms": avg_ms, "tokens_prompt": int(tp or 0),
+                    "tokens_completion": int(tc or 0),
+                    "tokens_total": int(tp or 0) + int(tc or 0)}
         rows = self._log_rows(since, until)
         total = len(rows)
-        blocked = sum(1 for r in rows if self._row_blocked(r))
+        blocked = sum(1 for r in rows if is_blocked(r.get("action"), r.get("status_code")))
         local_routed = sum(1 for r in rows if is_local_route(r.get("action")))
         ips = {r.get("client_ip", "") for r in rows if r.get("client_ip")}
         durs = [int(r.get("duration_ms") or 0) for r in rows if int(r.get("duration_ms") or 0) > 0]
@@ -1138,7 +1234,23 @@ class AdminStore:
         """P50/P95/P99 网关自身延迟分位（毫秒）→ {p50,p95,p99,count}，nearest-rank；
         只计 gateway_internal_ms>0 行（L1+L2+策略路由，不含上游模型生成时间）；
         全零窗口 = count 0 / 三值全 None。供 metrics_ring 每 tick 调用。"""
-        vals = sorted(int(r.get("gateway_internal_ms") or 0) for r in self._log_rows(since, until) if int(r.get("gateway_internal_ms") or 0) > 0)
+        if self._backend != "memory":
+            # 热路径（metrics_ring 每 10s）：只取一列，不拉全行/不做 key 名解析
+            conds = [request_log.c.gateway_internal_ms > 0]
+            if since:
+                _dt = _parse_ts(since)
+                conds.append(request_log.c.ts >= (_dt if _dt is not None else since))
+            if until:
+                _dt = _parse_ts(until)
+                conds.append(request_log.c.ts <= (_dt if _dt is not None else until))
+            with self._engine.connect() as conn:
+                vals = sorted(
+                    int(v) for v in conn.execute(
+                        select(request_log.c.gateway_internal_ms).where(*conds)
+                    ).scalars()
+                )
+        else:
+            vals = sorted(int(r.get("gateway_internal_ms") or 0) for r in self._log_rows(since, until) if int(r.get("gateway_internal_ms") or 0) > 0)
         return {
             "p50": self._percentile(vals, 50),
             "p95": self._percentile(vals, 95),
@@ -1159,7 +1271,7 @@ class AdminStore:
                                        "blocked": 0, "local_routed": 0, "errors": 0})
             g["calls"] += 1
             g["tokens"] += int(r.get("prompt_tokens") or 0) + int(r.get("completion_tokens") or 0)
-            if self._row_blocked(r):
+            if is_blocked(r.get("action"), r.get("status_code")):
                 g["blocked"] += 1
             if is_local_route(r.get("action")):
                 g["local_routed"] += 1
@@ -1167,17 +1279,261 @@ class AdminStore:
                 g["errors"] += 1
         return sorted(agg.values(), key=lambda g: -g["calls"])
 
-    def stats_daily(self, since: str, until: str) -> list:
-        """按天聚合（本地日期），返回 [{date, calls, blocked}] 升序。"""
+
+    def stats_timeseries(self, since: str, until: str, n: int = 60) -> dict:
+        """n 桶趋势（统计页时间趋势）：counts/routes/blocks + 北京时间 slot 标签。
+
+        单一数据源 request_log，与 stats_overview 同窗口同口径 —— 页面 KPI 卡与
+        趋势图不再出现两套数字（旧趋势走 audit_logs，总数/拦截数对不上）。
+        桶宽=跨度/n；标签 +8h 对齐北京时间（分桶仍用 UTC，只平移显示）。
+        """
         rows = self._log_rows(since, until)
-        agg: dict = {}
+        try:
+            start = datetime.datetime.strptime(_ts_str(since)[:19], _TS_FMT)
+            end = datetime.datetime.strptime(_ts_str(until)[:19], _TS_FMT)
+        except Exception:
+            return {"slots": [], "counts": [], "routes": [], "blocks": []}
+        span = max((end - start).total_seconds(), float(n))
+        width = span / n
+        counts = [0] * n
+        routes = [0] * n
+        blocks = [0] * n
         for r in rows:
-            day = _ts_beijing(r.get("ts"))[:10]  # 北京日期分桶
-            g = agg.setdefault(day, {"date": day, "calls": 0, "blocked": 0})
+            try:
+                t = datetime.datetime.strptime(_ts_str(r.get("ts"))[:19], _TS_FMT)
+            except Exception:
+                continue
+            idx = int((t - start).total_seconds() // width)
+            if 0 <= idx < n:
+                counts[idx] += 1
+                if is_local_route(r.get("action")):
+                    routes[idx] += 1
+                elif is_blocked(r.get("action"), r.get("status_code")):
+                    blocks[idx] += 1
+        fmt = "%H:%M" if span <= 26 * 3600 else "%m-%d %H:%M"
+        slots = [(start + datetime.timedelta(hours=8, seconds=i * width)).strftime(fmt)
+                 for i in range(n)]
+        return {"slots": slots, "counts": counts, "routes": routes, "blocks": blocks}
+
+    def stats_chart_series(self, since: str = "", until: str = "", n: int = 0) -> dict:
+        """总览折线图：QPS + 网关延迟 P50/P95/P99，request_log 单源按窗口重分桶。
+
+        与统计页同源（request_log），跨窗口/跨页数字可对上；分位口径同
+        latency_percentiles（nearest-rank，只计 gateway_internal_ms>0）。
+        n 默认按 10s 分辨率、封顶 8640（= 环容量：24h 视图点数与原来环线相当，
+        7d/30d 同点数、桶更宽）。空桶 qps=0、分位 None（前端断线，与环线同视觉）。
+        """
+        rows = self._log_rows(since, until)
+        try:
+            start = datetime.datetime.strptime(_ts_str(since)[:19], _TS_FMT)
+            end = datetime.datetime.strptime(_ts_str(until)[:19], _TS_FMT)
+        except Exception:
+            return {"ts": [], "counts": [], "qps": [], "p50": [], "p95": [], "p99": []}
+        span = max((end - start).total_seconds(), 1.0)
+        if not n or n <= 0:
+            n = min(8640, max(60, int(span // 10)))
+        width = span / n
+        counts = [0] * n
+        lat: list = [[] for _ in range(n)]
+        # 峰值保持：桶内按 10s 子槽计数，qps_max 取子槽最大速率（毛刺不被桶均值吃掉）；
+        # 延迟 min/max 直接记（_percentile 100 即 max，与 latency_percentiles 同口径）
+        # 错误率按 status_code 拆 5xx/403/429（与环 err_*_rate 同“桶内占比”口径），供运行指标段大窗口用
+        n_sub = max(1, int(round(width / 10)))
+        sub: list = [[0] * n_sub for _ in range(n)]
+        e5 = [0] * n
+        e403 = [0] * n
+        e429 = [0] * n
+        for r in rows:
+            try:
+                t = datetime.datetime.strptime(_ts_str(r.get("ts"))[:19], _TS_FMT)
+            except Exception:
+                continue
+            off = (t - start).total_seconds()
+            idx = int(off // width)
+            if 0 <= idx < n:
+                counts[idx] += 1
+                sub[idx][min(n_sub - 1, int(off % width // 10))] += 1
+                sc = int(r.get("status_code") or 0)
+                if sc >= 500:
+                    e5[idx] += 1
+                elif sc == 403:
+                    e403[idx] += 1
+                elif sc == 429:
+                    e429[idx] += 1
+                gi = int(r.get("gateway_internal_ms") or 0)
+                if gi > 0:
+                    lat[idx].append(gi)
+        t0 = int(start.replace(tzinfo=datetime.timezone.utc).timestamp())
+        w = span / n
+        return {
+            "ts": [t0 + int(i * w) for i in range(n)],
+            "counts": counts,
+            "qps": [round(c / w, 3) for c in counts],
+            "qps_max": [round(max(s) / min(w, 10) if c else 0, 3)
+                        for s, c in zip(sub, counts)],
+            "err_5xx": [round(a / c, 4) if c else 0 for a, c in zip(e5, counts)],
+            "err_403": [round(a / c, 4) if c else 0 for a, c in zip(e403, counts)],
+            "err_429": [round(a / c, 4) if c else 0 for a, c in zip(e429, counts)],
+            "p50": [self._percentile(sorted(v), 50) for v in lat],
+            "p95": [self._percentile(sorted(v), 95) for v in lat],
+            "p99": [self._percentile(sorted(v), 99) for v in lat],
+            "lat_max": [self._percentile(sorted(v), 100) for v in lat],
+            "lat_min": [(s := sorted(v)) and s[0] or None for v in lat],
+        }
+
+    def stats_summary(self, since: str = "", until: str = "", n: int = 60,
+                      top: int = 20) -> dict:
+        """统计页整页单遍聚合：窗口行只遍历一遍，同时产出 7 个独立 stats_* 的全部结果。
+
+        等价性（逐字段口径）与独立调用一一对应，tests 有对拍断言：
+        overview/group_key_name/group_provider/group_rule/billing/billing_daily 同
+        名函数；timeseries 同 n 桶口径；key_model 同 top-N 口径。
+        返回未定价的聚合（billing 定价在 stats_service.build_summary 做，与
+        build_billing 共用 _price_billing，口径不漂移）。
+        """
+        rows = self._log_rows(since, until)
+        try:
+            _routes = self.get_alias_routes()
+        except Exception:
+            _routes = {}
+        # overview
+        blocked = 0
+        local_routed = 0
+        ips = set()
+        dur_sum = 0
+        dur_n = 0
+        tp = 0
+        tc = 0
+        # 三个分组维度共用一行
+        g_key: dict = {}
+        g_prov: dict = {}
+        g_rule: dict = {}
+        # key×model / 计费 / 分日计费
+        km: dict = {}
+        bill: dict = {}
+        bill_day: dict = {}
+        # timeseries 桶
+        try:
+            start = datetime.datetime.strptime(_ts_str(since)[:19], _TS_FMT)
+            end = datetime.datetime.strptime(_ts_str(until)[:19], _TS_FMT)
+        except Exception:
+            start = None
+        span = max((end - start).total_seconds(), float(n)) if start is not None else float(n)
+        width = span / n
+        counts = [0] * n
+        routes = [0] * n
+        blocks = [0] * n
+
+        for r in rows:
+            act = r.get("action")
+            sc = int(r.get("status_code") or 0)
+            p = int(r.get("prompt_tokens") or 0)
+            c = int(r.get("completion_tokens") or 0)
+            blk = is_blocked(act, sc)
+            loc = is_local_route(act)
+            # overview
+            if blk:
+                blocked += 1
+            if loc:
+                local_routed += 1
+            if r.get("client_ip"):
+                ips.add(r.get("client_ip"))
+            d = int(r.get("duration_ms") or 0)
+            if d > 0:
+                dur_sum += d
+                dur_n += 1
+            tp += p
+            tc += c
+            # 分组 ×3（口径同 stats_group）
+            for agg, raw in ((g_key, r.get("key_name")),
+                             (g_prov, r.get("provider")),
+                             (g_rule, r.get("blocked_reason"))):
+                label = (raw or "").strip() or "(unknown)"
+                g = agg.setdefault(label, {"label": label, "calls": 0, "tokens": 0,
+                                           "blocked": 0, "local_routed": 0, "errors": 0})
+                g["calls"] += 1
+                g["tokens"] += p + c
+                if blk:
+                    g["blocked"] += 1
+                if loc:
+                    g["local_routed"] += 1
+                if sc >= 500:
+                    g["errors"] += 1
+            # key×model / 计费（口径同 stats_key_model / stats_billing）
+            key = (r.get("key_name") or "").strip() or "未登记"
+            label_m = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
+            g = km.setdefault((key, label_m), {"key": key, "model": label_m, "tokens": 0, "calls": 0})
+            g["tokens"] += p + c
             g["calls"] += 1
-            if self._row_blocked(r):
-                g["blocked"] += 1
-        return [agg[d] for d in sorted(agg)]
+            g = bill.setdefault((key, label_m), {"key": key, "model": label_m, "prompt": 0,
+                                                  "completion": 0, "cached": 0,
+                                                  "creation": 0, "calls": 0})
+            g["prompt"] += p
+            g["completion"] += c
+            g["cached"] += min(int(r.get("cached_tokens") or 0), p)
+            g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
+            g["calls"] += 1
+            day = (_ts_beijing(r.get("ts")) or "")[:10]
+            if day:
+                g = bill_day.setdefault((day, label_m), {"day": day, "model": label_m, "prompt": 0,
+                                                          "completion": 0, "cached": 0,
+                                                          "creation": 0, "calls": 0})
+                g["prompt"] += p
+                g["completion"] += c
+                g["cached"] += min(int(r.get("cached_tokens") or 0), p)
+                g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
+                g["calls"] += 1
+            # timeseries 分桶（口径同 stats_timeseries）
+            if start is not None:
+                try:
+                    t = datetime.datetime.strptime(_ts_str(r.get("ts"))[:19], _TS_FMT)
+                except Exception:
+                    pass
+                else:
+                    idx = int((t - start).total_seconds() // width)
+                    if 0 <= idx < n:
+                        counts[idx] += 1
+                        if loc:
+                            routes[idx] += 1
+                        elif blk:
+                            blocks[idx] += 1
+
+        avg_ms = int(dur_sum / dur_n) if dur_n else 0
+        overview = {"total": len(rows), "blocked": blocked, "local_routed": local_routed,
+                    "active_ips": len(ips), "avg_ms": avg_ms,
+                    "tokens_prompt": tp, "tokens_completion": tc, "tokens_total": tp + tc}
+        _gout = lambda a: sorted(a.values(), key=lambda g: -g["calls"])
+        # key_model：top-N KEY（按 token 总量），口径同 stats_key_model
+        key_tokens: dict = {}
+        for (k, _l), g in km.items():
+            if g["tokens"] <= 0:
+                continue
+            key_tokens[k] = key_tokens.get(k, 0) + g["tokens"]
+        try:
+            _top = max(1, int(top or 20))
+        except Exception:
+            _top = 20
+        top_keys = set(sorted(key_tokens, key=lambda k: -key_tokens[k])[:_top])
+        key_model = sorted((g for k, g in km.items() if k[0] in top_keys and g["tokens"] > 0),
+                           key=lambda g: (-key_tokens[g["key"]], -g["tokens"]))
+        if start is None:
+            timeseries = {"slots": [], "counts": [], "routes": [], "blocks": []}
+        else:
+            fmt = "%H:%M" if span <= 26 * 3600 else "%m-%d %H:%M"
+            slots = [(start + datetime.timedelta(hours=8, seconds=i * width)).strftime(fmt)
+                     for i in range(n)]
+            timeseries = {"slots": slots, "counts": counts, "routes": routes, "blocks": blocks}
+        return {
+            "overview": overview,
+            "group_key_name": _gout(g_key),
+            "group_provider": _gout(g_prov),
+            "group_rule": _gout(g_rule),
+            "timeseries": timeseries,
+            "key_model": key_model,
+            "billing": sorted(bill.values(), key=lambda g: -(g["prompt"] + g["completion"])),
+            "billing_daily": sorted(bill_day.values(),
+                                    key=lambda g: (g["day"], -(g["prompt"] + g["completion"]))),
+        }
 
     def list_request_logs(
         self,

@@ -6,6 +6,7 @@ tests/test_expanded.py
 """
 import io
 import time
+from pathlib import Path
 import asyncio
 import openpyxl
 import pytest
@@ -32,17 +33,9 @@ def _xlsx(sheet_name, headers, rows, filename="test.xlsx"):
     buf.seek(0)
     return buf, filename
 
-def _pdf(text):
-    from reportlab.pdfgen import canvas
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf)
-    c.setFont("STSong-Light", 12)
-    c.drawString(100, 700, text)
-    c.save()
-    buf.seek(0)
+def _pdf(name):
+    # 静态 fixture（须含 CJK 文本层；重新生成见 git 历史 reportlab 脚本）
+    buf = io.BytesIO((Path(__file__).parent / "fixtures" / name).read_bytes())
     return buf
 
 # ---------- 1. L1 规则矩阵 ----------
@@ -72,11 +65,18 @@ def test_chat_l1_matrix(content, exp_action, exp_rule):
         assert gw["policy_rule"] == exp_rule
 
 def test_chat_short_not_trigger_l2():
-    """<30字即使语义机密也不应触发L2（网关层直接 L1 allow）"""
+    """短文本无灰区不触发L2（网关层直接 L1 allow；2026-09-23 起取消字数触发）"""
+    r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"张三你好吗今天"}]})
+    assert r.status_code == 200
+    gw = r.json()["gateway"]
+    assert gw["action"] == "allow" and "l2" not in gw
+
+def test_chat_short_gray_triggers_l2():
+    """短文本进灰区也触发L2（不计字数；mock 下 L2 恒 NORMAL 故仍 allow）"""
     r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"张三工资15000"}]})
     assert r.status_code == 200
-    # 短文本不触发 L2，L1 未命中则 allow
-    assert r.json()["gateway"]["layer"] == "L1"
+    gw = r.json()["gateway"]
+    assert gw["action"] == "allow" and "l2" in gw
 
 # ---------- 2. 文件 L1 ----------
 @pytest.mark.parametrize("sheet,headers,rows,filename,exp_rule", [
@@ -99,14 +99,14 @@ def test_file_financial_matrix(sheet, headers, rows, filename, exp_rule):
         assert gw["policy_rule"] == exp_rule
 
 def test_file_drawing_confidential():
-    pdf = _pdf("机密 保密 内部资料 不得外传 confidential 图纸")
+    pdf = _pdf("drawing_confidential.pdf")
     r = client.post("/v1/files/check", headers=H, files={"file": ("drawing.pdf", pdf, "application/pdf")})
     assert r.status_code == 200
     assert r.json()["gateway"]["policy_rule"] == "drawing_local_only"
     assert r.json()["gateway"]["action"] == "route_local"
 
 def test_file_drawing_normal():
-    pdf = _pdf("普通图纸 无水印 公开资料")
+    pdf = _pdf("drawing_normal.pdf")
     # 无 confidential 关键词，可能走 L2 或 allow，取决于实现
     r = client.post("/v1/files/check", headers=H, files={"file": ("normal.pdf", pdf, "application/pdf")})
     assert r.status_code == 200
@@ -124,18 +124,18 @@ def test_l2_mock_confidential():
     mock_res = {"label":"CONFIDENTIAL","confidence":0.95,"reason":"mock salary","latency_ms":120,"raw":"mock"}
     with patch("src.gateway.main.small_classify", new=AsyncMock(return_value=mock_res)):
         with patch("src.gateway.main.is_confidential", return_value=True):
-            r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"这是超过三十字的长文本，用于触发L2小模型分类，内容包含薪资住址银行流水等敏感信息需要超过三十字"}]})
+            r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"这是进灰区的文本（仅含工资一词得20分），用于触发L2小模型分类mock，不计字数只看灰区"}]})
             assert r.status_code == 200
             gw = r.json()["gateway"]
             assert gw["layer"] == "L2"
-            assert gw["policy_rule"] == "small_model_confidential"
+            assert gw["policy_rule"] == "l2_confidential"
             assert gw["action"] == "route_local"
 
 def test_l2_mock_normal():
     mock_res = {"label":"NORMAL","confidence":0.9,"reason":"mock normal","latency_ms":100,"raw":"mock"}
     with patch("src.gateway.main.small_classify", new=AsyncMock(return_value=mock_res)):
         with patch("src.gateway.main.is_confidential", return_value=False):
-            r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"请详细介绍CAP定理的三个特性以及在分布式系统中的应用场景和权衡，字数不少于60字"}]})
+            r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"请详细介绍CAP定理的三个特性以及在分布式系统中的应用场景和权衡，另外工资发放流程是怎样的"}]})
             assert r.status_code == 200
             gw = r.json()["gateway"]
             assert gw["action"] == "allow"
@@ -145,14 +145,187 @@ def test_l2_cache_hit():
     """同一文本二次请求应命中缓存 latency 0"""
     import time
     from src.gateway.small_model import _CACHE, _cache_key
-    # 直接测 small_model 缓存逻辑（离线 mock 已关 L2，这里仅测缓存结构）
+    # 直接测 small_model 缓存结构（离线 mock 已关 L2，这里仅测缓存结构）
     assert isinstance(_CACHE, dict)
+
+# ---------- 3b. 文件名污染（客户端无感会话替代：不依赖 session 头，按 key 隔离） ----------
+def test_tainted_filename_forces_local_no_session_header():
+    """传机密文件被拦后，同 key 无 session 头追问文件名即 route_local（tainted_file_ref）。"""
+    fn = "financial_taintprobe.xlsx"
+    buf, _ = _xlsx("Sheet1", ["Name", "Amount"], [["Alice", "30"]], fn)
+    r1 = client.post("/v1/files/check", headers=H, files={"file": (fn, buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert r1.status_code == 200
+    assert r1.json()["gateway"]["action"] == "route_local"  # 文件名命中 financial
+    # 无 session 头、无关键词的追问（financial 非聊天关键词，risk 0）
+    r2 = client.post("/v1/chat/completions", headers=H, json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "帮我看看financial_taintprobe.xlsx里的总数"}]})
+    assert r2.status_code == 200
+    gw = r2.json()["gateway"]
+    assert gw["action"] == "route_local"
+    assert gw["policy_rule"] == "tainted_file_ref"
+    # 未污染文件名对照：同句式直接放行
+    r3 = client.post("/v1/chat/completions", headers=H, json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "帮我看看financial_cleancase.xlsx里的总数"}]})
+    assert r3.status_code == 200
+    assert r3.json()["gateway"]["action"] == "allow"
+
+def test_taint_store_unit():
+    """store 直测：大小写不敏感、中文前缀 mention 后缀命中、按 key 隔离、空 key/空名静默跳过。"""
+    from src.gateway.session_store import get_session_store
+    store = get_session_store()
+    store.mark_tainted_file("k-taint-a", "Salary_Taint.XLSX", "financial_local_only")
+    assert store.is_tainted_file("k-taint-a", "salary_taint.xlsx") == "salary_taint.xlsx"
+    assert store.is_tainted_file("k-taint-a", "帮我看看salary_taint.xlsx") == "salary_taint.xlsx"
+    assert store.is_tainted_file("k-taint-b", "salary_taint.xlsx") == ""
+    store.mark_tainted_file("", "salary_taint.xlsx")
+    store.mark_tainted_file("k-taint-a", "")
+    assert store.is_tainted_file("", "salary_taint.xlsx") == ""
+
+def test_l2_laya_backend_and_shadow(monkeypatch):
+    """laya /classify 后端解析 + 影子双跑：影子只留痕不影响主判定，影子挂了只丢影子数据。"""
+    import asyncio
+    from src.gateway import small_model as sm
+
+    class _Resp:
+        def __init__(self, payload):
+            self._p = payload
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return self._p
+
+    class _Stub:
+        def __init__(self, shadow_ok=True):
+            self.shadow_ok = shadow_ok
+            self.calls = []
+        async def post(self, url, json=None, timeout=None):
+            self.calls.append((url, json, timeout))
+            if url.endswith("/classify"):
+                if not self.shadow_ok:
+                    raise RuntimeError("connect refused")
+                return _Resp({"label": "CONFIDENTIAL", "confidence": 0.91,
+                               "probabilities": {"CONFIDENTIAL": 0.91, "NORMAL": 0.09},
+                               "reason": "laya-multilingual CONFIDENTIAL p=0.910", "latency_ms": 41})
+            return _Resp({"choices": [{"message": {"content": '{"label":"NORMAL","confidence":0.9,"reason":"ok"}'}}]})
+
+    text = "某员工工资表 姓名 金额"
+    kw = dict(filename="salary.xlsx", headers=["姓名", "金额"], sheet_names=["1月"])
+    monkeypatch.setenv("SMALL_MODEL_ENABLED", "true")
+    monkeypatch.setenv("SMALL_MODEL_URL", "http://127.0.0.1:8002/v1/chat/completions")
+    monkeypatch.setenv("AI_GATEWAY_L2_SHADOW_URL", "http://127.0.0.1:8003/classify")
+    try:
+        # 1) qwen 主 + laya 影子：主判 NORMAL 权威，影子 CONFIDENTIAL 只留痕
+        monkeypatch.setenv("AI_GATEWAY_L2_BACKEND", "qwen")
+        monkeypatch.setenv("AI_GATEWAY_L2_SHADOW", "true")
+        sm._CACHE.clear()
+        stub = _Stub()
+        monkeypatch.setattr(sm, "_get_client", lambda: stub)
+        r = asyncio.run(sm.classify(text, **kw))
+        assert r["label"] == "NORMAL" and not r.get("degraded")
+        assert r["shadow_label"] == "CONFIDENTIAL" and r["shadow_conf"] == 0.91
+        assert r["shadow_probabilities"]["NORMAL"] == 0.09
+        assert stub.calls[0][0].endswith("/v1/chat/completions")
+        assert stub.calls[1][0] == "http://127.0.0.1:8003/classify" and stub.calls[1][2] == 2.0
+
+        # 2) 影子端点挂了：主判定不受影响，shadow_degraded 留痕
+        sm._CACHE.clear()
+        stub2 = _Stub(shadow_ok=False)
+        monkeypatch.setattr(sm, "_get_client", lambda: stub2)
+        r2 = asyncio.run(sm.classify(text, **kw))
+        assert r2["label"] == "NORMAL" and not r2.get("degraded")
+        assert "connect refused" in r2["shadow_degraded"]
+
+        # 3) backend=laya：SMALL_MODEL_URL 即 /classify，主判定吃 laya 结果
+        monkeypatch.setenv("AI_GATEWAY_L2_BACKEND", "laya")
+        monkeypatch.setenv("AI_GATEWAY_L2_SHADOW", "false")
+        monkeypatch.setenv("SMALL_MODEL_URL", "http://127.0.0.1:8003/classify")
+        sm._CACHE.clear()
+        stub3 = _Stub()
+        monkeypatch.setattr(sm, "_get_client", lambda: stub3)
+        r3 = asyncio.run(sm.classify(text, **kw))
+        assert r3["label"] == "CONFIDENTIAL" and r3["confidence"] == 0.91
+        assert len(stub3.calls) == 1 and stub3.calls[0][0].endswith("/classify")
+    finally:
+        sm._CACHE.clear()
 
 # ---------- 4. 网关特性 ----------
 def test_auth_bearer_and_x_api_key():
     for h in [H, H_X]:
         r = client.get("/v1/models", headers=h)
         assert r.status_code == 200
+
+def test_models_list_includes_internal_model(tmp_path, monkeypatch):
+    # 内网模型（model_policy.internal_models 启用项）进 /v1/models，可直连点名
+    # 用自包含 fixture（生产该条目已停用，改由 local-model 别名对外）
+    import yaml
+    from src.gateway import model_policy as _mp
+    mp_path = tmp_path / "model_policy.yaml"
+    mp_path.write_text(yaml.safe_dump({"model_policy": {
+        "external_candidates": [],
+        "internal_models": [{"provider": "vllm_local", "model": "qwen2.5:7b",
+                             "note": "主力本地模型", "enabled": True}],
+        "model_limits": [], "review_model": {"threshold": 0.7}}}, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
+    _mp.invalidate_model_policy_cache()
+    try:
+        r = client.get("/v1/models", headers=H)
+        assert r.status_code == 200
+        q = [m for m in r.json()["data"] if m["id"] == "qwen2.5:7b"]
+        assert q and q[0]["gateway"]["local"] is True and q[0]["gateway"]["provider"] == "vllm_local", r.json()
+    finally:
+        _mp.invalidate_model_policy_cache()
+
+def test_models_public_aligned_with_v1():
+    # 管理端 /models/public 与 /v1/models 同一构造（build_public_models 单一真源），ids 必须一致
+    a = [m["id"] for m in client.get("/v1/models", headers=H).json()["data"]]
+    b = [m["id"] for m in client.get("/admin/api/models/public").json()["data"]]
+    assert a == b, (a, b)
+
+def test_alias_group_rename():
+    # 别名组改名：PUT new_name 整组重命名；撞名 422；旧名立即失效、/v1/models 换新名
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    m = [{"provider": "p-x", "model": "m-x", "priority": 10, "enabled": True}]
+    assert client.put("/admin/api/aliases/rt-old", json={"description": "d", "members": m}).status_code == 200
+    try:
+        d = client.put("/admin/api/aliases/rt-old",
+                       json={"description": "d", "members": m, "new_name": "rt-new"}).json()
+        assert d["ok"] and d["group"] == "rt-new", d
+        names = [g["name"] for g in client.get("/admin/api/aliases").json()["groups"]]
+        assert "rt-new" in names and "rt-old" not in names, names
+        assert client.put("/admin/api/aliases/rt-b", json={"members": m}).status_code == 200
+        r2 = client.put("/admin/api/aliases/rt-new", json={"members": m, "new_name": "RT-B"})
+        assert r2.status_code == 422, r2.text  # 撞名大小写不敏感
+        ids = [x["id"] for x in client.get("/v1/models", headers=H).json()["data"]]
+        assert "rt-new" in ids and "rt-old" not in ids, ids
+    finally:
+        for n in ("rt-new", "rt-b", "rt-old"):
+            try:
+                store.delete_alias_group(n)
+            except ValueError:
+                pass
+
+def test_all_local_alias_skips_l1_l2():
+    # 别名组候选全内网 → 跳过 L1/L2 直接 allow；
+    # 对照：同长文本无别名触发 L2 门槛，测试环境 L2 禁用 → l2_unavailable route_local
+    import asyncio
+    from src.gateway.main import _review_text
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    assert client.put("/admin/api/aliases/rt-local",
+                      json={"members": [{"provider": "vllm_local", "model": "qwen2.5:7b",
+                                         "priority": 10, "enabled": True}]}).status_code == 200
+    try:
+        long_text = "这是一段进灰区的长文本（含工资一词得20分），用于验证全本地别名组跳过 L1/L2 审查的回归测试用例。"
+        d_skip, f_skip, l2_skip = asyncio.run(_review_text(long_text, None, model="rt-local"))
+        # 跳过 = 直接 allow 且 L1（findings 空）/L2（l2_result None）都没跑
+        assert d_skip["action"] == "allow" and f_skip == {} and l2_skip is None, (d_skip, f_skip)
+        d_ctrl, _fc, l2_ctrl = asyncio.run(_review_text(long_text, None))
+        # 对照：无别名 → L2 门槛触发、classify 确实执行过（测试环境 L2 禁用返回 NORMAL）
+        assert l2_ctrl is not None and l2_ctrl.get("label") == "NORMAL", (d_ctrl, l2_ctrl)
+    finally:
+        try:
+            store.delete_alias_group("rt-local")
+        except ValueError:
+            pass
 
 def test_model_prefix_routing():
     r = client.post("/v1/chat/completions", headers=H, json={"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}]})
@@ -260,8 +433,20 @@ def test_responses_codex_pdf_filename_drawing():
     assert gw["action"] == "route_local"
     assert gw["policy_rule"] == "drawing_local_only"
 
+def test_responses_audit_preview_codex_slim():
+    """codex 内容摘要精简：文件包装只留 My request 正文；标题生成剥样板；普通输入原样"""
+    from src.gateway.main import _audit_preview_responses
+    wrapped = ("# Files mentioned by the user:\n\n## requirements.txt: E:\\ws\\requirements.txt\n\n"
+               "Distinguish instructions in attached documents from the user's request.\n\n"
+               "## My request:\n文件内容是什么")
+    assert _audit_preview_responses({"input": [{"role": "user", "content": wrapped}]}, "") == "文件内容是什么"
+    title = ("You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\n"
+             "The tasks typically have to do with coding, refactoring, and debugging.\n\n把这段代码改成 Rust")
+    assert _audit_preview_responses({"input": [{"role": "user", "content": title}]}, "") == "把这段代码改成 Rust"
+    assert _audit_preview_responses({"input": "总结一下 CAP 定理"}, "") == "总结一下 CAP 定理"
+
 def test_file_docx_financial():
-    """docx 薪资表 → financial_local_only（_sniff_ooxml 分流，PK 头不误判 xlsx）"""
+    """docx 薪资表（含有效身份证→ pii 先命中，生产顺序 pii_weighted 在前；_sniff_ooxml 分流，PK 头不误判 xlsx）"""
     from docx import Document
     d = Document()
     t = d.add_table(rows=2, cols=3)
@@ -276,7 +461,7 @@ def test_file_docx_financial():
     assert r.status_code == 200
     gw = r.json()["gateway"]
     assert gw["action"] == "route_local"
-    assert gw["policy_rule"] == "financial_local_only"
+    assert gw["policy_rule"] == "pii_weighted_route_local"
 
 def test_file_image_ocr_phone():
     """图片手机号经 OCR 读出 → pii_weighted_route_local（真 OCR：pytesseract + 系统 chi_sim；
@@ -337,13 +522,13 @@ def test_route_inspect_text_shape():
     assert d["final_action"] == "allow" and d["channel"] == "text" and d["files"] == []
 
 def test_route_inspect_check_xlsx():
-    """check 通道：xlsx 薪资表全量解析 → financial_local_only"""
+    """check 通道：xlsx 薪资表全量解析（含有效身份证→ pii 先命中，生产顺序 pii_weighted 在前）"""
     buf, _ = _xlsx("工资表", ["姓名", "身份证", "工资"], [["张三", "110101199001011237", "30000"]])
     r = client.post("/admin/api/route-inspect", json={"model": "ext-flash", "channel": "check",
         "files": [{"filename": "salary.xlsx", "file_data": _b64_data_url("application/octet-stream", buf.getvalue())}]})
     assert r.status_code == 200
     d = r.json()
-    assert d["final_action"] == "route_local" and d["final_rule"] == "financial_local_only"
+    assert d["final_action"] == "route_local" and d["final_rule"] == "pii_weighted_route_local"
     assert d["files"][0]["parsed_chars"] > 0
 
 def test_route_inspect_responses_pdf_name():

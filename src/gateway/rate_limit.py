@@ -146,7 +146,7 @@ class RateLimiter:
     def check_model(self, full_model: str, rpm: int) -> Tuple[bool, int]:
         """模型级全局限流（全客户端共享一个桶）。rpm<=0 = 不限。
 
-        full_model 形如 "vllm_local/Qwen3.8-AB"，作桶键。
+        full_model 形如 "vllm_local/qwen2.5:7b"，作桶键。
         同一请求内 resolve() 会被预检/实际转发调用多次 —— ContextVar 去重，
         每请求每模型只扣一次（fallback 换候选 = 不同 full_model，各自计）。
         """

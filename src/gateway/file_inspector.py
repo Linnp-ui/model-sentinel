@@ -145,7 +145,6 @@ def _to_markdown_table(headers: List[str], rows: List[List[Any]]) -> str:
 
 def inspect_pdf(data: bytes, filename: str) -> Dict[str, Any]:
     text = ""
-    markdown = ""
     pages = 0
     has_ocr = False
     try:
@@ -174,7 +173,7 @@ def inspect_pdf(data: bytes, filename: str) -> Dict[str, Any]:
 
     findings = {
         "text_preview": text[:500],
-        "markdown_preview": markdown[:500] if markdown else text[:500],
+        "markdown_preview": text[:500],
         "has_drawing_keyword": _contains_any(text, DRAWING_KEYWORDS),
         "has_financial_keyword": _contains_any(text, FINANCIAL_SHEET_KEYWORDS + FINANCIAL_HEADER_KEYWORDS),
         "has_watermark": _contains_any(text, ["机密","保密","Watermark"]),
@@ -184,7 +183,7 @@ def inspect_pdf(data: bytes, filename: str) -> Dict[str, Any]:
     }
     # 分块供 L2
     chunks = _chunk_text(text, 1800)
-    return {"text": text, "markdown": markdown or text, "findings": findings, "chunks": chunks}
+    return {"text": text, "markdown": text, "findings": findings, "chunks": chunks}
 
 # OCR 输入归一化：tesseract 耗时约随像素数线性涨，手机 12MP 照片先压到长边 2000px
 # （截图文字精度几乎无损，速度数倍提升）。跨图并行已在 main._inline_media_scan

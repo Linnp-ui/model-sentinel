@@ -14,6 +14,16 @@ import 'uplot/dist/uPlot.min.css';
 // right only when pinned to the newest data edge. Double-click resets.
 const MIN_SPAN_S = 30;
 
+// 坐标轴标签格式化（OverviewPage / MetricsPage 共用）
+export const qpsAxis = (v) => (v == null ? '' : (Math.round(v * 100) / 100).toLocaleString('en-US') + ' req/s');
+export const msAxis = (v) => {
+  if (v == null) return '';
+  if (v === 0) return '0';
+  return v >= 1000
+    ? (v / 1000).toFixed(v >= 10000 ? 0 : 1).replace(/\.0$/, '') + 's'
+    : Math.round(v) + 'ms';
+};
+
 // uPlot y 轴标签区默认固定 50px（yAxisOpts.size=50），标签右对齐、距轴线
 // 15px（tick 10 + gap 5）向左排布 —— 标签超 ~35px 即在画布左缘被裁掉
 // （延迟到万 ms 量级时 "15,000" 已裁）。这里实测最长标签宽度让轴宽自适应。
@@ -33,6 +43,7 @@ export default function UPlotChart({ series, height = 180, yVal = null }) {
   const host = useRef(null);
   const plot = useRef(null);
   const lastX1 = useRef(0);
+  const lastX0 = useRef(0);
   const namesKey = (series || []).map((s) => s.name + '=' + s.color).join('|');
   const data = useMemo(() => {
     if (!series || !series.length || !series[0].points.length) return null;
@@ -125,7 +136,14 @@ export default function UPlotChart({ series, height = 180, yVal = null }) {
     const x0 = xs[0];
     const x1 = xs[xs.length - 1];
     const prevX1 = lastX1.current || x1;
+    const prevX0 = lastX0.current || x0;
     lastX1.current = x1;
+    lastX0.current = x0;
+    // 时间窗切换（x0 跳变远超实时漂移）→ 回全景，否则图还卡在旧窗口切片、看起来像没同步
+    if (Math.abs(x0 - prevX0) > Math.max(300, (sc.max - sc.min) * 0.05)) {
+      u.setData(data, true);
+      return;
+    }
     const drift = Math.max(0, x1 - prevX1);
     const tol = Math.max(2, 2 * drift);
     const span = sc.max - sc.min;

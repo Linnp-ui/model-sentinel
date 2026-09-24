@@ -19,7 +19,6 @@ class AnthropicLLM(BaseLLM):
     mode = "anthropic"
 
     # ---------------------------------------------------------------- URL
-
     def get_complete_url(self, base_url: str, kind: str = "chat", custom_path: str = "",
                          *, model: str = "", stream: bool = False) -> str:
         # Anthropic 全部走 /v1/messages（保持与原 Provider.endpoint 行为一致）
@@ -28,7 +27,6 @@ class AnthropicLLM(BaseLLM):
         return base + suffix
 
     # ---------------------------------------------------------------- 请求头
-
     def get_headers(self, api_key: str, extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         h = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
         h["content-type"] = "application/json"
@@ -36,7 +34,6 @@ class AnthropicLLM(BaseLLM):
         return h
 
     # ---------------------------------------------------------------- 请求/响应变换
-
     def transform_request(self, body: Dict[str, Any], model: str, *, stream: bool = False) -> Dict[str, Any]:
         out = _to_anthropic(body, model)
         if stream:

@@ -49,8 +49,8 @@ class ExternalCandidate(BaseModel):
     model: str
     price_per_1m_in: float = 0.0
     price_per_1m_out: float = 0.0
+    price_per_1m_cached: float = 0.0
     context_length: int = 0
-    rate: float = 1.0
     note: str = ""
     enabled: bool = True
     rank: int = 100
@@ -63,6 +63,7 @@ class InternalModel(BaseModel):
     model: str
     note: str = ""
     enabled: bool = True
+    url: str = ""
 
 
 class ModelLimit(BaseModel):
@@ -284,7 +285,3 @@ def pop_fallback_trace() -> List[Dict[str, Any]]:
     if lst:
         _fallback_trace.set([])
     return lst
-
-
-def reset_fallback_trace() -> None:
-    _fallback_trace.set([])

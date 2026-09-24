@@ -1,16 +1,6 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Statistic, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
+import React, { useEffect, useState, useCallback } from 'react';
+import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Tooltip, Row, Col } from 'antd';
+import { ReloadOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';
 
 const { Text } = Typography;
@@ -100,7 +90,6 @@ function ProviderRegistryCard() {
             }}><Button type="link" size="small" danger>删除</Button></Popconfirm>
           </Space>) },
       ]} />
-      <Text type="secondary">base_url 支持 {'${ENV_VAR}'} / {'${ENV_VAR:默认值}'} 展开；删除受引用保护（默认路由/候选/别名组/策略规则）</Text>
       <Modal open={!!modal} title={modal?.row ? `编辑 provider ${modal.row.name}` : '新增 provider'}
         onOk={save} confirmLoading={saving} onCancel={() => setModal(null)} destroyOnClose width={560}>
         <Form form={form} layout="vertical" size="small">
@@ -190,9 +179,6 @@ export function ProviderHealthCard({ compact = false }) {
               <Button type="link" size="small" loading={checking} onClick={() => check(r.name)}>检查</Button>) },
           ] || []),
         ]} />
-      {!compact && (
-        <Text type="secondary">打 GET {`{base_url}`}/models 测连通+鉴权+延迟，不发真实模型调用（不耗 token）</Text>
-      )}
     </Card>
   );
 }
@@ -234,9 +220,6 @@ function CircuitCard() {
               <Button type="link" size="small" loading={busy === r.name} onClick={() => setState(r.name, 'closed')}>关闭</Button>
             </Space>) },
         ]} />
-      {data && <Text type="secondary">
-        参数：{data.config.window_seconds}s 内连续 {data.config.failure_threshold} 次失败自动 OPEN；OPEN {data.config.recovery_seconds}s 后转 HALF_OPEN 探测，连续 {data.config.success_threshold} 次成功恢复
-      </Text>}
     </Card>
   );
 }

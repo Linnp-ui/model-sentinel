@@ -16,12 +16,12 @@
   客户端用 `model` 前缀（如 `openrouter/deepseek-v4-flash`）或 `X-Gateway-Provider` /
   `X-Gateway-Model` 头指定外网一律拒绝并记 `gateway.override_denied`
 - 覆盖优先级（仅 `allow` 时生效）：`policy.target` < `model` 前缀 < `X-Gateway-Provider/Model` 头
-- L2 触发（`main._review_text` 三条件与）：L1 allow **且**（实际喂模型的文本 >30 字
-  **或** `risk_score ∈ [20,60)` 灰区）**且**（机密会话 **或** 非白名单豁免）；
+- L2 触发（`main._review_text` 三条件与）：L1 allow **且** `risk_score ∈ [20,60)` 灰区
+  **且**（机密会话 **或** 非白名单豁免）（2026-09-23 起取消字数触发，只看灰区）；
   白名单 key 95% 跳 L2（`AI_GATEWAY_WL_L2_SAMPLE=0.05`，5% 抽样）；
   `/v1/embeddings` 永不 L2；灰区下限 env `AI_GATEWAY_L2_GRAY_FLOOR`（默认 20）。
   命中 CONFIDENTIAL 转本地（`route_local`，`rule=l2:…`）。
-  `POST /admin/api/route-inspect` 可干跑整条链（口径与线上门一致，返回 `trigger: length/gray`）
+  `POST /admin/api/route-inspect` 可干跑整条链（口径与线上门一致，返回 `trigger: gray`）
 - 热重载：`policy.load_policy()` 每次请求重载；`providers.load_routing()` 按 mtime 重载；
   `docker-compose.yml` 把两个 yaml 挂 `:ro`
 - **Provider 命名**：`vllm_local` = 本地降级（`OLLAMA_BASE_URL` 后端是 vLLM）；env 名
@@ -43,6 +43,16 @@
 - 协议转换在 `routing.py`：Anthropic `stop_reason` 映射（`stop→end_turn`, `length→max_tokens`）；
   `/v1/responses` 上游 404 时自动回退 chat 转换
 - `claude-*` 模型名会被策略 target 覆盖；外网具体模型用 `X-Gateway-Model` 头
+
+## 文件名污染 taint（客户端无感的会话替代，2026-09-23 起）
+
+客户端不发会话头也能防上下文绕过：记"被污染的文件名"而非"会话"。files/check
+命中 / chat 文本因含数据文件名被判 route_local/block 时，记
+`(key 指纹, 小写文件名)`（`session_store` 按 key 存集合，TTL 同 session）；
+chat/messages/responses 正文提及库内文件名即 `tainted_file_ref`（priority 12，
+紧贴 session）走本地。mention 提取常带中文前缀（"帮我看看X.xlsx"整体命中），
+读写都只比后缀（任一方向 endswith 即中，保守方向）。codex/ workbuddy/ 新客户端
+零改动自动覆盖；局限：改名即认不出（内容重贴仍会被 L1/L2 当场命中）。
 
 ## X-Session-ID 会话级机密（防上下文绕过）
 

@@ -11,18 +11,18 @@ providers:
     default_model: deepseek-v4-flash
     local: false
     timeout: 60
-  openrouter:
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    default_model: deepseek/deepseek-chat
-    local: false
-    timeout: 60
   vllm_local:
     base_url: ${OLLAMA_BASE_URL:http://10.0.0.10:8000/v1}
     api_key_env: OLLAMA_API_KEY
     default_model: qwen2.5:7b
     local: true
     timeout: 120
+  vllm_l2:
+    base_url: ${L2_VLLM_BASE_URL:http://10.0.0.10:8002/v1}
+    api_key_env: OLLAMA_API_KEY
+    default_model: Qwen3-4B-Instruct-2507
+    local: true
+    timeout: 60
   bge_m3:
     kind: embedding
     base_url: ${BGE_BASE_URL:http://10.0.0.10:8001/v1}

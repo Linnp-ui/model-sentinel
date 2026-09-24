@@ -14,7 +14,6 @@ from .base import BaseLLM
 
 class OpenAICompatLLM(BaseLLM):
     mode = "openai"
-
     def get_complete_url(self, base_url: str, kind: str = "chat", custom_path: str = "",
                          *, model: str = "", stream: bool = False) -> str:
         if not base_url:

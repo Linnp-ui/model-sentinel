@@ -15,7 +15,6 @@ src/gateway/main.py
 from __future__ import annotations
 
 
-
 import hashlib
 
 import hmac
@@ -44,7 +43,6 @@ from contextvars import ContextVar
 from typing import Any, Optional
 
 
-
 import httpx
 
 from fastapi import FastAPI, Header, UploadFile, File, Depends, HTTPException, Request
@@ -58,7 +56,6 @@ from pydantic import BaseModel, ConfigDict
 from starlette.concurrency import run_in_threadpool
 
 
-
 from .inspection import inspect_text
 
 from .file_inspector import inspect_file, inspect_inline_bytes, collect_inline_blobs_chat, collect_inline_blobs_anthropic, collect_inline_blobs_responses
@@ -70,29 +67,17 @@ from .providers import load_routing
 from .routing import (
 
     aclose_clients,
-
     anthropic_text,
-
     get_proxy_client,
-
     responses_text,
-
     resolve,
-
     route_chat,
-
     route_chat_stream,
-
     route_embeddings,
-
     route_messages,
-
     route_messages_stream,
-
     route_responses,
-
     route_responses_stream,
-
     RoutingError,
     upstream_key,
     _DEFAULT_MAX_TOKENS,
@@ -103,7 +88,7 @@ from .small_model import classify as small_classify, classify_chunks, is_confide
 
 from .user_models import UserModel, get_store, validate
 
-from .audit_store import get_audit_store, AuditStore
+from .audit_store import get_audit_store
 
 from .session_store import get_session_store, extract_session_id
 
@@ -158,8 +143,6 @@ def _pii_audit_summary(tf) -> dict | None:
         return None
 
 
-
-
 app = FastAPI(title="Secure Gateway — 大模型请求统一审查出口", version="0.3.0")
 
 
@@ -183,7 +166,6 @@ async def _capture_response_status(request, call_next):
     return response
 
 
-
 @app.on_event("startup")
 async def _ring_startup():
     from .metrics_ring import get_ring
@@ -193,24 +175,16 @@ async def _ring_startup():
 async def _l2_overrides_startup():
     # T46: 应用 l2_overrides.yaml 持久化覆盖（首个请求前；键白名单见 l2_overrides.py）
     from src.gateway.l2_overrides import apply_overrides
-
     apply_overrides()
 
 
 @app.on_event("shutdown")
 
 async def _shutdown():
-
     await aclose_clients()
 
 
-
-# 内存审计（postgres 接入后可落库）
-
-# AUDIT_LOG delegated to AuditStore (Redis or in-memory)
-
-
-
+# 审计双写：Redis 热缓存 + MySQL 持久化（见 audit_store.py）
 
 
 def _bind_identity(request, identity, token):
@@ -295,181 +269,38 @@ async def _bind_identity_ctx(identity: Identity = Depends(auth)) -> Identity:
         pass
     return identity
 
-def _rate_limit_chat(request: Request, identity: Identity = Depends(_bind_identity_ctx)) -> Identity:
-
-    """/v1/chat/* 限流；返回调用方身份（供下游归因）。"""
-
-    rpm = int(os.getenv("AI_GATEWAY_RATE_LIMIT_RPM", "0") or 0)
-
-    rps = int(os.getenv("AI_GATEWAY_RATE_LIMIT_RPS", "0") or 0)
-
-    if rpm <= 0 and rps <= 0:
-
+def _make_rate_limit_dep(scope: str, rpm_env: str, rps_env: str = None):
+    """限流依赖工厂：4 个 /v1/* 入口的限流逻辑唯一实现（仅 scope 与 env 名不同）。"""
+    async def _dep(request: Request, identity: Identity = Depends(_bind_identity_ctx)) -> Identity:
+        rpm = int(os.getenv(rpm_env, "0") or 0)
+        rps = int(os.getenv(rps_env, "0") or 0) if rps_env else 0
+        if rpm <= 0 and rps <= 0:
+            return identity
+        authz = request.headers.get("authorization", "")
+        xak = request.headers.get("x-api-key", "")
+        client_ip = _resolve_client_ip(request)
+        key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
+        ok, retry, reason = get_limiter().check(key, scope=scope)
+        if not ok:
+            get_metrics().inc_rate_limited(scope, reason)
+            raise HTTPException(
+                status_code=429,
+                detail={"type": "rate_limited", "scope": scope, "reason": reason, "retry_after": retry},
+                headers={"Retry-After": str(retry)},
+            )
         return identity
+    return _dep
 
-    authz = request.headers.get("authorization", "")
 
-    xak = request.headers.get("x-api-key", "")
-
-    client_ip = _resolve_client_ip(request)
-
-    key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
-
-    ok, retry, reason = get_limiter().check(key, scope="chat")
-
-    if not ok:
-
-        get_metrics().inc_rate_limited("chat", reason)
-
-        raise HTTPException(
-
-            status_code=429,
-
-            detail={"type": "rate_limited", "scope": "chat", "reason": reason, "retry_after": retry},
-
-            headers={"Retry-After": str(retry)},
-
-        )
-
-    return identity
-
-
-
-
-
-def _rate_limit_files(request: Request, identity: Identity = Depends(_bind_identity_ctx)) -> Identity:
-
-    """文件预检限流（独立桶，更严）。"""
-
-    rpm = int(os.getenv("AI_GATEWAY_RATE_LIMIT_FILES_RPM", "0") or 0)
-
-    if rpm <= 0:
-
-        return identity
-
-    authz = request.headers.get("authorization", "")
-
-    xak = request.headers.get("x-api-key", "")
-
-    client_ip = _resolve_client_ip(request)
-
-    key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
-
-    ok, retry, reason = get_limiter().check(key, scope="files")
-
-    if not ok:
-
-        get_metrics().inc_rate_limited("files", reason)
-
-        raise HTTPException(
-
-            status_code=429,
-
-            detail={"type": "rate_limited", "scope": "files", "reason": reason, "retry_after": retry},
-
-            headers={"Retry-After": str(retry)},
-
-        )
-
-    return identity
-
-
-
-
-
-def _rate_limit_embed(request: Request, identity: Identity = Depends(_bind_identity_ctx)) -> Identity:
-
-    rpm = int(os.getenv("AI_GATEWAY_RATE_LIMIT_RPM", "0") or 0)
-
-    rps = int(os.getenv("AI_GATEWAY_RATE_LIMIT_RPS", "0") or 0)
-
-    if rpm <= 0 and rps <= 0:
-
-        return identity
-
-    authz = request.headers.get("authorization", "")
-
-    xak = request.headers.get("x-api-key", "")
-
-    client_ip = _resolve_client_ip(request)
-
-    key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
-
-    ok, retry, reason = get_limiter().check(key, scope="embed")
-
-    if not ok:
-
-        get_metrics().inc_rate_limited("embed", reason)
-
-        raise HTTPException(
-
-            status_code=429,
-
-            detail={"type": "rate_limited", "scope": "embed", "reason": reason, "retry_after": retry},
-
-            headers={"Retry-After": str(retry)},
-
-        )
-
-    return identity
-
-
-
-
-
-def _rate_limit_messages(request: Request, identity: Identity = Depends(_bind_identity_ctx)) -> Identity:
-
-    rpm = int(os.getenv("AI_GATEWAY_RATE_LIMIT_RPM", "0") or 0)
-
-    rps = int(os.getenv("AI_GATEWAY_RATE_LIMIT_RPS", "0") or 0)
-
-    if rpm <= 0 and rps <= 0:
-
-        return identity
-
-    authz = request.headers.get("authorization", "")
-
-    xak = request.headers.get("x-api-key", "")
-
-    client_ip = _resolve_client_ip(request)
-
-    key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
-
-    ok, retry, reason = get_limiter().check(key, scope="messages")
-
-    if not ok:
-
-        get_metrics().inc_rate_limited("messages", reason)
-
-        raise HTTPException(
-
-            status_code=429,
-
-            detail={"type": "rate_limited", "scope": "messages", "reason": reason, "retry_after": retry},
-
-            headers={"Retry-After": str(retry)},
-
-        )
-
-    return identity
-
-
-
-
-
-
-
+_rate_limit_chat = _make_rate_limit_dep("chat", "AI_GATEWAY_RATE_LIMIT_RPM", "AI_GATEWAY_RATE_LIMIT_RPS")
+_rate_limit_files = _make_rate_limit_dep("files", "AI_GATEWAY_RATE_LIMIT_FILES_RPM")
+_rate_limit_embed = _make_rate_limit_dep("embed", "AI_GATEWAY_RATE_LIMIT_RPM", "AI_GATEWAY_RATE_LIMIT_RPS")
+_rate_limit_messages = _make_rate_limit_dep("messages", "AI_GATEWAY_RATE_LIMIT_RPM", "AI_GATEWAY_RATE_LIMIT_RPS")
 
 
 def _parse_admin_allowlist() -> set[str]:
-
     raw = os.getenv("AI_GATEWAY_ADMIN_IP_ALLOWLIST", "127.0.0.1,::1")
-
     return {x.strip() for x in raw.split(",") if x.strip()}
-
-
-
-
 
 
 # ---------- /admin 登录（cookie 会话，AI_GATEWAY_ADMIN_PASSWORD 启用） ----------
@@ -579,12 +410,6 @@ def admin_page_auth(request: Request) -> str:
     return admin_auth(request)
 
 
-
-
-
-
-
-
 def _resolve_client_ip(request) -> str:
     """P1-2: canonical client IP for rate limiting and audit.
 
@@ -650,9 +475,8 @@ def _mentioned_data_filename(text):
     """
     global _MENTIONED_FILE_RE
     try:
-        import re as _re
         if _MENTIONED_FILE_RE is None:
-            _MENTIONED_FILE_RE = _re.compile(r"[A-Za-z0-9_\-\u4e00-\u9fa5~]+\.(?:csv|tsv|txt|xlsx|xls|pdf|docx?)", _re.IGNORECASE)
+            _MENTIONED_FILE_RE = re.compile(r"[A-Za-z0-9_\-\u4e00-\u9fa5~]+\.(?:csv|tsv|txt|xlsx|xls|pdf|docx?)", re.IGNORECASE)
         m = _MENTIONED_FILE_RE.search(text or "")
         return m.group(0) if m else ""
     except Exception:
@@ -675,19 +499,29 @@ def _mark_session_hit(session_id, decision, name=""):
         pass
 
 
+def _mark_taint_hit(key_id, filename, decision):
+    """命中即记被污染文件名（客户端无感：不依赖 session 头，按 key 隔离）。
 
+    filename 取 basename 段（_mentioned_data_filename 提纯）；key 为空即跳过
+    （绝不写全局）。失败绝不影响主链路。
+    """
+    try:
+        if (decision or {}).get("action") not in ("route_local", "block"):
+            return
+        name = _mentioned_data_filename(filename or "")
+        if key_id and name:
+            get_session_store().mark_tainted_file(
+                key_id, name, (decision or {}).get("name") or "")
+    except Exception:
+        pass
 
 
 class ChatMessage(BaseModel):
 
     model_config = ConfigDict(extra="allow")
-
     role: str
-
     content: Any = None  # str or list[{type:text}] or None for tool_calls
-
     tool_calls: Any = None
-
     tool_call_id: Any = None
 
 def _clip_audit(s: Any, n: int) -> str:
@@ -851,9 +685,25 @@ def _last_user_text_responses(body) -> str:
     return ""
 
 
+_CODEX_TITLE_HEAD = "You are a helpful assistant. You will be presented with a user prompt"
+_CODEX_TITLE_NOISE = ("You are a helpful assistant.", "The tasks typically have to do with")
+
+
 def _audit_preview_responses(body, text: str) -> str:
-    s = _last_user_text_responses(body)
-    return (s or (text or ""))[:200]
+    """codex 摘要精简（纯展示，L1/L2 审的是全文不受影响）：
+    ① 附件包装 '# Files mentioned... ## My request:' → 只留 My request 正文
+       （文件名另有 filename 列）；② 内部标题生成调用 → 剥掉开头样板行，留被
+       起标题的用户 prompt。都认不出时原样回退，不丢内容。"""
+    s = _last_user_text_responses(body) or (text or "")
+    m = re.search(r"##\s*My request:\s*(.*)", s, re.S)
+    if m and m.group(1).strip():
+        s = m.group(1).strip()
+    elif s.startswith(_CODEX_TITLE_HEAD):
+        lines = s.splitlines()
+        while lines and lines[0].lstrip().startswith(_CODEX_TITLE_NOISE):
+            lines.pop(0)
+        s = "\n".join(lines).strip() or s
+    return s[:200]
 
 
 def _l2_source_text(kind: str, payload, merged_text: str) -> str:
@@ -1004,7 +854,6 @@ def _select_l2_scopes(kind: str, payload, merged_text: str) -> list:
     names = list(cfg["scopes"] or [_L2_SCOPE_LAST_USER])
     cc = max(1, int(cfg["chunk_chars"] or 1200))
     budget = max(0, int(cfg["budget_chars"] or 0))
-
     src = ""
     if _L2_SCOPE_TAIL in names:
         try:
@@ -1094,19 +943,14 @@ def _extract_chat_bundle(messages):
             "audit_preview": (last_user or text)[:200]}
 
 
-
 def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> list:
-
     """Truncate oldest/longest messages to fit max_chars, keep last messages prioritized"""
-
     if not messages:
 
         return messages
 
     def msg_len(m):
-
         c = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
-
         if isinstance(c, str):
 
             return len(c)
@@ -1122,25 +966,19 @@ def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> lis
         return len(str(c))
 
     total = sum(msg_len(m) for m in messages)
-
     if total <= max_chars:
 
         return messages
 
     new_msgs = []
-
     for i, m in enumerate(messages):
 
         is_dict = isinstance(m, dict)
-
         content = m.get("content") if is_dict else getattr(m, "content", None)
-
         cur_len = msg_len(m)
-
         if i >= len(messages) - 3:
 
             new_msgs.append(m)
-
             continue
 
         if cur_len > 5000:
@@ -1148,7 +986,6 @@ def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> lis
             if isinstance(content, str):
 
                 trunc = content[:5000] + "...[truncated]"
-
                 if is_dict:
 
                     new_m = dict(m); new_m["content"] = trunc
@@ -1156,7 +993,6 @@ def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> lis
                 else:
 
                     new_m = m.model_dump() if hasattr(m, "model_dump") else dict(m)
-
                     new_m["content"] = trunc
 
                 new_msgs.append(new_m)
@@ -1164,25 +1000,19 @@ def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> lis
             elif isinstance(content, list):
 
                 new_content = []
-
                 chars = 0
-
                 for part in content:
 
                     if isinstance(part, dict) and part.get("type") == "text":
 
                         txt = str(part.get("text",""))
-
                         if chars + len(txt) > 5000:
 
                             txt = txt[:5000 - chars] + "...[truncated]"
-
                             new_content.append({"type":"text","text": txt})
-
                             break
 
                         new_content.append(part)
-
                         chars += len(txt)
 
                     else:
@@ -1196,7 +1026,6 @@ def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> lis
                 else:
 
                     new_m = m.model_dump() if hasattr(m, "model_dump") else dict(m)
-
                     new_m["content"] = new_content
 
                 new_msgs.append(new_m)
@@ -1212,65 +1041,32 @@ def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> lis
     return new_msgs
 
 
-
-
-
-
-
-
-
 class ChatReq(BaseModel):
 
     model_config = ConfigDict(extra="allow")  # temperature / top_p 等原样透传
-
-
-
     model: str = "gpt-4o-mini"
-
     messages: list[ChatMessage]
-
     stream: bool = False
-
-
-
 
 
 class EmbeddingReq(BaseModel):
 
     model_config = ConfigDict(extra="allow")
-
-
-
     model: str = ""
-
     input: Any = ""
-
-
-
 
 
 class RegisterReq(BaseModel):
 
     """用户自定义模型注册请求体"""
-
-
-
     name: str
-
     base_url: str
-
     api_key: str
-
     api_mode: str = "openai"        # openai | anthropic
-
     default_model: str = ""
 
 
-
-
-
 # ---------------------------------------------------------------- 公共逻辑
-
 
 
 async def _inline_media_scan(kind: str, payload) -> tuple[str, bool]:
@@ -1352,55 +1148,78 @@ def _review_file_ctx(file_ctx: Optional[dict]) -> dict:
             base[_k] = list(file_ctx[_k])
     return base
 
-async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None) -> tuple[dict, dict, dict | None]:
+def _all_local_alias(model: str) -> bool:
+    """别名组全部启用候选都是内网 provider → True（如 local-model）。
 
+    这类请求内容不可能出境：所有故障切换路径都跳过 local 候选（routing.py
+    三处 `pcfg.local` 判定），全组失败即 fail-loud，因此 L1/L2 审查可跳过。
+    """
+    from .alias_router import find_alias
+    from .providers import load_routing
+    group = find_alias(model)
+    if not group:
+        return False
+    cands = group.get("candidates") or []
+    if not cands:
+        return False
+    try:
+        cfg = load_routing()
+    except Exception:
+        return False
+    return all(getattr(cfg.get(c["provider"]), "local", False) for c in cands)
+
+
+async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "") -> tuple[dict, dict, dict | None]:
     """
 
     纯文本审查（chat / messages / responses 共用）：
 
-    L1 规则 -> 命中即返回；L1 放行且（文本>30字 或 risk_score 灰区[20,60)）时触发 L2 小模型语义判定。
+    L1 规则 -> 命中即返回；L1 放行且 risk_score 进灰区[20,60) 时触发 L2 小模型语义判定
+    （2026-09-23 起取消字数触发：长短文本一视同仁，只看风险分）。
+
+    全本地别名组（_all_local_alias，候选全内网）跳过 L1/L2 直接 allow。
 
     返回 (decision, text_findings, l2_result)
 
     """
+    if model and _all_local_alias(model):
+        return {"action": "allow", "name": "local_alias_bypass"}, {}, None
 
     text_findings = inspect_text(text)
     if extra_findings:
         text_findings.update(extra_findings)
     _note_risk(text_findings)
-
     session_id = extract_session_id(request.headers) if request is not None else None
-
     session_conf = _is_session_confidential(session_id)
-
+    # 文件名污染（客户端无感会话替代）：正文提及同 key 下曾判机密的文件名即命中。
+    # key 取身份绑定键（与限流同口径）；干跑/无身份时 key 为空即跳过。
+    _taint_name = ""
+    _men = _mentioned_data_filename(text)
+    if _men and request is not None:
+        _kid = _identity_bind_key(request)
+        if _kid and get_session_store().is_tainted_file(_kid, _men):
+            _taint_name = _men
     ctx = {
 
         "text": text,
-
         "file": _review_file_ctx(file_ctx),
-
         "findings": text_findings,
-
         "session": {"confidential": session_conf},
+        "tainted_file": {"hit": bool(_taint_name), "name": _taint_name},
 
     }
-
     decision = decide(load_policy(), ctx)
     if request is not None and decision.get("action") != "allow":
         request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
-
 
 
     l2_result = None
 
     # 注：/v1/embeddings 未复用本函数（内联 L1 副本，且不跑 L2），
     #     行为差异见 docs/gateway-hidden-issues-2026-09-15.md「范围外」一节。
-    # 门槛按"实际喂给模型的文本"（l2_chunks / last_user 回退）计长，不按 merged
-    # text：responses 路径 merged 恒含 instructions（codex ~100 字），旧口径让
-    # codex 请求必然触发 L2，30 字边界失效（2026-09-18 修，三路径对齐）。
+    # 2026-09-23 起取消字数触发：只看灰区，不计长（短文本灰区同样进 L2）。
     _dec_blocks = l2_chunks or [(_L2_SCOPE_LAST_USER, l2_text or text)]
-    _l2_feed = _dec_blocks[0][1] or ""
-    if (decision.get("action") == "allow" and (len(_l2_feed.strip()) > 30 or _l2_gray_trigger(text_findings))
+    if (decision.get("action") == "allow" and _l2_gray_trigger(text_findings)
             and (session_conf or not _wl_l2_skip(request))):
 
         if not l2_chunks:
@@ -1444,9 +1263,7 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
     return decision, text_findings, l2_result
 
 
-
 def _l2_decision(l2_result: dict | None) -> dict | None:
-
     """L2 小模型结论 -> 覆盖用的 decision；None = 维持原判（L1 放行）。
 
     - 判密（label=CONFIDENTIAL 且 confidence >= 阈值）-> route_local
@@ -1460,7 +1277,7 @@ def _l2_decision(l2_result: dict | None) -> dict | None:
         return None
     if is_confidential(l2_result):
         return {
-            "name": "small_model_confidential",
+            "name": "l2_confidential",
             "priority": 15,
             "action": "route_local",
             "target": {"provider": load_routing().default_local},
@@ -1481,9 +1298,7 @@ def _l2_decision(l2_result: dict | None) -> dict | None:
     return None
 
 
-
 def _mark_gw_action(request, decision) -> None:
-
     """把最终处置写进 request.state，供中间件落 request_log。
 
     审计条目的 action 直接取 handler 的 decision，而 request_log 过去是中间件
@@ -1499,7 +1314,6 @@ def _mark_gw_action(request, decision) -> None:
 
 
 def _block_to_fallback(decision: dict) -> tuple[dict, str | None]:
-
     """
 
     block 规则的处置：默认降级到本地模型而非 403。
@@ -1507,35 +1321,25 @@ def _block_to_fallback(decision: dict) -> tuple[dict, str | None]:
     routing.yaml 的 routing.on_block 可切回 reject。
 
     """
-
     if decision.get("action") != "block":
 
         return decision, None
 
     cfg = load_routing()
-
     if cfg.on_block == "reject":
 
         return decision, None
 
     rule = decision.get("name")
-
     return {
 
         "name": rule,
-
         "priority": decision.get("priority"),
-
         "action": "route_local",
-
         "target": {"provider": cfg.default_local},
-
         "reason": f"命中拦截规则 {rule}，已自动降级到本地模型，内容未出境",
 
     }, rule
-
-
-
 
 
 def _alias_ctx_now():
@@ -1544,17 +1348,11 @@ def _alias_ctx_now():
 
 
 def _gateway_meta(
-
     decision: dict,
-
     prov,
-
     model: str,
-
     notes: dict,
-
     l2_result: dict | None,
-
     downgraded: str | None,
 
 ) -> dict:
@@ -1562,35 +1360,22 @@ def _gateway_meta(
     return {
 
         "provider": prov.name if prov else "",
-
         "model": model,
-
         "endpoint": (prov.base_url if prov else "") or "",
-
         "local": bool(prov.local) if prov else False,
-
         "action": decision.get("action"),
-
         "policy_rule": decision.get("name"),
         "alias": ((_alias_ctx_now() or {}).get("name")) or "",
         "alias_failover": ((_alias_ctx_now() or {}).get("failover")) or [],
-
-        "layer": "L2" if l2_result and decision.get("name") == "small_model_confidential" else "L1",
-
+        "layer": "L2" if l2_result and decision.get("name") == "l2_confidential" else "L1",
         "downgraded_from": downgraded,
-
         "override_denied": notes.get("override_denied"),
-
         "findings": None,
 
     }
 
 
-
-
-
 def _apply_token_cap(payload: dict) -> dict:
-
     """调用方没给 max_tokens 时兜底 _DEFAULT_MAX_TOKENS；给了但超过上限才截断
 
     注意：兜底值必须与 `routing._DEFAULT_MAX_TOKENS` **同源**。本函数在 handler
@@ -1598,9 +1383,7 @@ def _apply_token_cap(payload: dict) -> dict:
     层的默认值就永远轮不到（2026-09-15 实测：走网关时 completion_tokens 卡在
     300、finish_reason=length，长回答被截断）。
     """
-
     cap = int(os.getenv("AI_GATEWAY_MAX_TOKENS_CAP", "0") or 0)
-
     try:
 
         cur = int(payload.get("max_tokens") or 0)
@@ -1618,9 +1401,6 @@ def _apply_token_cap(payload: dict) -> dict:
         payload["max_tokens"] = cap
 
     return payload
-
-
-
 
 
 def _note_risk(tf):
@@ -1738,7 +1518,6 @@ def _resolve_actual_model(model, provider):
 
 
 def log_entry(entry: dict, *, count: bool = True):
-
     redact_audit_entry(entry)
 
     # 模型列记实际：别名请求放行/本地路由时 model 还是别名（如 ext-flash），
@@ -1750,9 +1529,7 @@ def log_entry(entry: dict, *, count: bool = True):
             pass
 
     entry["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-
     entry["id"] = str(uuid.uuid4())[:8]
-
     if not entry.get("token_masked"):
         _ck = _CURRENT_CLIENT_KEY.get()
         if _ck:
@@ -1774,7 +1551,6 @@ def log_entry(entry: dict, *, count: bool = True):
             entry["pii_summary"] = _ps
 
     get_audit_store().append(entry)
-
     if not count:
         # T43：流式失败的补写行（log_stream_error）走这里 —— 该请求已被流开始前的首行
         # 计过一次数，重复计数会让 requests_v2（请求总数分母）把一次失败算成两次。
@@ -1782,43 +1558,29 @@ def log_entry(entry: dict, *, count: bool = True):
         return
 
     # metrics: P2 7-axis counter (provider/model/local + status_code)
-
     status = get_current_status() or _infer_status(entry)
-
     get_metrics().inc_request_v2(
 
         type_=entry.get("type", ""),
-
         action=entry.get("action", ""),
-
         rule=entry.get("rule", ""),
-
         provider=entry.get("provider", ""),
-
         model=entry.get("model", "") or entry.get("requested_model", ""),
-
         local=bool(entry.get("local", False)),
-
         status_code=status,
 
     )
 
     # legacy 5-axis counter (kept for old dashboards)
-
     get_metrics().inc_request(
 
         type_=entry.get("type", ""),
-
         action=entry.get("action", ""),
-
         rule=entry.get("rule", ""),
-
         provider=entry.get("provider", ""),
-
         local=bool(entry.get("local", False)),
 
     )
-
     if entry.get("override_denied"):
 
         get_metrics().inc_override_denied()
@@ -1836,7 +1598,6 @@ def log_entry(entry: dict, *, count: bool = True):
     #   ③ degraded 的 label 恒为 "NORMAL"（small_model._degraded），必须单独成桶，
     #      否则超时 / 坏 JSON / 熔断的耗时会伪装成「正常判定耗时」。
     _l2e = entry.get("l2")
-
     if isinstance(_l2e, dict):
 
         if _l2e.get("cached"):
@@ -1846,13 +1607,10 @@ def log_entry(entry: dict, *, count: bool = True):
         else:
 
             l2_lat = _l2e.get("latency_ms")
-
             if isinstance(l2_lat, (int, float)) and l2_lat > 0:
 
                 label = "DEGRADED" if _l2e.get("degraded") else _l2e.get("label", "UNKNOWN")
-
                 get_metrics().observe_l2(label, float(l2_lat))
-
 
 
 def log_stream_error(request, *, type_: str, status, action=None, rule=None,
@@ -1891,15 +1649,11 @@ def log_stream_error(request, *, type_: str, status, action=None, rule=None,
         pass
 
 def _infer_status(entry: dict) -> int:
-
     """P2 fallback: estimate HTTP status from action/rule when context var is empty.
 
     Used in tests and call paths that do not go through middleware."""
-
     rule = (entry.get("rule") or "").lower()
-
     action = (entry.get("action") or "").lower()
-
     if action == "block" or rule == "egress_denied":
 
         return 403
@@ -1925,17 +1679,19 @@ def _entry_blocked(entry: dict) -> bool:
     return is_blocked(entry.get("action"), _infer_status(entry))
 
 
-
 def _normalize_usage(u) -> tuple:
-    """上游 usage -> (prompt_tokens, completion_tokens)，非负 int。
+    """上游 usage -> (prompt, completion, cached_read, cache_creation)，非负 int。
 
     兼容 OpenAI(prompt/completion_tokens) 与 Anthropic(input/output_tokens)。
+    cached 取 prompt_tokens_details.cached_tokens（OpenAI/DeepSeek）或
+    cache_read_input_tokens（Anthropic）；creation 取 cache_creation_input_tokens
+    （Anthropic；OpenAI 系无此档）；取不到记 0（历史行亦为 0，计费按全价算）。
     非流式取完整 JSON 的 usage；流式由中间件 SSE 扫描提取（见 _parse_sse_usage_event）。
     """
     try:
         d = dict(u or {})
     except Exception:
-        return 0, 0
+        return 0, 0, 0, 0
     def _int(*keys):
         for k in keys:
             try:
@@ -1945,7 +1701,19 @@ def _normalize_usage(u) -> tuple:
             if v > 0:
                 return v
         return 0
-    return _int("prompt_tokens", "input_tokens"), _int("completion_tokens", "output_tokens")
+    p = _int("prompt_tokens", "input_tokens")
+    c = _int("completion_tokens", "output_tokens")
+    det = d.get("prompt_tokens_details")
+    det = det if isinstance(det, dict) else {}
+    try:
+        cached = int(det.get("cached_tokens") or d.get("cache_read_input_tokens") or 0)
+    except (TypeError, ValueError):
+        cached = 0
+    try:
+        creation = int(d.get("cache_creation_input_tokens") or 0)
+    except (TypeError, ValueError):
+        creation = 0
+    return p, c, max(0, min(cached, p)), max(0, min(creation, p))
 
 
 def _parse_sse_usage_event(ev: bytes, out: dict, client_wants_usage: bool) -> bytes:
@@ -1972,7 +1740,7 @@ def _parse_sse_usage_event(ev: bytes, out: dict, client_wants_usage: bool) -> by
         has_p = any(k in usage for k in ("prompt_tokens", "input_tokens"))
         has_c = any(k in usage for k in ("completion_tokens", "output_tokens"))
         if has_p and has_c:
-            out["p"], out["c"] = _normalize_usage(usage)
+            out["p"], out["c"], out["h"], out["w"] = _normalize_usage(usage)
         # usage-only chunk（choices 为空）且客户端未主动要求 -> 剥离不转发
         if not client_wants_usage and obj.get("choices") == []:
             return b""
@@ -1982,33 +1750,22 @@ def _parse_sse_usage_event(ev: bytes, out: dict, client_wants_usage: bool) -> by
 
 
 def _sse_err(obj: dict) -> bytes:
-
     """SSE 错误事件（流式响应中途路由失败时用）"""
-
     return f"event: error\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
-
-
-
 
 
 # ---------------------------------------------------------------- 端点
 
 
-
 @app.get("/", response_class=HTMLResponse)
 
 async def index():
-
     p = os.path.join(os.path.dirname(__file__), "../../static/index.html")
-
     if os.path.exists(p):
 
         return FileResponse(p)
 
     return HTMLResponse("<h3>Secure Gateway running. POST /v1/chat/completions or /v1/files/check</h3>")
-
-
-
 
 
 @app.get("/favicon.ico")
@@ -2024,81 +1781,34 @@ async def favicon():
 @app.get("/health")
 
 async def health():
-
     cfg = load_routing()
-
     return {
 
         "status": "ok",
-
         "policy_count": len(load_policy()),
-
         "providers": {n: {"local": p.local, "kind": p.kind, "configured": p.configured} for n, p in cfg.providers.items()},
-
         "default_external": cfg.default_external,
-
         "default_local": cfg.default_local,
-
         "on_block": cfg.on_block,
 
     }
 
 
-
-
-
 @app.get("/v1/models")
 async def list_models(identity: Identity = Depends(_bind_identity_ctx)):
-    """OpenAI compatible model list — 只暴露对外别名组（ext-flash / ext-pro）。
+    """OpenAI compatible model list — 对外别名组（ext-flash / ext-pro）+ 内网主力模型
+    （model_policy.internal_models，可直连点名）+ 用户自注册模型。
 
-    别名组成员与默认模型在 Admin Console 配置；用户自注册模型（/v1/models/register）
-    保持展示，不受别名机制影响。上游真实模型目录不再对外暴露（真实模型名请求仍兼容）。
+    列表构造在 admin_api.build_public_models（与管理端 /models/public 单一真源，
+    两端必然一致）；用户自注册模型（/v1/models/register）保持展示，不受别名机制
+    影响。上游真实模型目录不再对外暴露（真实模型名请求仍兼容）。
     """
-    from .admin_store import get_admin_store
-    data: list = []
-    now = int(time.time())
-    for g in get_admin_store().list_alias_groups():
-        members = [m for m in (g.get("members") or []) if m.get("enabled", 1)]
-        if not members:
-            continue
-        members = sorted(members, key=lambda x: x["priority"])
-        default = members[0]
-        data.append({
-            "id": g["name"],
-            "object": "model",
-            "created": now,
-            "owned_by": "gateway",
-            "gateway": {
-                "kind": "chat",
-                "alias_group": g["name"],
-                "default": f"{default['provider']}/{default['model']}",
-                "candidates": [f"{m['provider']}/{m['model']}" for m in members],
-            },
-        })
-    # 用户注册模型始终展示（不受别名机制影响；chat 路径按注册名解析）
-    for m in get_store().list():
-        mid = m.default_model or m.name
-        data.append({
-            "id": str(m.name),
-            "object": "model",
-            "created": int(m.created_at),
-            "owned_by": f"user:{m.owner}",
-            "gateway": {
-                "kind": "chat",
-                "local": False,
-                "default_model": m.default_model,
-                "model": str(mid),
-                "configured": True,
-                "user_defined": True,
-            },
-        })
-    return {"object": "list", "data": data}
+    return {"object": "list", "data": _admin_api.build_public_models()}
 
 
 @app.post("/v1/models/register")
 
 async def register_model(req: RegisterReq, request: Request, identity: Identity = Depends(_bind_identity_ctx)):
-
     """
 
     用户自定义模型注册：提交 name + endpoint + key，网关校验域名白名单后持久化。
@@ -2106,13 +1816,9 @@ async def register_model(req: RegisterReq, request: Request, identity: Identity 
     后续请求用 model=<name> 即可走该模型（仍过安全审查，不通过降级本地）。
 
     """
-
     session_id = extract_session_id(request.headers)
-
     owner = request.headers.get("X-Gateway-User") or "anonymous"
-
     err = validate(req.name, req.base_url, req.api_key, req.api_mode)
-
     if err:
 
         raise HTTPException(400, detail={"type": "invalid_model", "message": err})
@@ -2120,51 +1826,34 @@ async def register_model(req: RegisterReq, request: Request, identity: Identity 
     m = UserModel(
 
         name=req.name,
-
         base_url=req.base_url,
-
         api_key=req.api_key,
-
         api_mode=req.api_mode,
-
         default_model=req.default_model,
-
         owner=owner,
 
     )
-
     get_store().register(m)
-
     log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "model_register", "name": req.name, "owner": owner,
 
                "base_url": req.base_url, "api_mode": req.api_mode,
-
                "session_id": session_id,})
 
     return {"object": "model", "id": m.name, "gateway": m.public()}
 
 
-
-
-
 @app.delete("/v1/models/{name}")
 
 async def unregister_model(name: str, request: Request, identity: Identity = Depends(_bind_identity_ctx)):
-
     """注销用户自定义模型（仅本人或管理员可删；管理员通过 X-Gateway-Admin: 1 标识）"""
-
     store = get_store()
-
     m = store.get(name)
-
     if m is None:
 
         raise HTTPException(404, detail={"type": "not_found", "message": f"模型 {name} 不存在"})
 
     caller = request.headers.get("X-Gateway-User") or "anonymous"
-
     is_admin = request.headers.get("X-Gateway-Admin") == "1"
-
     if not is_admin and m.owner != caller:
 
         raise HTTPException(403, detail={"type": "forbidden",
@@ -2172,58 +1861,48 @@ async def unregister_model(name: str, request: Request, identity: Identity = Dep
                                          "message": "只能注销本人注册的模型"})
 
     store.delete(name)
-
     log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "model_unregister", "name": name, "owner": m.owner, "caller": caller})
-
     return {"object": "model", "id": name, "deleted": True}
 
 
-
+def _err_provider(exc, prov) -> str:
+    """错误信封 provider：RoutingError 自带（别名层失败填别名名）优先，
+    否则沿用预解析的 prov（别名 503 曾误标 deepseek）。"""
+    return (getattr(exc, "provider", "") or "") or (prov.name if prov else "")
 
 
 @app.post("/v1/chat/completions")
-
 async def chat_completions(req: ChatReq, request: Request, identity: Identity = Depends(_rate_limit_chat)):
-
     session_id = extract_session_id(request.headers)
-
     _bundle = _extract_chat_bundle(req.messages)
     text = _bundle["text"]
-
     audit_preview = _bundle["audit_preview"]
     inline_text, inline_bad = await _inline_media_scan("chat", req.messages)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("chat", req.messages, text)
-
     decision, text_findings, l2_result = await _review_text(
         text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-        l2_chunks=l2_blocks)
-
+        l2_chunks=l2_blocks, model=str(req.model or ""))
 
 
     # block -> 默认自动降级到本地模型（routing.on_block=reject 时才 403）
-
     decision, downgraded = _block_to_fallback(decision)
     _mark_gw_action(request, decision)
-    _mark_pre_upstream(request)
+    _mark_pre_upstream(request)
     _mentioned = _mentioned_data_filename(text)
     _mark_session_hit(session_id, decision, "chat-inline-image" if (inline_text or inline_bad) else ("chat-mentioned-file:" + _mentioned if _mentioned else ""))
-
+    _mark_taint_hit(_identity_bind_key(request), _mentioned, decision)
     if decision.get("action") == "block":
 
         log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), "type": "chat", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview, "l2": l2_result,
-
         "session_id": session_id,})
-
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"), "message": "内容被安全策略拦截，未转发外网"})
-
 
 
     payload = _apply_token_cap(req.model_dump())
 
     # pre-truncate if prompt too long (DeepInfra max 32768 tokens ~ 130k chars)
-
     if _bundle["total_chars"] > 100000:
         _msgs = payload.get("messages") or []
         payload["messages"] = _truncate_messages_for_limit(_msgs, max_chars=90000)
@@ -2231,11 +1910,8 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
     try:
 
         prov = None
-
         model = ""
-
         prov, model, notes = resolve(decision, payload, request.headers, kind="chat")
-
         if payload.get("stream"):
             # 流式 token 统计：外部供应商注入 include_usage，让上游在末 chunk 回 usage
             # 本地 vLLM 不注入（老版本兼容性优先），其流式 tokens 记 0
@@ -2247,17 +1923,13 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
 
 
             async def gen():
-
                 sent = False
-
                 try:
 
                     # stream upstream
-
                     async for chunk in route_chat_stream(payload, decision, request.headers):
 
                         sent = True
-
                         yield chunk
 
                 except RoutingError as exc:
@@ -2265,13 +1937,10 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                     if not sent and exc.status_code >= 500:  # 仅瞬态错误(5xx/网络)降级；上游 4xx(密钥/权限/限流)直接透传
 
                         # 首字节前上游失败：透明降级到本地模型，对调用方无感
-
                         try:
 
                             cfg_fc = load_routing()
-
                             lp = cfg_fc.local_provider()
-
                             if lp is not None and prov.name != lp.name:
 
                                 fb_decision = {"name": "first_chunk_fallback", "priority": 0,
@@ -2281,30 +1950,22 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                                 notice = {"id": "chatcmpl-fallback", "object": "chat.completion.chunk",
 
                                           "created": int(time.time()), "model": lp.default_model,
-
                                           "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-
                                           "gateway": {"provider": lp.name, "downgraded_from": "upstream_error"}}
 
                                 yield f"data: {json.dumps(notice, ensure_ascii=False)}\n\n".encode("utf-8")
-
                                 fb_payload = dict(payload)
                                 fb_payload.pop("stream_options", None)
-
                                 fb_payload["messages"] = _truncate_messages_for_limit(payload.get("messages") or [], max_chars=60000)
-
                                 async for chunk in route_chat_stream(fb_payload, fb_decision, request.headers):
 
                                     sent = True
-
                                     yield chunk
 
                                 log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
 
                                     "type": "chat", "action": "route_local", "rule": "first_chunk_fallback",
-
                                     "provider": lp.name, "local": True, "model": lp.default_model,
-
                                     "text_preview": audit_preview, "downgraded_from": "upstream_error", "stream": True})
 
                                 return
@@ -2314,51 +1975,37 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                             pass  # 本地也失败 -> 走下方原有错误上报
 
                     msg = str(exc)
-
                     _ctx_overflow = _looks_like_context_overflow(msg)
                     if _ctx_overflow or exc.status_code in (408, 502, 504):
 
                         # fallback: truncate + reroute to local
-
                         try:
 
                             cfg = load_routing()
-
                             local_prov = cfg.local_provider()
-
                             if local_prov and prov and prov.name != local_prov.name:
 
                                 fallback_payload = dict(payload)
                                 fallback_payload.pop("stream_options", None)
-
                                 fallback_payload["messages"] = _truncate_messages_for_limit(payload.get("messages") or [], max_chars=60000)
-
                                 fallback_decision = {"name": "prompt_too_long_fallback", "priority": 0, "action": "route_local", "target": {"provider": local_prov.name}}
 
                                 # emit a small notice chunk so client knows
-
                                 notice = {"id": "chatcmpl-fallback", "object": "chat.completion.chunk", "created": int(time.time()),
 
                                           "model": local_prov.default_model,
-
                                           "choices": [{"index": 0, "delta": {"role": "assistant", "content": "[fallback to local due to prompt too long, regenerating...]\n"}, "finish_reason": None}],
-
                                           "gateway": {"provider": local_prov.name, "downgraded_from": "prompt_too_long"}}
 
                                 yield f"data: {json.dumps(notice, ensure_ascii=False)}\n\n".encode("utf-8")
-
                                 log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
                                     "type": "chat", "action": "route_local", "rule": "prompt_too_long_fallback",
-
                                     "provider": local_prov.name, "local": True, "model": local_prov.default_model,
-
                                     "text_preview": audit_preview, "layer": "L1", "downgraded_from": "prompt_too_long",
-
                                     "stream": True,
 
                                 })
-
                                 async for chunk in route_chat_stream(fallback_payload, fallback_decision, request.headers):
 
                                     yield chunk
@@ -2368,29 +2015,22 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                         except Exception as e2:
 
                             # fallback failed
-
                             log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
                                  action=decision.get("action"), rule=decision.get("name"),
                                  provider=prov, model=model, kind="upstream_fallback_failed",
                                  session_id=session_id, text_preview=audit_preview)
-                            err = {"error": {"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc) + f" (fallback failed: {e2})"}}
-
+                            err = {"error": {"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc) + f" (fallback failed: {e2})"}}
                             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8")
-
                             yield b"data: [DONE]\n\n"
-
                             return
 
                     # non-fallback error
-
                     log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
                          action=decision.get("action"), rule=decision.get("name"),
                          provider=prov, model=model, kind="upstream",
                          session_id=session_id, text_preview=audit_preview)
-                    err = {"error": {"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc)}}
-
+                    err = {"error": {"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc)}}
                     yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8")
-
                     yield b"data: [DONE]\n\n"
 
                 except Exception as exc:
@@ -2401,39 +2041,27 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                          provider=prov, model=model, kind="internal",
                          session_id=session_id, text_preview=audit_preview)
                     err = {"error": {"type": "internal_error", "message": f"gateway stream error: {exc}"}}
-
                     yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8")
-
                     yield b"data: [DONE]\n\n"
-
 
 
             log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
                 "type": "chat", "action": decision.get("action"), "rule": decision.get("name"),
-
                 "provider": prov.name, "local": prov.local, "model": model,
-
-                "text_preview": audit_preview, "layer": "L2" if decision.get("name") == "small_model_confidential" else "L1",
-
+                "text_preview": audit_preview, "layer": "L2" if decision.get("name") == "l2_confidential" else "L1",
                 "downgraded_from": downgraded, "stream": True,
-
                 "session_id": session_id,})
 
             headers = {
 
                 "X-Gateway-Provider": prov.name,
-
                 "X-Gateway-Local": "1" if prov.local else "0",
-
                 "X-Gateway-Action": _hdr_safe(decision.get("action")),
-
                 "X-Gateway-Rule": _hdr_safe(decision.get("name")),
 
             }
-
             return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
-
 
 
         try:
@@ -2443,26 +2071,19 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
         except RoutingError as exc:
 
             msg = str(exc)
-
             _ctx_overflow = _looks_like_context_overflow(msg)
             if _ctx_overflow or exc.status_code in (408, 502, 504):
 
                 try:
 
                     cfg = load_routing()
-
                     local_prov = cfg.local_provider()
-
                     if local_prov and prov and prov.name != local_prov.name:
 
                         fallback_decision = {"name": "prompt_too_long_fallback", "priority": 0, "action": "route_local", "target": {"provider": local_prov.name}}
-
                         payload["messages"] = _truncate_messages_for_limit(payload.get("messages") or [], max_chars=60000)
-
                         result = await route_chat(payload, fallback_decision, request.headers)
-
                         downgraded = downgraded or "prompt_too_long"
-
                         prov, model, notes = local_prov, local_prov.default_model, {"fallback": "prompt_too_long"}
 
                     else:
@@ -2478,21 +2099,18 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                     log_upstream_failure(request, type_="chat", status=exc.status_code,
 
                                           action=decision.get("action"), rule=decision.get("name"),
-
                                           provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
 
-                    raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc) + f" (fallback failed: {e2})"})
+                    raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc) + f" (fallback failed: {e2})"})
 
             else:
 
                 log_upstream_failure(request, type_="chat", status=exc.status_code,
 
                                       action=decision.get("action"), rule=decision.get("name"),
-
                                       provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
 
-                raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc)})
-
+                raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc)})
 
 
         gw = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
@@ -2505,7 +2123,6 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
             pass
 
         gw["findings"] = text_findings
-
         if l2_result:
 
             gw["l2"] = l2_result
@@ -2520,15 +2137,11 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                 gw["local"] = _acur["local"]
 
         result["gateway"] = gw
-
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
             "type": "chat", "action": decision.get("action"), "rule": decision.get("name"),
-
             "provider": gw["provider"], "local": gw["local"], "model": gw["model"],
-
             "text_preview": audit_preview, "layer": gw["layer"], "downgraded_from": downgraded,
-
             "filename": _mentioned, "session_id": session_id,})
 
         try:
@@ -2543,44 +2156,28 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
         log_upstream_failure(request, type_="chat", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
-
                               provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
 
-        raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc)})
-
-
-
+        raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc)})
 
 
 @app.post("/v1/embeddings")
 
 async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = Depends(_rate_limit_embed)):
-
     raw = req.input
-
     text = " ".join(raw) if isinstance(raw, list) else str(raw or "")
-
     text_findings = inspect_text(text)
     _note_risk(text_findings)
-
-
-
     session_id = extract_session_id(request.headers) if request is not None else None
-
     session_conf = _is_session_confidential(session_id)
-
     ctx = {
 
         "text": text,
-
         "file": {"ext": "", "filename": "", "headers": [], "sheet_names": [], "text": ""},
-
         "findings": text_findings,
-
         "session": {"confidential": session_conf},
 
     }
-
     decision = decide(load_policy(), ctx)
     if decision.get("action") != "allow":
         request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
@@ -2588,7 +2185,6 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
     decision, downgraded = _block_to_fallback(decision)
     _mark_gw_action(request, decision)
     _mark_pre_upstream(request)
-
     if decision.get("action") == "block":
 
         log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
@@ -2597,19 +2193,13 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name")})
 
 
-
     payload = req.model_dump()
-
     payload["input"] = raw
-
     try:
 
         prov = None
-
         model = ""
-
         prov, model, notes = resolve(decision, payload, request.headers, kind="embedding")
-
         result = await route_embeddings(payload, decision, request.headers)
 
     except RoutingError as exc:
@@ -2617,27 +2207,19 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
         log_upstream_failure(request, type_="embedding", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
-
                               provider=prov, model=model, text_preview=text[:200])
 
-        raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc)})
-
+        raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc)})
 
 
     result["gateway"] = _gateway_meta(decision, prov, model, notes, None, downgraded)
-
     log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
         "type": "embedding", "action": decision.get("action"), "rule": decision.get("name"),
-
         "provider": prov.name, "local": prov.local, "model": model, "text_preview": text[:200],
 
     })
-
     return JSONResponse(result)
-
-
-
 
 
 # ---------------------------------------------------------------- Anthropic Messages（ccswitch / Claude Code）
@@ -2647,55 +2229,41 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
 # POST {base}/v1/messages（Anthropic 协议，可能流式）。审查与降级逻辑同 chat。
 
 
-
 @app.post("/v1/messages")
 
 async def anthropic_messages(request: Request, identity: Identity = Depends(_rate_limit_messages)):
-
     session_id = extract_session_id(request.headers)
-
     body = await request.json()
-
     text = anthropic_text(body)
-
     audit_preview = _audit_preview_anthropic(body, text)
     inline_text, inline_bad = await _inline_media_scan("anthropic", body)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("anthropic", body, text)
-
     decision, text_findings, l2_result = await _review_text(
         text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-        l2_chunks=l2_blocks)
-
+        l2_chunks=l2_blocks, model=str((body or {}).get("model") or ""))
 
 
     decision, downgraded = _block_to_fallback(decision)
     _mark_gw_action(request, decision)
-    _mark_pre_upstream(request)
+    _mark_pre_upstream(request)
     _mentioned = _mentioned_data_filename(text)
     _mark_session_hit(session_id, decision, "messages-inline-image" if (inline_text or inline_bad) else ("messages-mentioned-file:" + _mentioned if _mentioned else ""))
-
+    _mark_taint_hit(_identity_bind_key(request), _mentioned, decision)
     if decision.get("action") == "block":
 
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "messages", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
-
         "session_id": session_id,})
-
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"),
 
                                          "message": "请求因机密策略被拦截，未转发至外网"})
 
 
-
     def _meta(prov, model, notes):
-
         gw = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
-
         gw["findings"] = text_findings
-
         return gw
-
 
 
     if body.get("stream"):
@@ -2703,9 +2271,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
         try:
 
             prov = None
-
             model = ""
-
             prov, model, notes = resolve(decision, {"model": str(body.get("model") or "")}, request.headers, kind="chat")
 
         except RoutingError as exc:
@@ -2713,23 +2279,18 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
             log_upstream_failure(request, type_="messages", status=exc.status_code,
 
                                   action=decision.get("action"), rule=decision.get("name"),
-
                                   provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
 
             raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "message": str(exc)})
 
 
-
         async def gen():
-
             sent = False
-
             try:
 
                 async for chunk in route_messages_stream(body, decision, request.headers):
 
                     sent = True
-
                     yield chunk
 
             except RoutingError as exc:
@@ -2737,13 +2298,10 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                 if not sent and exc.status_code >= 500:  # 仅瞬态错误(5xx/网络)降级；上游 4xx(密钥/权限/限流)直接透传
 
                     # 首字节前上游失败：透明降级到本地模型
-
                     try:
 
                         cfg_fc = load_routing()
-
                         lp = cfg_fc.local_provider()
-
                         if lp is not None and prov.name != lp.name:
 
                             fb_decision = {"name": "first_chunk_fallback", "priority": 0,
@@ -2753,15 +2311,12 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                             async for chunk in route_messages_stream(body, fb_decision, request.headers):
 
                                 sent = True
-
                                 yield chunk
 
                             log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
 
                                 "type": "messages", "action": "route_local", "rule": "first_chunk_fallback",
-
                                 "provider": lp.name, "local": True, "text_preview": audit_preview,
-
                                 "downgraded_from": "upstream_error", "stream": True})
 
                             return
@@ -2775,7 +2330,6 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                      provider=prov, model=model, kind="upstream",
                      session_id=session_id, text_preview=audit_preview)
                 yield _sse_err({"type": "error", "error": {"type": "gateway_error", "message": str(exc)},
-
                 "session_id": session_id,})
 
             except Exception as exc:
@@ -2785,41 +2339,30 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                      provider=prov, model=model, kind="internal",
                      session_id=session_id, text_preview=audit_preview)
                 yield _sse_err({"type": "error", "error": {"type": "gateway_error", "message": f"gateway stream error: {exc}"},
-
                 "session_id": session_id,})
-
 
 
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
             "type": "messages", "action": decision.get("action"), "rule": decision.get("name"),
-
             "provider": prov.name, "local": prov.local, "model": model,
-
             "text_preview": audit_preview, "downgraded_from": downgraded, "stream": True, "filename": _mentioned,
 
         })
-
         return StreamingResponse(gen(), media_type="text/event-stream", headers={
 
             "X-Gateway-Provider": prov.name,
-
             "X-Gateway-Local": "1" if prov.local else "0",
-
             "X-Gateway-Rule": _hdr_safe(decision.get("name")),
 
         })
 
 
-
     try:
 
         prov = None
-
         model = ""
-
         prov, model, notes = resolve(decision, {"model": str(body.get("model") or "")}, request.headers, kind="chat")
-
         result = await route_messages(body, decision, request.headers)
 
     except RoutingError as exc:
@@ -2827,51 +2370,34 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
         log_upstream_failure(request, type_="messages", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
-
                               provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
 
         raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"),
 
-                                                     "provider": prov.name if prov else "", "message": str(exc),
-
+                                                     "provider": _err_provider(exc, prov), "message": str(exc),
                                                      "session_id": session_id,})
 
 
-
     result["gateway"] = _meta(prov, model, notes)
-
     log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
         "type": "messages", "action": decision.get("action"), "rule": decision.get("name"),
-
         "provider": result["gateway"]["provider"], "local": result["gateway"]["local"], "model": model,
-
         "text_preview": audit_preview, "downgraded_from": downgraded, "filename": _mentioned,
 
     })
-
     return JSONResponse(result)
-
-
-
 
 
 @app.post("/v1/messages/count_tokens")
 
 async def anthropic_count_tokens(request: Request, identity: Identity = Depends(_bind_identity_ctx)):
-
     """Claude Code 偶尔调用的 token 估算端点；网关层面给近似值即可"""
-
     body = await request.json()
-
     text = anthropic_text(body)
 
     # 中文约 1.5-2 token/字，保守按 len/3 估算，仅用于客户端预算
-
     return {"input_tokens": max(1, (len(text) + 2) // 3)}
-
-
-
 
 
 # ---------------------------------------------------------------- OpenAI Responses（ccswitch / Codex CLI）
@@ -2879,7 +2405,6 @@ async def anthropic_count_tokens(request: Request, identity: Identity = Depends(
 # Codex 的 wire_api="responses"：POST {base}/v1/responses。放行直通上游，
 
 # 拦截/降级时转 chat.completions 打本地模型，再转回 Responses 格式。
-
 
 
 def _codex_session_id(body):
@@ -2913,31 +2438,25 @@ def _codex_session_id(body):
 @app.post("/v1/responses")
 
 async def responses_api(request: Request, identity: Identity = Depends(_rate_limit_messages)):
-
     body = await request.json()
 
     # codex 不发 X-Session-ID：回落对话指纹（见 _codex_session_id）
     session_id = extract_session_id(request.headers) or _codex_session_id(body)
-
     text = responses_text(body)
-
     audit_preview = _audit_preview_responses(body, text)
     inline_text, inline_bad = await _inline_media_scan("responses", body)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("responses", body, text)
     file_ctx = extract_responses_filectx(body, text)
-
     decision, text_findings, l2_result = await _review_text(
         text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-        l2_chunks=l2_blocks, file_ctx=file_ctx)
-
+        l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""))
 
 
     decision, downgraded = _block_to_fallback(decision)
     _mark_gw_action(request, decision)
     _mark_pre_upstream(request)
-
     if responses_should_mark(decision.get("name"), decision.get("action"), file_ctx):
         # 附件/内联文件触发拦截后污染 session，后续追问自动走本地（TTL 见 .env）。
         # （P1-1 client 身份标记已移除，2026-09-18）
@@ -2947,24 +2466,20 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                 session_id,
                 {"name": _mark_file, "rule": decision.get("name"), "action": decision.get("action")},
             )
+        _mark_taint_hit(_identity_bind_key(request), file_ctx.get("filename") or "", decision)
     if decision.get("action") == "block":
 
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "responses", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
-
         "session_id": session_id,})
-
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"),
 
                                          "message": "请求因机密策略被拦截，未转发至外网"})
 
 
-
     try:
 
         prov = None
-
         model = ""
-
         prov, model, notes = resolve(decision, {"model": str(body.get("model") or "")}, request.headers, kind="chat")
 
     except RoutingError as exc:
@@ -2972,25 +2487,20 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
         log_upstream_failure(request, type_="responses", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
-
                               provider=prov, model=model, session_id=session_id)
 
         raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "message": str(exc)})
 
 
-
     if body.get("stream"):
 
         async def gen():
-
             sent = False
-
             try:
 
                 async for chunk in route_responses_stream(body, decision, request.headers):
 
                     sent = True
-
                     yield chunk
 
             except RoutingError as exc:
@@ -2998,13 +2508,10 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                 if not sent and exc.status_code >= 500:  # 仅瞬态错误(5xx/网络)降级；上游 4xx(密钥/权限/限流)直接透传
 
                     # 首字节前上游失败：透明降级到本地模型（本地走 chat->responses 事件转换）
-
                     try:
 
                         cfg_fc = load_routing()
-
                         lp = cfg_fc.local_provider()
-
                         if lp is not None and prov.name != lp.name:
 
                             fb_decision = {"name": "first_chunk_fallback", "priority": 0,
@@ -3014,15 +2521,12 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                             async for chunk in route_responses_stream(body, fb_decision, request.headers):
 
                                 sent = True
-
                                 yield chunk
 
                             log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
 
                                 "type": "responses", "action": "route_local", "rule": "first_chunk_fallback",
-
                                 "provider": lp.name, "local": True, "text_preview": audit_preview,
-
                                 "downgraded_from": "upstream_error", "stream": True, "session_id": session_id})
 
                             return
@@ -3047,29 +2551,21 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                 yield _sse_err({"type": "response.failed", "response": {"error": {"message": f"gateway stream error: {exc}"}}, "session_id": session_id,})
 
 
-
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
             "type": "responses", "action": decision.get("action"), "rule": decision.get("name"),
-
             "provider": prov.name, "local": prov.local, "model": model,
-
             "text_preview": audit_preview, "downgraded_from": downgraded, "stream": True, "filename": file_ctx.get("filename") or "",
-
             "session_id": session_id,
 
         })
-
         return StreamingResponse(gen(), media_type="text/event-stream", headers={
 
             "X-Gateway-Provider": prov.name,
-
             "X-Gateway-Local": "1" if prov.local else "0",
-
             "X-Gateway-Rule": _hdr_safe(decision.get("name")),
 
         })
-
 
 
     try:
@@ -3081,37 +2577,25 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
         log_upstream_failure(request, type_="responses", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
-
                               provider=prov, model=model, session_id=session_id)
 
         raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"),
 
-                                                     "provider": prov.name if prov else "", "message": str(exc),
-
+                                                     "provider": _err_provider(exc, prov), "message": str(exc),
                                                      "session_id": session_id,})
 
 
-
     gw = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
-
     gw["findings"] = text_findings
-
     result["gateway"] = gw
-
     log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
         "type": "responses", "action": decision.get("action"), "rule": decision.get("name"),
-
         "provider": gw["provider"], "local": gw["local"], "model": model,
-
         "text_preview": audit_preview, "downgraded_from": downgraded, "session_id": session_id, "filename": file_ctx.get("filename") or "",
 
     })
-
     return JSONResponse(result)
-
-
-
 
 
 # ---------------------------------------------------------------- /v1/* 兜底
@@ -3131,31 +2615,18 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
 DEFAULT_EGRESS_PATHS = (
 
     "chat/completions,completions,embeddings,models,responses,"
-
     "images/generations,moderations"
 
 )
 
 
-
-
-
 def _egress_whitelist() -> set[str]:
-
     """每次读取，改环境变量即时生效，不需要重启"""
-
     return {p.strip() for p in os.getenv("AI_GATEWAY_EGRESS_PATHS", DEFAULT_EGRESS_PATHS).split(",") if p.strip()}
 
 
-
-
-
 def _strict_egress() -> bool:
-
     return os.getenv("AI_GATEWAY_STRICT_EGRESS", "false").lower() in ("1", "true", "yes", "on")
-
-
-
 
 
 def _body_text(payload: Any, _depth: int = 0, _budget: list | None = None) -> str:
@@ -3193,72 +2664,46 @@ def _body_text(payload: Any, _depth: int = 0, _budget: list | None = None) -> st
 @app.post("/v1/files/check")
 
 async def files_check(request: Request, file: UploadFile = File(...), identity: Identity = Depends(_rate_limit_files)):
-
     data = await file.read()
-
     filename = file.filename or "unknown"
 
     # 异步线程池，避免阻塞事件循环（Excel/PDF 解析 20-100ms）
-
     file_info = await run_in_threadpool(inspect_file, data, filename)
-
     text = file_info.get("text", "")[:5000]
-
     text_findings = inspect_text(text)
     _note_risk(text_findings)
-
     session_id = extract_session_id(request.headers)
-
     session_conf = _is_session_confidential(session_id)
-
     ctx = {
 
         "text": text + " " + filename,
-
         "session": {"confidential": session_conf},
-
         "file": {
 
             "ext": file_info.get("ext", ""),
-
             "filename": filename,
-
             "headers": file_info.get("headers", []),
-
             "sheet_names": file_info.get("sheet_names", []),
-
             "text": text,
-
             "watermark": file_info.get("findings", {}).get("text_preview", "") if isinstance(file_info.get("findings"), dict) else "",
-
             "size": len(data),
 
         },
-
         "findings": {**text_findings, **file_info.get("findings", {})},
 
     }
-
     ctx["file"]["findings_text"] = str(file_info.get("findings", {}))
-
-
-
     policy_list = load_policy()
-
     decision = decide(policy_list, ctx)
     if decision.get("action") != "allow":
         request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
 
 
-
     # L2 小模型二次判定（文件场景：L1 为 allow 时触发，支持分块聚合应对长文档）
-
     l2_result = None
-
     if decision.get("action") == "allow":
 
         chunks = file_info.get("chunks") or [text[:2000]]
-
         if len(chunks) > 1:
 
             l2_result = await classify_chunks(chunks, filename=filename, headers=file_info.get("headers", []), sheet_names=file_info.get("sheet_names", []))
@@ -3268,11 +2713,8 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
             l2_result = await small_classify(
 
                 text[:2000],
-
                 filename=filename,
-
                 headers=file_info.get("headers", []),
-
                 sheet_names=file_info.get("sheet_names", []),
 
             )
@@ -3283,17 +2725,13 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
             request.state.gw_block_reason = f"l2:{(l2_result or {}).get('reason') or 'confidential'}"
 
 
-
     decision, downgraded = _block_to_fallback(decision)
     _mark_gw_action(request, decision)
     _mark_pre_upstream(request)
-
     try:
 
         prov = None
-
         model = ""
-
         prov, model, notes = resolve(decision, {"model": ""}, None, kind="chat")
 
     except RoutingError as exc:
@@ -3301,33 +2739,23 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
         log_upstream_failure(request, type_="file", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
-
                               provider=prov, model=model, filename=filename, ext=file_info.get("ext"), session_id=session_id)
 
         raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "message": str(exc)})
 
 
-
     log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", 
 
         "type": "file", "filename": filename, "ext": file_info.get("ext"),
-
         "action": decision.get("action"), "rule": decision.get("name"),
-
         "provider": prov.name, "local": prov.local, "model": model,
-
         "override_denied": notes.get("override_denied") if notes else None,
-
         "findings": file_info.get("findings"), "l2": l2_result,
-
-        "layer": "L2" if l2_result and decision.get("name") in ("small_model_confidential", "l2_unavailable") else "L1",
-
+        "layer": "L2" if l2_result and decision.get("name") in ("l2_confidential", "l2_unavailable") else "L1",
         "downgraded_from": downgraded,
-
         "session_id": session_id,
 
     })
-
     if decision.get("action") in ("route_local", "block"):
         # 命中即标 session（若有），后续同会话请求粘性走本地。
         # （P1-1 client 身份标记已移除，2026-09-18）
@@ -3335,11 +2763,10 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
             get_session_store().mark_confidential(
 
                 session_id,
-
                 {"name": filename, "rule": decision.get("name"), "action": decision.get("action")},
 
             )
-
+        _mark_taint_hit(_identity_bind_key(request), filename, decision)
 
 
     if decision.get("action") == "block":
@@ -3347,41 +2774,28 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"), "findings": file_info.get("findings")})
 
 
-
     gw = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
-
     if l2_result:
 
         gw["l2"] = l2_result
 
 
-
     return {
 
         "filename": filename,
-
         "ext": file_info.get("ext"),
-
         "gateway": gw,
-
         "findings": file_info.get("findings"),
-
         "text_findings": text_findings,
-
         "preview": file_info.get("findings", {}).get("sample_preview") or file_info.get("findings", {}).get("text_preview", "")[:800],
-
         "message": "审查未通过：已自动转本地模型，文件内容不会出境" if gw["action"] == "route_local" else "审查通过：可走外网模型",
 
     }
 
 
-
-
-
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 
 async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bind_identity_ctx)):
-
     """
 
     未单独实现的 /v1/* 端点：先审查，通过才转发到外网 provider。
@@ -3389,15 +2803,12 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
     必须注册在所有具体 /v1 路由之后，否则会把 /v1/files/check 之类吞掉。
 
     """
-
     session_id = extract_session_id(request.headers)
-
     if _strict_egress() and path not in _egress_whitelist():
 
         raise HTTPException(403, detail={"type": "egress_denied", "path": path,
 
                                          "message": "严格出网模式：该端点不在白名单内"})
-
 
 
     if request.method in ("POST", "PUT"):
@@ -3430,17 +2841,12 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
 
     findings = inspect_text(text)
     _note_risk(findings)
-
     decision = decide(load_policy(), {
 
         "text": text,
-
         "file": {"ext": "", "filename": "", "headers": [], "sheet_names": [], "text": ""},
-
         "findings": findings,
-
         "session_id": session_id,
-
         "session": {"confidential": _is_session_confidential(session_id)},
 
     })
@@ -3452,11 +2858,9 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
     _mark_pre_upstream(request)
 
 
-
     # 非 chat 端点无法"降级到本地模型"（本地大模型没有 /v1/images 之类接口），
 
     # 所以审查不通过只能拒绝，绝不静默发给外网。
-
     if decision.get("action") != "allow":
 
         log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "egress_blocked", "path": path, "action": decision.get("action"),
@@ -3466,17 +2870,13 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
         raise HTTPException(403, detail={
 
             "type": "policy_violation", "path": path, "rule": decision.get("name"),
-
             "message": "审查未通过，且该端点无本地模型可降级，已拒绝外发",
 
         })
 
 
-
     cfg = load_routing()
-
     prov = cfg.external_provider()
-
     if prov is None or not prov.base_url:
 
         raise HTTPException(503, detail={"type": "routing_error", "message": "未配置外网 provider"})
@@ -3501,29 +2901,22 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
                                          "message": f"网关未配置 {prov.name} 凭据，请联系管理员（{prov.api_key_env}；不再支持随请求携带上游密钥）"})
 
 
-
     body = await request.body()
-
     client = get_proxy_client(prov.local)
-
     try:
 
         r = await client.request(
 
             request.method, prov.endpoint("proxy", custom_path=path),
-
             headers=prov.headers(ukey), content=body,
-
             params=dict(request.query_params), timeout=prov.timeout,
 
         )
 
     except httpx.HTTPError as exc:
 
-        raise HTTPException(502, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": prov.name if prov else "", "message": str(exc),
-
+        raise HTTPException(502, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc),
         "session_id": session_id,})
-
 
 
     log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "egress", "path": path, "provider": prov.name, "local": prov.local,
@@ -3533,18 +2926,12 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
     return Response(
 
         content=r.content, status_code=r.status_code,
-
         media_type=r.headers.get("content-type", "application/json"),
-
         headers={"X-Gateway-Provider": _hdr_safe(prov.name), "X-Gateway-Local": "1" if prov.local else "0",
 
                  "X-Gateway-Rule": _hdr_safe(decision.get("name"))},
 
     )
-
-
-
-
 
 
 _ADMIN_LOGIN_PAGE_TMPL = """<!doctype html>
@@ -3667,36 +3054,46 @@ def _to_beijing(value):
         return value
 
 
+def _audit_key_name_map() -> dict:
+    """token_masked -> 登记名：读时 enrichment 用（审计写时只存脱敏 key，反解不出名）。
+
+    正向建表：mask_key(key_plain) -> name；模糊条目（含 *）的 mask 无意义，跳过。
+    历史行/新行、Redis/MySQL 全覆盖，零 schema 变更；fail-open。"""
+    try:
+        from .admin_store import get_admin_store, mask_key as _mask_key
+        m = {}
+        for k in get_admin_store().list_api_keys_raw() or []:
+            kp = (k.get("key_plain") or "").strip()
+            nm = (k.get("name") or "").strip()
+            if not kp or "*" in kp or not nm:
+                continue
+            m.setdefault(_mask_key(kp), nm)
+        return m
+    except Exception:
+        return {}
+
+
+def _enrich_audit_key_name(rows) -> None:
+    """就地补 key_name（未知/未登记留空，调用方按 token_masked 回退展示）。"""
+    mp = _audit_key_name_map()
+    if not mp:
+        return
+    for e in rows or []:
+        try:
+            if isinstance(e, dict) and not e.get("key_name"):
+                e["key_name"] = mp.get(e.get("token_masked") or "", "")
+        except Exception:
+            pass
+
+
 @app.get("/admin/audit/entries", dependencies=[Depends(admin_page_auth)])
 
-async def audit_entries_api(request: Request, ip: Optional[str] = None, token: Optional[str] = None, action: Optional[str] = None, limit: Optional[str] = None, type: Optional[str] = None, page: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None, provider: Optional[str] = None, rule: Optional[str] = None, q: Optional[str] = None, sort: Optional[str] = None):
-
+async def audit_entries_api(request: Request, ip: Optional[str] = None, token: Optional[str] = None, action: Optional[str] = None, page: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None, provider: Optional[str] = None, rule: Optional[str] = None, q: Optional[str] = None, sort: Optional[str] = None, shadow: Optional[str] = None):
     # Filtering: ip (client_ip) and action
-
     store = get_audit_store()
 
     # 固定每页 50 条；接受 str/int/None
-
-    try:
-
-        limit = int(limit) if str(limit).strip() not in ("", "None", None) else 50
-
-    except (ValueError, TypeError):
-
-        limit = 50
-
     limit = 50
-
-    try:
-
-        page = int(page) if str(page).strip() not in ("", "None", None) else 1
-
-    except (ValueError, TypeError):
-
-        page = 1
-
-    page = max(1, page)
-
     try:
 
         page = int(page)
@@ -3708,19 +3105,15 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     page = max(1, page)
 
     # 为分页需要足够数据，固定拉取 5000 条（覆盖 100页*50），足够仪表盘使用且不影响性能
-
     fetch_n = 5000
 
     # 仪表盘筛选：始终基于 Redis 热缓存 tail（oldest-first），内存过滤后分页，保持与表格一致
-
     all_entries = store.tail(fetch_n)
-
+    _enrich_audit_key_name(all_entries)
     entries = all_entries
-
     if ip:
 
         ip = ip.strip()
-
         if ip:
 
             entries = [e for e in entries if ip in (e.get("client_ip") or "")]
@@ -3728,17 +3121,14 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     if token:
 
         token = token.strip()
-
         if token:
 
             _tl = token.lower()
-
-            entries = [e for e in entries if _tl in str(e.get("token_masked") or "").lower()]
+            entries = [e for e in entries if _tl in str(e.get("token_masked") or "").lower() or _tl in str(e.get("key_name") or "").lower()]
 
     if action:
 
         action = action.strip()
-
         if action:
 
             entries = [e for e in entries if e.get("action") == action]
@@ -3746,7 +3136,6 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     if provider:
 
         provider = provider.strip()
-
         if provider:
 
             entries = [e for e in entries if (e.get("provider") or "") == provider]
@@ -3754,116 +3143,18 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     if rule:
 
         rule = rule.strip()
-
         if rule:
 
             entries = [e for e in entries if (e.get("rule") or "") == rule]
 
     # 时间范围：since/until 支持 1h/24h/7d/30d 或 YYYY-MM-DD 或 ISO
-
-    def _parse_t(s, is_until: bool = False):
-
-        if not s or not str(s).strip():
-
-            return None
-
-        s = str(s).strip()
-
-        if s.endswith("h") or s.endswith("d"):
-
-            try:
-
-                n = int(s[:-1])
-
-                delta = timedelta(hours=n) if s.endswith("h") else timedelta(days=n)
-
-                return datetime.now() - delta
-
-            except Exception:
-
-                pass
-
-        try:
-
-            if "T" in s:
-
-                return to_local_naive(datetime.fromisoformat(s.replace("Z", "+00:00")))
-
-            if len(s) == 10:
-
-                dt = datetime.strptime(s, "%Y-%m-%d")
-
-                if is_until:
-
-                    return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-                return dt
-
-            return datetime.fromisoformat(s) if " " in s else datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-
-        except Exception:
-
-            try:
-
-                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-
-            except Exception:
-
-                return None
-
-
-
-    since_dt = _parse_t(since, is_until=False)
-
-    until_dt = _parse_t(until, is_until=True)
-
+    since_dt = _parse_window_ts(since)
+    until_dt = _parse_window_ts(until, is_until=True)
     if since_dt or until_dt:
-
-        def _to_dt(v):
-
-            if not v:
-
-                return None
-
-            if isinstance(v, datetime):
-
-                return to_local_naive(v)
-
-            v = str(v).strip()
-
-            try:
-
-                if "T" in v:
-
-                    return to_local_naive(datetime.fromisoformat(v.replace("Z", "+00:00")))
-
-                return datetime.fromisoformat(v)
-
-            except Exception:
-
-                try:
-
-                    return datetime.strptime(v.split(".")[0], "%Y-%m-%d %H:%M:%S")
-
-                except Exception:
-
-                    try:
-
-                        return datetime.strptime(v, "%Y-%m-%d")
-
-                    except Exception:
-
-                        return None
-
-
-
         tmp = []
-
-        for e in entries:
-
-            t = _to_dt(e.get("time") or e.get("ts") or "")
-
-            if not t: 
+        for e in all_entries:
+            t = _parse_window_ts(e.get("time") or e.get("ts") or "")
+            if not t:
 
                 continue
 
@@ -3882,11 +3173,9 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     if q:
 
         q=q.strip()
-
         if q:
 
             ql=q.lower()
-
             def _is_local(e):
                 v = e.get("local")
                 return v is True or v in (1, "1", "true", "True")
@@ -3900,17 +3189,33 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
             def _match(e):
                 if q_route is not None and _is_local(e) == q_route:
                     return True
-                for k in ("text_preview","filename","requested_model","model","provider","rule","client_ip","type","token_masked"):
+                for k in ("text_preview","filename","requested_model","model","provider","rule","client_ip","type","token_masked","key_name"):
 
                     v=e.get(k)
-
                     if v and ql in str(v).lower():
 
                         return True
+                # l2 判定 JSON（含影子 shadow_*）：搜 shadow_degraded / CONFIDENTIAL 等可定位 L2 记录
+                try:
+                    import json as _js
+                    if ql in _js.dumps(e.get("l2") or {}, ensure_ascii=False).lower():
+                        return True
+                except Exception:
+                    pass
 
                 return False
 
             entries=[e for e in entries if _match(e)]
+
+    # 影子筛选：shadow=mismatch 只留主影 label 不一致的（影子验收专用；无影子/主判定降级的不算）
+    if (shadow or "").strip() == "mismatch":
+        def _mm(e):
+            l2 = e.get("l2")
+            if not isinstance(l2, dict):
+                return False
+            sl = l2.get("shadow_label")
+            return sl in ("CONFIDENTIAL", "NORMAL") and not l2.get("degraded") and sl != l2.get("label")
+        entries = [e for e in entries if _mm(e)]
 
     # 排序：默认严格 time_desc（最新在前），支持 time_asc / provider / rule / type
     def _t_key(x):
@@ -3928,11 +3233,8 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
         entries = sorted(entries, key=_t_key, reverse=True)
 
     # KPI 统计基于筛选后全量（分页前）
-
     total_filtered = len(entries)
-
     total_pages = max(1, (total_filtered + limit - 1) // limit)
-
     if page > total_pages:
 
         page = total_pages
@@ -3943,37 +3245,27 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     page_entries = entries[start:end]
 
 
-
     # --- stats for header KPI ---  # 基于筛选后全量（分页前）
-
     total = total_filtered
-
     c_allow = sum(1 for e in entries if e.get("action")=="allow")
-
     c_route = sum(1 for e in entries if is_local_route(e.get("action")))
-
     c_block = sum(1 for e in entries if _entry_blocked(e))
-
     c_other = total - c_allow - c_route - c_block
-
     c_local = sum(1 for e in entries if e.get("local"))
-
     c_ext = total - c_local
-
-
-
     def _plain(v):
         if v is None or isinstance(v, (str, int, float, bool)):
             return v
         return str(v)
 
     _keys = ("time", "type", "rule", "action", "provider", "local", "model",
-             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "session_id")
+             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2")
     return JSONResponse({
         "total": total, "page": page, "pages": total_pages, "limit": limit,
         "c_allow": c_allow, "c_route": c_route, "c_block": c_block,
         "c_other": c_other, "c_local": c_local, "c_ext": c_ext,
-        "entries": [{k: (_to_beijing(e.get(k)) if k == "time" else _plain(e.get(k))) for k in _keys} for e in page_entries],
+        # l2 保持对象原样（主判定 + 影子 shadow_*），前端展开行渲染；_plain 会把 dict 压成 str，不用它
+        "entries": [{k: (_to_beijing(e.get(k)) if k == "time" else (e.get(k) if k == "l2" else _plain(e.get(k)))) for k in _keys} for e in page_entries],
     })
 
 
@@ -3986,27 +3278,16 @@ async def admin_legacy_redirect():
 @app.get("/admin/csv")
 
 async def export_csv(
-
     _ip: str = Depends(admin_auth),
-
     since: Optional[str] = None,       # ISO 8601 or "YYYY-MM-DD" or "1h"/"24h"/"7d"
-
     until: Optional[str] = None,       # ISO 8601 or "YYYY-MM-DD"; default = now
-
     action: Optional[str] = None,      # allow | route_local | block
-
     rule: Optional[str] = None,
-
     type: Optional[str] = None,        # chat | file | messages | responses | embedding
-
     ip: Optional[str] = None,          # client_ip filter
-
     token: Optional[str] = None,       # caller key (masked) filter
-
     q: Optional[str] = None,           # keyword filter
-
     source: Optional[str] = "auto",    # auto | redis | mysql  (auto = mysql if since/until given)
-
     limit: int = 5000,
 
 ):
@@ -4022,109 +3303,31 @@ async def export_csv(
     - Time shortcuts: "1h", "24h", "7d", "30d" relative to now.
 
     """
-
     import csv, io
-
-    from datetime import datetime, timedelta
-
     store = get_audit_store()
-
-
-
-    def _parse(t: Optional[str], default: Optional[datetime] = None, is_until: bool = False) -> Optional[datetime]:
-
-        if not t:
-
-            return default
-
-        t = str(t).strip()
-
-        if t.endswith("h") or t.endswith("d"):
-
-            try:
-
-                n = int(t[:-1])
-
-                delta = timedelta(hours=n) if t.endswith("h") else timedelta(days=n)
-
-                return datetime.now() - delta
-
-            except ValueError:
-
-                pass
-
-        try:
-
-            if "T" in t:
-
-                return to_local_naive(datetime.fromisoformat(t.replace("Z", "+00:00")))
-
-            if len(t) == 10:
-
-                dt = datetime.strptime(t, "%Y-%m-%d")
-
-                if is_until:
-
-                    return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-                return dt
-
-            return datetime.fromisoformat(t) if " " in t else datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
-
-        except ValueError:
-
-            return default
-
-
-
-    use_mysql = (source == "mysql") or (source == "auto" and (since or until or action or rule or type or ip or q or token))
-
-
-
-    cols = ["time", "type", "rule", "action", "provider", "local", "model", "requested_model", "downgraded_from", "filename", "text_preview", "id", "client_ip", "token_masked", "session_id"]
-
-    def _csv_safe(v):  # 防 Excel 公式注入：=,+,-,@ 开头加单引号前缀
-        if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
-            return "'" + v
-        return v
-
-    buf = io.StringIO()
-
-    w = csv.DictWriter(buf, fieldnames=cols)
-
-    w.writeheader()
-
-
-
-    if use_mysql:
-
-        since_dt = _parse(since, is_until=False)
-
-        until_dt = _parse(until, default=datetime.now(), is_until=True)
-
+    if since or until:
+        since_dt = _parse_window_ts(since)
+        until_dt = _parse_window_ts(until, default=datetime.now(), is_until=True)
         rows = store.query_mysql(since=since_dt, until=until_dt, action=action, rule=rule, type_=type, limit=limit)
-
         if ip:
 
             ip = ip.strip()
-
             rows = [r for r in rows if ip in (r.get("client_ip") or "")]
 
+        _enrich_audit_key_name(rows)
         if q:
 
             ql = q.strip().lower()
-
             if ql:
 
-                rows = [r for r in rows if any(ql in str(r.get(k) or "").lower() for k in ("text_preview","filename","requested_model","model","provider","rule","client_ip","type","token_masked"))]
+                rows = [r for r in rows if any(ql in str(r.get(k) or "").lower() for k in ("text_preview","filename","requested_model","model","provider","rule","client_ip","type","token_masked","key_name"))]
 
         if token:
 
             _tl = token.strip().lower()
-
             if _tl:
 
-                rows = [r for r in rows if _tl in str(r.get("token_masked") or "").lower()]
+                rows = [r for r in rows if _tl in str(r.get("token_masked") or "").lower() or _tl in str(r.get("key_name") or "").lower()]
 
         for r in rows:
 
@@ -4135,32 +3338,20 @@ async def export_csv(
             _row = {
 
                 "time": _to_beijing(r.get("ts", "")),
-
                 "type": r.get("type", ""),
-
                 "rule": r.get("rule", ""),
-
                 "action": r.get("action", ""),
-
                 "provider": r.get("provider", "") or "",
-
                 "local": "1" if r.get("local_flag") else "0",
-
                 "model": r.get("model", "") or "",
-
                 "requested_model": r.get("requested_model", "") or "",
-
                 "downgraded_from": r.get("downgraded_from", "") or "",
-
                 "filename": r.get("filename", "") or "",
-
                 "text_preview": (r.get("text_preview", "") or "")[:200],
-
                 "id": r.get("req_id", ""),
-
                 "client_ip": r.get("client_ip", "") or "",
-
                 "token_masked": r.get("token_masked", "") or "",
+                "key_name": r.get("key_name") or r.get("token_masked") or "",
 
             }
             w.writerow({k: _csv_safe(v) for k, v in _row.items()})
@@ -4168,21 +3359,19 @@ async def export_csv(
     else:
         # Redis 热缓存路径：显式按时间升序导出，保证确定性（MySQL 分支已 ORDER BY ts）
         rows_hot = sorted(store.all(), key=lambda x: str(x.get("time") or x.get("ts") or "").replace("T", " ")[:19])
+        _enrich_audit_key_name(rows_hot)
         for e in rows_hot:
+            if not e.get("key_name"):
+                e["key_name"] = e.get("token_masked") or ""
             w.writerow({k: (_csv_safe(_to_beijing(e.get(k, ""))) if k == "time" else (_csv_safe(e.get(k, "")) if k != "local" else (1 if e.get(k) else 0))) for k in cols})
-
 
 
     return HTMLResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=gateway_audit.csv"})
 
 
-
-
-
 @app.get("/admin/metrics")
 
 async def metrics_endpoint(_ip: str = Depends(admin_auth)):
-
     return Response(content=get_metrics().render(), media_type=f"text/plain; version={GATEWAY_VERSION}")
 
 
@@ -4214,7 +3403,6 @@ async def metrics_timeseries():
     return JSONResponse({"interval_s": ring.tick_s, "ticks": list(ring.points), "panel": panel})
 
 
-
 @app.get("/admin/metrics/panel", dependencies=[Depends(admin_page_auth)])
 async def metrics_panel_redirect():
     """旧指标面板 HTML 页已退役，统一跳转 Admin Console SPA。"""
@@ -4224,113 +3412,43 @@ async def metrics_panel_redirect():
 @app.get("/admin/circuit")
 
 async def circuit_state(_ip: str = Depends(admin_auth)):
-
     from .circuit_breaker import get_breaker
-
     return JSONResponse(get_breaker().snapshot())
-
-
-
-
-
-@app.post("/admin/circuit/reset")
-
-async def circuit_reset(_ip: str = Depends(admin_auth)):
-
-    """手动重置所有/指定 provider 的熔断器。仅供运维使用。"""
-
-    from .circuit_breaker import get_breaker
-
-    b = get_breaker()
-
-    b.reset()
-
-    return JSONResponse({"status": "reset", "snapshot": b.snapshot()})
-
-
-
 
 
 @app.get("/admin/audit/status")
 
 async def audit_status(_ip: str = Depends(admin_auth)):
-
     """Show audit backend status (Redis hot cache + MySQL long-term)."""
-
-    import re as _re
     store = get_audit_store()
     # 密码脱敏：redis url 与 backend 串里都带明文密码，不进管理 API 响应
-    _redact = lambda u: _re.sub(r"://[^@/]*@", "://***@", str(u or ""))
-
+    _redact = lambda u: re.sub(r"://[^@/]*@", "://***@", str(u or ""))
     return {
 
         "backend": _redact(store.backend()),
-
         "redis": {
 
             "connected": store._r is not None,
-
             "url": _redact(store._r_url),
 
         },
-
         "mysql": store.mysql_status(),
 
     }
 
 
-
-
-
-@app.post("/admin/audit/cleanup")
-
-async def audit_cleanup(_ip: str = Depends(admin_auth), days: int = 90):
-
-    """Delete audit rows older than N days (default 90). Returns row count deleted."""
-
-    store = get_audit_store()
-
-    deleted = store.cleanup_old(days=days)
-
-    return {"deleted": deleted, "days": days}
-
-
-
-
-
-@app.post("/admin/audit/reset")
-
-async def audit_reset(_ip: str = Depends(admin_auth)):
-
-    """Reset audit backends after DB/Redis fix (clears disabled flag)."""
-
-    store = get_audit_store()
-
-    result = store.reset()
-
-    import time, uuid
-
-    test_entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "id": str(uuid.uuid4())[:8], "type": "audit_reset", "action": "reset", "rule": "admin", "text_preview": "audit reset triggered"}
-
-    store.append(test_entry)
-
-    return result
-
-
-
-
-
-
-
-def _parse_window_ts(v, now=None):
+def _parse_window_ts(v, now=None, is_until=False, default=None):
     """时间窗参数 -> 本地墙钟朴素 datetime（唯一实现）。
 
-    支持 "1h"/"7d" 相对窗与 ISO/日期串。ISO 一律先解析成 aware 再 to_local_naive()
-    落本地：审计明细的 time 是 time.strftime 本地墙钟，两侧必须同一时基
-    （原实现把 UTC 串直接当本地用，窗口整体偏一个时区）。
+    支持 datetime 实例、"1h"/"7d" 相对窗与 ISO/日期串。ISO 一律先解析成 aware
+    再 to_local_naive() 落本地：审计明细的 time 是 time.strftime 本地墙钟，
+    两侧必须同一时基（原实现把 UTC 串直接当本地用，窗口整体偏一个时区）。
+    is_until + 纯日期 = 当日 23:59:59.999999。解析失败/空 = default。
     """
-    if not v:
-        return None
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    if isinstance(v, datetime):
+        return to_local_naive(v)
     v = str(v).strip()
     now = now or datetime.now()
     if v.endswith("h") or v.endswith("d"):
@@ -4343,17 +3461,18 @@ def _parse_window_ts(v, now=None):
         if "T" in v:
             return to_local_naive(datetime.fromisoformat(v.replace("Z", "+00:00")))
         if len(v) == 10:
-            return datetime.strptime(v, "%Y-%m-%d")
-        return datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(v, "%Y-%m-%d")
+            if is_until:
+                return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return dt
+        return to_local_naive(datetime.fromisoformat(v)) if " " in v else datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
     except Exception:
-        return None
+        return default
 
 
 def _analytics_aggregate(entries, since=None, until=None):
     """按所选时间跨度聚合；趋势固定 60 桶，桶宽 = 跨度/60（自适应标签粒度）。"""
-    from datetime import datetime, timedelta
     now0 = datetime.now()
-
     def _t(v):
         return _parse_window_ts(v, now=now0)
 
@@ -4373,7 +3492,6 @@ def _analytics_aggregate(entries, since=None, until=None):
             continue
         filtered.append((t, e))
     entries = [e for _, e in filtered]
-
     total = len(entries)
     c_allow = sum(1 for e in entries if e.get("action") == "allow")
     c_route = sum(1 for e in entries if is_local_route(e.get("action")))
@@ -4492,19 +3610,16 @@ if os.path.isdir(_app_static_dir):
     app.mount("/static/admin", StaticFiles(directory=_app_static_dir), name="admin_static")
 
 
-# SPA 静态资源（/static/admin/assets/*）；index.html 由 /admin/app 路由托管。
-# 目录存在才挂载，避免未构建环境下启动报错。
-_app_static_dir = os.path.join("static", "admin")
-if os.path.isdir(_app_static_dir):
-    app.mount("/static/admin", StaticFiles(directory=_app_static_dir), name="admin_static")
-
-
 @app.get("/admin/app", response_class=HTMLResponse, dependencies=[Depends(admin_page_auth)])
 async def admin_console_spa():
-    """Admin Console SPA（React 构建产物 static/admin/）。"""
+    """Admin Console SPA（React 构建产物 static/admin/）。
+
+    index.html 恒 no-cache（hashed 资源可长缓存，入口不可）：npm run build 换 chunk
+    hash 后浏览器必须重取入口，否则旧 index-*.js 去要已删的旧 chunk → 控制台 404。
+    """
     p = os.path.join("static", "admin", "index.html")
     if os.path.exists(p):
-        return FileResponse(p)
+        return FileResponse(p, headers={"Cache-Control": "no-cache"})
     return HTMLResponse(
         "<h3>Admin Console 未构建</h3><p>在 web/admin/ 下执行 npm install && npm run build</p>",
         status_code=404,
@@ -4538,7 +3653,6 @@ async def _admin_ip_filter_mw(request: Request, call_next):
     白名单放行、黑名单 403，仅作用于 /v1/* 出口路径；落库走单线程 executor
     fire-and-forget，store/统计任何故障都不阻断主链路。"""
     from .stats_service import log_request_async, peek_model_from_body, peek_provider_from_response, provider_from_json_bytes
-
     path = request.url.path
     if not path.startswith("/v1/"):
         return await call_next(request)
@@ -4624,7 +3738,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
         _reason = getattr(request.state, "gw_block_reason", None)
         _act = getattr(request.state, "gw_action", None) or resolve_action(_reason, getattr(response, "status_code", 0))
         _breason = _reason or ""
-        _p_tok, _c_tok = _normalize_usage(getattr(request.state, "gw_usage", None))
+        _p_tok, _c_tok, _h_tok, _w_tok = _normalize_usage(getattr(request.state, "gw_usage", None))
         _ct = (response.headers.get("content-type") or "")
         # provider 归属（request_log.provider 的唯一来源）：响应头优先 ——
         # 流式与 egress 直通都带头；非流式 JSON 没有头，得读 body。
@@ -4658,8 +3772,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
                 _client_wants_usage = bool(isinstance(_bj, dict) and (( _bj.get("stream_options") or {}).get("include_usage")))
             except Exception:
                 _client_wants_usage = False
-            _usage = {"p": _p_tok, "c": _c_tok, "logged": False}
-
+            _usage = {"p": _p_tok, "c": _c_tok, "h": _h_tok, "w": _w_tok, "logged": False}
             def _flush():
                 if _usage["logged"]:
                     return
@@ -4680,6 +3793,8 @@ async def _admin_ip_filter_mw(request: Request, call_next):
                         provider=_provider,
                         prompt_tokens=_usage["p"],
                         completion_tokens=_usage["c"],
+                        cached_tokens=_usage.get("h", 0),
+                        cache_creation_tokens=_usage.get("w", 0),
                     )
                     if _usage["p"] or _usage["c"]:
                         try:
@@ -4736,6 +3851,8 @@ async def _admin_ip_filter_mw(request: Request, call_next):
                 provider=_provider,
                 prompt_tokens=_p_tok,
                 completion_tokens=_c_tok,
+                cached_tokens=_h_tok,
+                cache_creation_tokens=_w_tok,
             )
             if _p_tok or _c_tok:
                 try:
@@ -4754,5 +3871,4 @@ async def _admin_ip_filter_mw(request: Request, call_next):
         return response
 
     return await call_next(request)
-
 

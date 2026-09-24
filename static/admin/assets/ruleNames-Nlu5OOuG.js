@@ -1,0 +1,1 @@
+const _={session_route_local:"会话机密转内网",financial_local_only:"财务表转内网",ocr_empty_image_route_local:"空图转内网",drawing_local_only:"图纸转内网",block_secrets:"拦截密钥",pii_critical_block:"高危隐私拦截",pii_weighted_route_local:"隐私加权转内网",unparsed_binary_route_local:"未解析二进制转内网",default_allow:"默认放行"};function o(l){return l?_[l]||l:"—"}export{_ as R,o as r};

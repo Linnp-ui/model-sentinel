@@ -3,9 +3,7 @@
 目标态下客户端 API key 只承担四件事 —— 鉴权、归因、限流/配额、审计与策略分级；
 **永不作为上游 provider 凭据**（出境凭据归密钥池 `provider_keys` 管）。
 
-本模块是**纯本地**的：不发起任何网络调用。校验链第 3 级（上游验签，
-`key_validator.validate`）由 `main.auth()` 在需要时补做 —— 若中间件也做，
-等于给每个请求加一次外网往返。
+本模块是**纯本地**的：不发起任何网络调用，只做登记表查询。
 
 绑定键口径（限流分桶）：
 
@@ -17,9 +15,7 @@
 **字符集约束**：绑定键只含 ``[A-Za-z0-9-]``，方案文档里写的 ``key:<key_id>``（冒号）
 不可用。（P1-1 涉密标记已于 2026-09-18 移除，绑定键现仅用于限流分桶。）
 
-`key_id is None` 的三个合法来源：env 共享 dev key、上游验签放行的 key、
-以及（未来）匿名，用 `Identity.source` 区分。**不允许存在「无 key_id 且
-source 不属于上述之一」的身份** —— 这是本期要堵的口子。
+2026-09-20 收紧后未登记身份一律 401：`Identity` 只来自登记表（`source="registry"`）。
 """
 from __future__ import annotations
 
@@ -34,14 +30,10 @@ __all__ = [
     "identity_v2_enabled",
     "token_fp",
     "bind_key",
-    "dev_api_keys",
     "identity_from_entry",
-    "identity_from_env",
-    "identity_from_validator",
     "local_identity",
     "current_identity",
     "set_current_identity",
-    "reset_current_identity",
 ]
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
@@ -72,17 +64,13 @@ class Identity:
     """一个通过鉴权的调用方身份。
 
     本对象**不持有凭据明文**（只有 `token_fp`），可以安全地进日志/审计/repr。
-    `prefix` 在 P0 阶段恒为空串 —— 可读前缀要等 `api_key_map.key_prefix` 列
-    落地（P2）后回填，避免把明文片段塞进身份对象。
     """
 
     key_id: Optional[int]
     name: str
     owner: str
-    source: str          # registry | generated | env | validator | anonymous
-    prefix: str
+    source: str          # registry（2026-09-20 收紧后唯一来源）
     token_fp: str
-    tier: str = "normal"  # normal | white | black（来自 key_rule / keytier）
 
     @property
     def bind_key(self) -> str:
@@ -107,42 +95,7 @@ def identity_from_entry(token: str, entry) -> Identity:
         name=name,
         owner="",
         source="registry",
-        prefix="",
         token_fp=token_fp(token),
-    )
-
-
-def dev_api_keys() -> list:
-    """`AI_GATEWAY_DEV_API_KEY`（逗号分隔）解析结果，保序。"""
-    return [k.strip() for k in os.getenv("AI_GATEWAY_DEV_API_KEY", "").split(",") if k.strip()]
-
-
-def identity_from_env(token: str, ordinal: int = 0) -> Identity:
-    """env 共享 dev key：不是登记身份（``key_id=None``），归 ``shared-dev``。"""
-    try:
-        n = int(ordinal) + 1
-    except (TypeError, ValueError):
-        n = 1
-    return Identity(
-        key_id=None,
-        name="dev-key#%d" % n,
-        owner="shared-dev",
-        source="env",
-        prefix="",
-        token_fp=token_fp(token),
-    )
-
-
-def identity_from_validator(token: str) -> Identity:
-    """上游验签放行（未登记）。自动命名 ``auto:<fp 前 8 位>``，可在 Console 改名/停用。"""
-    fp = token_fp(token)
-    return Identity(
-        key_id=None,
-        name="auto:%s" % fp[:8],
-        owner="unassigned",
-        source="validator",
-        prefix="",
-        token_fp=fp,
     )
 
 
@@ -185,15 +138,7 @@ _CURRENT_IDENTITY: ContextVar[Optional[Identity]] = ContextVar("gw_current_ident
 
 
 def set_current_identity(identity: Optional[Identity]):
-    """设入当前 context，返回 token 供 ``reset_current_identity()``（测试用）。"""
     return _CURRENT_IDENTITY.set(identity)
-
-
-def reset_current_identity(token) -> None:
-    try:
-        _CURRENT_IDENTITY.reset(token)
-    except (ValueError, LookupError):
-        pass
 
 
 def current_identity() -> Optional[Identity]:

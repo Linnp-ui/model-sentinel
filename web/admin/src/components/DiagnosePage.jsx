@@ -1,21 +1,10 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Statistic, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
+import React, { useState } from 'react';
+import { Button, Input, Select, Tag, Space, message, Typography, Alert, Card } from 'antd';
 import { api, errText } from '../api.js';
 
 const { Text } = Typography;
 // ---------------- 运维诊断：路由检查器（L1→L2→路由 全链干跑） ----------------
-function RouteInspectCard() {
+export default function RouteInspectCard() {
   const [model, setModel] = useState('ext-flash');
   const [text, setText] = useState('');
   const [channel, setChannel] = useState('check');
@@ -98,6 +87,4 @@ function RouteInspectCard() {
 }
 
 
-export default function DiagnosePage() {
-  return <RouteInspectCard />;
-}
+

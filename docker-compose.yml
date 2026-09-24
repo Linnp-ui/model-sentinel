@@ -1,19 +1,4 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: gateway
-      POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: gateway
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway"]
-      interval: 5s
-      retries: 10
-
   redis:
     image: redis:7-alpine
     ports:
@@ -23,27 +8,18 @@ services:
       interval: 5s
       retries: 10
 
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    profiles: ["ollama"]
-    # 首次启动后手动: docker compose exec ollama ollama pull qwen2:7b
-
   gateway:
     build: .
     ports:
       - "8080:8080"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
-    # 如内网vLLM在宿主机/另一台机器，无需 ollama 容器；已有内网模型时注释掉 ollama 服务
+    # 开发用：明细/审计库指向 MySQL（生产同口径，见 agents/env.md）；
+    # 不设 DATABASE_URL / AUDIT_MYSQL_URL 则走内存后端（重启即丢）。
     environment:
-      DATABASE_URL: postgresql+psycopg://gateway:gateway@postgres:5432/gateway
+      DATABASE_URL: ${DATABASE_URL:-}
+      AUDIT_MYSQL_URL: ${AUDIT_MYSQL_URL:-}
       REDIS_URL: redis://redis:6379/0
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -56,7 +32,3 @@ services:
       - ./policy.yaml:/app/policy.yaml:ro
       - ./src:/app/src:ro
     command: uvicorn src.gateway.main:app --host 0.0.0.0 --port 8080 --reload
-
-volumes:
-  pgdata:
-  ollama_data:

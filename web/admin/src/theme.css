@@ -1,6 +1,7 @@
-/* 顶部常驻：滚动长表格时 Header + 状态灯始终可见（antd Header 默认高 64px） */
-.app-header { position: sticky; top: 0; z-index: 10; }
-.app-statusbar { position: sticky; top: 64px; z-index: 9; }
+/* 顶部常驻块：状态条在上 + 标题在下。真 fixed（sticky 在 body 滚动 + flex 下每帧重算会抖，
+   与侧边栏同因）；left:200 让出侧边栏，高度由 App.jsx 实测后内容区 paddingTop 让位 */
+.app-topbar { position: fixed; top: 0; left: 200px; right: 0; z-index: 10; background: #fff; }
+/* 注：页面工具栏统一用 Portal 挂标题右侧（#page-toolbar-slot），不跟内容滚动，无需吸顶 */
 
 /* 状态灯异常：红色 Tag 脉冲提示（系统偏好减动效时关闭） */
 @keyframes status-pulse {

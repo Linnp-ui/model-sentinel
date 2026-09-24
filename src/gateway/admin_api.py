@@ -35,16 +35,13 @@ M5（别名候选选择）：
   GET    /admin/api/providers/{name}/models  代理拉取供应商 /models（管理员选模型用）
 
 M6（运维留痕）：
-  POST   /admin/api/ops/audit-cleanup        审计清理（?days=N，默认 90）+ 留痕
-  POST   /admin/api/ops/audit-reset          审计后端重置 + 留痕
-  POST   /admin/api/ops/circuit-reset        熔断器全量重置 + 留痕
-  GET    /admin/api/ops-log                  运维留痕查询（最新在前）
 """
 from __future__ import annotations
 
 import os
 import re
-from typing import Dict, List, Optional
+import time
+from typing import Dict, List, Optional, Union
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -290,20 +287,41 @@ def stats_overview_api(hours: float = 168.0):
 
 @router.get("/stats/group")
 def stats_group_api(dim: str = "model", hours: float = 168.0):
-    """按维度分组（model|key_name|client_ip|provider|action）。"""
-    if dim not in ("model", "key_name", "client_ip", "provider", "action"):
-        raise HTTPException(422, "dim must be one of model/key_name/client_ip/provider/action")
+    """按维度分组（model|key_name|client_ip|provider|action|rule）。
+
+    rule = request_log.blocked_reason（命中规则名；空=放行无规则）。
+    """
+    if dim not in ("model", "key_name", "client_ip", "provider", "action", "rule"):
+        raise HTTPException(422, "dim must be one of model/key_name/client_ip/provider/action/rule")
     store = get_admin_store()
     since, until = _win(hours)
-    return {"dim": dim, "hours": hours, "items": store.stats_group(since, until, dim)}
+    col = "blocked_reason" if dim == "rule" else dim
+    return {"dim": dim, "hours": hours, "items": store.stats_group(since, until, col)}
 
 
-@router.get("/stats/daily")
-def stats_daily_api(hours: float = 168.0):
-    """按天聚合（图表用）。"""
+@router.get("/stats/billing")
+def stats_billing_api(hours: float = 168.0):
+    """Token 计费：KEY × 实际模型 × 单价 → ¥（内部成本分摊口径，不等于上游账单）。"""
+    store = get_admin_store()
+    return _stats.build_billing(store, hours)
+
+
+@router.get("/stats/timeseries")
+def stats_timeseries_api(hours: float = 168.0):
+    """60 桶趋势（统计页时间趋势；request_log 源，与同页 KPI 卡同口径）。"""
     store = get_admin_store()
     since, until = _win(hours)
-    return {"hours": hours, "items": store.stats_daily(since, until)}
+    return store.stats_timeseries(since, until)
+
+
+@router.get("/stats/chart")
+def stats_chart_api(hours: float = 24.0):
+    """总览折线图（QPS+延迟分位；request_log 源按窗口重分桶，点数与环线相当）。"""
+    store = get_admin_store()
+    since, until = _win(hours)
+    return store.stats_chart_series(since, until)
+
+
 
 
 @router.get("/stats/key-model")
@@ -314,15 +332,13 @@ def stats_key_model_api(hours: float = 168.0, top: int = 20):
     return {"hours": hours, "items": store.stats_key_model(since, until, top)}
 
 
-@router.get("/stats/ips")
-def stats_ips_api(hours: float = 168.0):
-    """3.4 IP 连接用量视图：调用量 + 拦截量（黑白名单已改为 KEY 维度，不在此标注）。"""
+@router.get("/stats/summary")
+def stats_summary_api(hours: float = 168.0, top: int = 20):
+    """统计页整页单请求（单遍聚合，7 端点合并；口径与各自端点逐字段一致，见 tests）。"""
     store = get_admin_store()
-    since, until = _win(hours)
-    items = store.stats_group(since, until, "client_ip")
-    for g in items:
-        g["rule"] = ""
-    return {"hours": hours, "items": items}
+    return _stats.build_summary(store, hours, top=top)
+
+
 
 
 @router.get("/logs")
@@ -356,8 +372,8 @@ def cleanup_logs_api(days: float = 90.0):
 def suggestions_api(hours: float = 24.0):
     """3.3 调节策略建议（规则引擎）。
 
-    meta 供 UI 明示口径：触发指标 = 异常处置（拦截 ∪ 本地路由），且规则 0（KEY 分级）
-    用 30 天独立窗口、规则 1/2/3 用 hours 窗口 —— 同一张卡片上并存两个窗口。
+    meta 供 UI 明示口径：触发指标 = 异常处置（拦截 ∪ 本地路由）；规则 0/5/6
+    用 30 天独立窗口、规则 1/2/3/4/7 用 hours 窗口 —— 同一张卡片上并存两个窗口。
     """
     store = get_admin_store()
     return {
@@ -368,17 +384,80 @@ def suggestions_api(hours: float = 24.0):
 
 
 class SuggestionApplyReq(BaseModel):
-    kind: str = Field(default="black", pattern="^(black|white|unwhite)$")
+    kind: str = Field(default="black", pattern="^(black|white|unwhite|reorder|remove_rule|add_limit)$")
     key: str = Field(default="", max_length=256)
     key_name: str = Field(default="", max_length=128)
     rule_id: Optional[int] = None
+    rule_a: str = Field(default="", max_length=128)
+    rule_b: str = Field(default="", max_length=128)
+    order: list = Field(default_factory=list)
+    rule_name: str = Field(default="", max_length=128)
+    limit_model: str = Field(default="", max_length=256)
+    limit_rpm: int = Field(default=0, ge=0, le=1000000)
     note: str = Field(default="", max_length=512)
 
 
 @router.post("/suggestions/apply")
 def suggestion_apply_api(req: SuggestionApplyReq):
-    """一键应用分级建议：black/white 按 key 或 key_name（后端解析明文）；unwhite 按 rule_id。"""
+    """一键应用分级建议：black/white 按 key 或 key_name（后端解析明文）；unwhite 按 rule_id；
+    reorder 按 order 全量重排 L1 规则 priority（规则 4 高频先判一次排到底；
+    无 order 时按 rule_a/rule_b 交换，兼容旧建议）；
+    remove_rule 按 rule_name 删除一条 L1 规则（规则 5 沉默清理）；
+    add_limit 按 limit_model/limit_rpm 加模型全局限流（规则 7，已有则更新，热重载生效）。"""
     store = get_admin_store()
+    if req.kind == "add_limit":
+        if not req.limit_model or req.limit_rpm <= 0:
+            raise HTTPException(422, "limit_model and positive limit_rpm required")
+        from src.gateway import model_policy as _mp
+        pol = _mp.load_model_policy()
+        rows = [m.model_dump() for m in pol.model_limits]
+        hit = [m for m in rows if m.get("model") == req.limit_model]
+        if hit:
+            hit[0]["rpm"] = req.limit_rpm
+            hit[0]["enabled"] = True
+        else:
+            rows.append({"model": req.limit_model, "rpm": req.limit_rpm,
+                         "enabled": True, "note": "strategy:suggest"})
+        data = pol.model_dump()
+        data["model_limits"] = rows
+        _mp.save_model_policy(data)
+        return {"ok": True, "limited": {req.limit_model: req.limit_rpm}}
+    if req.kind == "remove_rule":
+        if not req.rule_name:
+            raise HTTPException(422, "rule_name required")
+        from src.gateway import policy_admin as _pa
+        if not _pa.delete_policy(req.rule_name):
+            raise HTTPException(404, "policy rule not found")
+        return {"ok": True, "removed": req.rule_name}
+    if req.kind == "reorder":
+        from src.gateway import policy_admin as _pa
+        if req.order:
+            names = [n for n in dict.fromkeys(req.order) if n]
+            if len(names) < 2:
+                raise HTTPException(422, "order needs at least 2 distinct rules")
+            cur = {p["name"]: p for p in _pa.list_policies()}
+            missing = [n for n in names if n not in cur]
+            if missing:
+                raise HTTPException(404, f"policy rule not found: {missing[0]}")
+            slots = sorted(cur[n]["priority"] for n in names)
+            done = {}
+            for n, p in zip(names, slots):
+                row = dict(cur[n])
+                row["priority"] = p
+                _pa.upsert_policy(row, original_name=n)
+                done[n] = p
+            return {"ok": True, "reordered": done}
+        if not req.rule_a or not req.rule_b or req.rule_a == req.rule_b:
+            raise HTTPException(422, "rule_a and rule_b required (distinct)")
+        cur = {p["name"]: p for p in _pa.list_policies()}
+        if req.rule_a not in cur or req.rule_b not in cur:
+            raise HTTPException(404, "policy rule not found")
+        ra, rb = dict(cur[req.rule_a]), dict(cur[req.rule_b])
+        ra["priority"], rb["priority"] = rb["priority"], ra["priority"]
+        _pa.upsert_policy(ra, original_name=req.rule_a)
+        _pa.upsert_policy(rb, original_name=req.rule_b)
+        return {"ok": True, "reordered": {req.rule_a: ra["priority"],
+                                          req.rule_b: rb["priority"]}}
     if req.kind == "unwhite":
         if req.rule_id is None:
             raise HTTPException(422, "rule_id required")
@@ -420,16 +499,9 @@ class ModelPolicySaveReq(BaseModel):
 @router.get("/model-policy")
 def get_model_policy():
     from src.gateway import model_policy as mp
-    from src.gateway.small_model import SMALL_MODEL_URL, SMALL_MODEL_NAME, SMALL_MODEL_ENABLED
     pol = mp.load_model_policy()
     return {
         "policy": pol.model_dump(),
-        "review_model_runtime": {
-            "url": SMALL_MODEL_URL,
-            "name": SMALL_MODEL_NAME,
-            "enabled": SMALL_MODEL_ENABLED,
-            "source": "env（改需重启，页面只读）",
-        },
         "env_flag": {
             "AI_GATEWAY_MODEL_FALLBACK": os.getenv(
                 "AI_GATEWAY_MODEL_FALLBACK", "true"),
@@ -516,6 +588,7 @@ class AliasMemberReq(BaseModel):
 class AliasGroupSaveReq(BaseModel):
     description: str = ""
     members: list[AliasMemberReq]
+    new_name: str = ""  # 非空且 ≠ URL 组名 → 整组重命名（撞名 422）
 
 
 @router.get("/aliases")
@@ -524,18 +597,99 @@ def list_alias_groups_api():
     return {"groups": get_admin_store().list_alias_groups()}
 
 
+def build_public_models() -> list:
+    """/v1/models 对外模型列表（单一真源）：别名组（有启用成员）+ 内网主力模型
+    （model_policy.internal_models 启用项，与别名重名跳过）+ 用户自注册模型。
+
+    main.list_models 与管理端 /models/public 共用，两端保证一致。
+    """
+    from .model_policy import load_model_policy
+    from .user_models import get_store
+    data: list = []
+    now = int(time.time())
+    seen: set = set()
+    for g in get_admin_store().list_alias_groups():
+        members = [m for m in (g.get("members") or []) if m.get("enabled", 1)]
+        if not members:
+            continue
+        members = sorted(members, key=lambda x: x["priority"])
+        default = members[0]
+        seen.add(g["name"])
+        data.append({
+            "id": g["name"],
+            "object": "model",
+            "created": now,
+            "owned_by": "gateway",
+            "gateway": {
+                "kind": "chat",
+                "alias_group": g["name"],
+                "default": f"{default['provider']}/{default['model']}",
+                "candidates": [f"{m['provider']}/{m['model']}" for m in members],
+            },
+        })
+    try:
+        for im in load_model_policy().internal_models:
+            if not im.enabled or im.model in seen:
+                continue
+            seen.add(im.model)
+            data.append({
+                "id": im.model,
+                "object": "model",
+                "created": now,
+                "owned_by": "gateway",
+                "gateway": {
+                    "kind": "chat",
+                    "local": True,
+                    "provider": im.provider,
+                    "model": im.model,
+                    "configured": True,
+                    "note": im.note,
+                },
+            })
+    except Exception:
+        pass
+    for m in get_store().list():
+        mid = m.default_model or m.name
+        data.append({
+            "id": str(m.name),
+            "object": "model",
+            "created": int(m.created_at),
+            "owned_by": f"user:{m.owner}",
+            "gateway": {
+                "kind": "chat",
+                "local": False,
+                "default_model": m.default_model,
+                "model": str(mid),
+                "configured": True,
+                "user_defined": True,
+            },
+        })
+    return data
+
+
+@router.get("/models/public")
+def public_models_api():
+    """与 /v1/models 同一构造（build_public_models），供管理台对齐展示。"""
+    return {"data": build_public_models()}
+
+
 @router.put("/aliases/{name}")
 def update_alias_group_api(name: str, body: AliasGroupSaveReq):
-    """整组保存别名成员（按 priority 升序重排为 10,20,...；最小者为默认）。"""
+    """整组保存别名成员（按 priority 升序重排为 10,20,...；最小者为默认）。
+
+    body.new_name 非空且 ≠ URL 组名 → 整组重命名（目标名撞名 422），返回的
+    group 为最终名。"""
     try:
         saved = get_admin_store().update_alias_group(
             name,
             [m.model_dump() for m in body.members],
             description=body.description,
+            new_name=body.new_name,
         )
     except ValueError as e:
         raise HTTPException(422, str(e))
-    return {"ok": True, "group": name, "routes": saved}
+    final = (body.new_name or "").strip() or name
+    return {"ok": True, "group": final, "routes": saved}
 
 
 @router.delete("/aliases/{name}")
@@ -574,6 +728,8 @@ def list_providers_api():
             if k != "api_key_value":  # 明文密钥字段永不外泄
                 item[k] = v
         item["configured"] = p.configured
+        # 展开后的真实 base_url（只读，供 L2 审查卡按模型自动推导端点；编辑仍用 raw 的 base_url）
+        item["base_url_resolved"] = p.base_url
         items.append(item)
     return {"providers": items, "api_modes": list(SUPPORTED_MODES)}
 
@@ -635,18 +791,13 @@ def _provider_refs(name: str) -> List[str]:
     return out
 
 
-def load_routing_cfg():
-    from src.gateway.providers import load_routing
-    return load_routing()
-
-
 @router.post("/providers")
 def create_provider_api(request: Request, body: ProviderCreateReq):
     from src.gateway import providers as _pv
     name = body.name.strip()
     raw = _pv.load_raw()
     provs = raw.get("providers") or {}
-    if name in provs or load_routing_cfg().get(name) is not None:
+    if name in provs or _pv.load_routing().get(name) is not None:
         raise HTTPException(409, f"provider 已存在：{name}")
     provs[name] = _provider_payload(body)
     try:
@@ -662,7 +813,7 @@ def update_provider_api(request: Request, name: str, body: ProviderUpsertReq):
     from src.gateway import providers as _pv
     raw = _pv.load_raw()
     provs = raw.get("providers") or {}
-    if name not in provs and load_routing_cfg().get(name) is None:
+    if name not in provs and _pv.load_routing().get(name) is None:
         raise HTTPException(404, f"provider 不存在：{name}")
     merged = {k: v for k, v in (provs.get(name) or {}).items() if k != "api_key_value"}
     merged.update(_provider_payload(body))
@@ -686,7 +837,8 @@ def set_provider_key_api(request: Request, name: str, body: ProviderKeyReq):
     值只写不读：任何端点都不返回明文（GET /providers 只有 api_key_env 变量名 + configured 布尔）；
     ops-log 只记变量名+长度。"""
     from src.gateway import env_file
-    prov = load_routing_cfg().get(name)
+    from src.gateway import providers as _pv
+    prov = _pv.load_routing().get(name)
     if prov is None:
         raise HTTPException(404, f"provider 不存在：{name}")
     env_name = (prov.api_key_env or "").strip()
@@ -709,7 +861,7 @@ def delete_provider_api(request: Request, name: str):
     from src.gateway import providers as _pv
     raw = _pv.load_raw()
     provs = raw.get("providers") or {}
-    if name not in provs and load_routing_cfg().get(name) is None:
+    if name not in provs and _pv.load_routing().get(name) is None:
         raise HTTPException(404, f"provider 不存在：{name}")
     refs = _provider_refs(name)
     if refs:
@@ -788,48 +940,6 @@ def list_provider_models_api(name: str, x_api_key: Optional[str] = Header(None, 
 def _operator(request: Request) -> str:
     from src.gateway.main import _resolve_client_ip
     return _resolve_client_ip(request)
-
-
-@router.post("/ops/audit-cleanup")
-def ops_audit_cleanup(request: Request, days: int = 90):
-    """删除 N 天前审计（默认 90）并留痕。deleted<0 表示未配置 MySQL 审计库。"""
-    from src.gateway.audit_store import get_audit_store
-    deleted = get_audit_store().cleanup_old(days=days)
-    get_admin_store().log_ops("audit_cleanup", f"days={days} deleted={deleted}", _operator(request))
-    return {"deleted": deleted, "days": days}
-
-
-@router.post("/ops/audit-reset")
-def ops_audit_reset(request: Request):
-    """重置审计后端禁用标记（写测试条目自证）并留痕。"""
-    import time
-    import uuid
-
-    from src.gateway.audit_store import get_audit_store
-    store = get_audit_store()
-    result = store.reset()
-    store.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "id": str(uuid.uuid4())[:8],
-                  "type": "audit_reset", "action": "reset", "rule": "admin",
-                  "text_preview": "audit reset triggered"})
-    get_admin_store().log_ops("audit_reset", str(result)[:200], _operator(request))
-    return result
-
-
-@router.post("/ops/circuit-reset")
-def ops_circuit_reset(request: Request):
-    """重置全部 provider 熔断器并留痕。"""
-    from src.gateway.circuit_breaker import get_breaker
-    b = get_breaker()
-    b.reset()
-    snap = b.snapshot()
-    get_admin_store().log_ops("circuit_reset", f"breakers={len(snap)}", _operator(request))
-    return {"status": "reset", "snapshot": snap}
-
-
-@router.get("/ops-log")
-def list_ops_log_api(limit: int = 50):
-    """运维操作留痕（最新在前，最多 200 条）。"""
-    return {"items": get_admin_store().list_ops_log(limit)}
 
 
 @router.get("/policies")
@@ -923,10 +1033,32 @@ class L2ConfigPutReq(BaseModel):
     SMALL_MODEL_URL: Optional[str] = Field(default=None, max_length=512)
     SMALL_MODEL_NAME: Optional[str] = Field(default=None, max_length=128)
     SMALL_MODEL_MAX_TOKENS: Optional[int] = Field(default=None, ge=8, le=512)
+    AI_GATEWAY_L2_BACKEND: Optional[str] = Field(default=None, max_length=16)
+    AI_GATEWAY_L2_SHADOW: Optional[bool] = None
+    AI_GATEWAY_L2_SHADOW_URL: Optional[str] = Field(default=None, max_length=512)
     AI_GATEWAY_WL_L2_SAMPLE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD: Optional[int] = Field(default=None, ge=1, le=1000)
-    AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD: Optional[int] = Field(default=None, ge=1, le=100000)
+    AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD: Optional[Union[int, Dict[str, int]]] = None
+    AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD: Optional[Union[int, Dict[str, int]]] = None
     AI_GATEWAY_SUGGEST_ERROR_RATE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+def _ser_window_map(v, lo: int, hi: int, key: str) -> str:
+    """按窗口阈值序列化：int=全窗口同值；{hours: value} → '24:20,168:100,720:500'。"""
+    pairs = {}
+    if isinstance(v, int) and not isinstance(v, bool):
+        pairs = {24: v, 168: v, 720: v}
+    else:
+        for h, x in (v or {}).items():
+            try:
+                h_i, x_i = int(h), int(x)
+            except (TypeError, ValueError):
+                raise HTTPException(422, f"{key} 窗口/取值非法")
+            if not (lo <= x_i <= hi):
+                raise HTTPException(422, f"{key} 取值须 {lo}-{hi}")
+            pairs[h_i] = x_i
+    if not pairs:
+        raise HTTPException(422, f"{key} 不能为空")
+    return ",".join(f"{h}:{x}" for h, x in sorted(pairs.items()))
 
 
 class L2PromptsPutReq(BaseModel):
@@ -942,19 +1074,22 @@ def l2_config_get():
     from src.gateway import stats_service as _st
     from src.gateway.main import wl_l2_sample as _wl
     th = _st._thresholds()
+    win3 = lambda m, d: {str(h): _st.pick_window(m, h, d) for h in (24, 168, 720)}
     return {
         "SMALL_MODEL_ENABLED": _sm.l2_enabled(),
         "SMALL_MODEL_TIMEOUT": _sm.l2_timeout(),
         "SMALL_MODEL_URL": _sm.l2_url(),
         "SMALL_MODEL_NAME": _sm.l2_name(),
         "SMALL_MODEL_MAX_TOKENS": _sm.l2_max_tokens(),
+        "AI_GATEWAY_L2_BACKEND": _sm.l2_backend(),
+        "AI_GATEWAY_L2_SHADOW": (os.getenv("AI_GATEWAY_L2_SHADOW") or "").strip().lower() == "true",
+        "AI_GATEWAY_L2_SHADOW_URL": (os.getenv("AI_GATEWAY_L2_SHADOW_URL") or "").strip(),
         "AI_GATEWAY_WL_L2_SAMPLE": _wl(),
-        "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": th["violation"],
-        "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD": th["volume"],
+        "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": win3(th["violation_map"], 20),
+        "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD": win3(th["volume_map"], 1000),
         "AI_GATEWAY_SUGGEST_ERROR_RATE": th["error_rate"],
         # T46: PUT 落盘 l2_overrides.yaml，启动时由 l2_overrides.apply_overrides 应用
         "persisted": _l2ov.load_overrides(),
-        "ephemeral": False,
     }
 
 
@@ -964,10 +1099,18 @@ def l2_config_put(req: L2ConfigPutReq):
     for k, v in req.model_dump(exclude_unset=True).items():
         if v is None:
             continue
+        if k == "AI_GATEWAY_L2_BACKEND" and str(v).strip().lower() not in ("qwen", "laya"):
+            raise HTTPException(422, "AI_GATEWAY_L2_BACKEND must be qwen|laya")
+        if k == "AI_GATEWAY_L2_BACKEND":
+            v = str(v).strip().lower()
+        if k == "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD":
+            v = _ser_window_map(v, 1, 1000, k)
+        elif k == "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD":
+            v = _ser_window_map(v, 1, 100000, k)
         os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
         applied[k] = v
     persisted = _l2ov.save_overrides(applied) if applied else _l2ov.load_overrides()
-    return {"ok": True, "applied": applied, "persisted": persisted, "ephemeral": False}
+    return {"ok": True, "applied": applied, "persisted": persisted}
 
 
 @router.get("/l2-prompts")
@@ -1016,6 +1159,137 @@ def l2_prompts_put(req: L2PromptsPutReq):
         "user_prompt_template": _sm.get_user_prompt_template(),
         "persisted": _l2ov.load_overrides(),
     }
+
+
+@router.get("/l2-shadow-health")
+def l2_shadow_health(url: str = ""):
+    """影子端点健康检查：GET {base}/health + POST /classify 小探针（不耗 token，非生成调用）。
+
+    url 传参 = 检查表单草稿（未保存）；空 = 检查服务端已生效值。
+    内网直连（trust_env=False，不过代理），与 small_model 影子调用同路径。
+    """
+    import time as _t
+
+    import httpx
+
+    target = (url or os.getenv("AI_GATEWAY_L2_SHADOW_URL") or "").strip()[:512]
+    if not target:
+        return {"ok": False, "error": "未配置影子端点（AI_GATEWAY_L2_SHADOW_URL 为空）"}
+    base = target[:-len("/classify")] if target.endswith("/classify") else target.rstrip("/")
+    out: dict = {"ok": False, "url": target}
+    t0 = _t.monotonic()
+    try:
+        hr = httpx.get(f"{base}/health", timeout=5.0, trust_env=False)
+        out["health"] = {"status": hr.status_code,
+                         "latency_ms": round((_t.monotonic() - t0) * 1000),
+                         "body": hr.text[:200]}
+        if hr.status_code != 200:
+            out["error"] = f"/health HTTP {hr.status_code}"
+            return out
+    except Exception as e:
+        out["health"] = {"latency_ms": round((_t.monotonic() - t0) * 1000)}
+        out["error"] = f"/health 连不通：{e!r}"[:200]
+        return out
+    t0 = _t.monotonic()
+    try:
+        cr = httpx.post(target, timeout=15.0, trust_env=False, json={
+            "text": "hello world, today is sunny",
+            "filename": "", "headers": [], "sheet_names": [],
+        })
+        out["classify"] = {"status": cr.status_code,
+                           "latency_ms": round((_t.monotonic() - t0) * 1000)}
+        if cr.status_code != 200:
+            out["error"] = f"/classify HTTP {cr.status_code}：{cr.text[:200]}"
+            return out
+        data = cr.json()
+        out["classify"].update({k: data.get(k) for k in ("label", "confidence")})
+        out["ok"] = data.get("label") in ("CONFIDENTIAL", "NORMAL")
+        if not out["ok"]:
+            out["error"] = f"/classify 返回异常：{str(data)[:200]}"
+    except Exception as e:
+        out["classify"] = {"latency_ms": round((_t.monotonic() - t0) * 1000)}
+        out["error"] = f"/classify 失败：{e!r}"[:200]
+    return out
+
+
+@router.get("/l2-shadow-stats")
+def l2_shadow_stats(hours: int = 168):
+    """影子（laya）汇总：扫审计热缓存（Redis 近 5000 条），按窗口聚合主/影判定对照。
+
+    口径：
+    - l2_total：窗口内带 l2 判定的条数（只有进 L2 的灰区流量才有；L1 直判无 l2）。
+    - shadowed：l2 含 shadow_label 的条数；shadow_degraded：影子失败只丢影子。
+    - 一致率 = 主影 label 相同 / 可比条数（主判定 degraded 的不计入可比，兜底 label 不可比）。
+    - cells：主密影密(cc)/主密影放(cn)/主放影密(nc)/主放影放(nn)。
+    """
+    import datetime as _dt
+
+    from src.gateway.audit_store import get_audit_store
+
+    try:
+        hours = max(1, min(int(hours), 720))
+    except (TypeError, ValueError):
+        hours = 168
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+
+    def _ts(e) -> object:
+        try:
+            return _dt.datetime.strptime(
+                str(e.get("time") or e.get("ts") or "").strip().replace("T", " ")[:19],
+                "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    try:
+        entries = get_audit_store().tail(5000) or []
+    except Exception:
+        entries = []
+    scanned = len(entries)
+    window = [e for e in entries if isinstance(e, dict) and ((_ts(e) or cutoff) >= cutoff)]
+
+    out: dict = {"hours": hours, "scanned": scanned, "l2_total": 0, "shadowed": 0,
+                 "compared": 0, "agree": 0, "agree_rate": None,
+                 "shadow_degraded": 0, "main_degraded": 0,
+                 "cells": {"cc": 0, "cn": 0, "nc": 0, "nn": 0},
+                 "avg_main_latency_ms": None}
+    lat_sum, lat_n = 0, 0
+    for e in window:
+        l2 = e.get("l2")
+        if not isinstance(l2, dict):
+            continue
+        out["l2_total"] += 1
+        sl = l2.get("shadow_label")
+        if sl not in ("CONFIDENTIAL", "NORMAL"):
+            if l2.get("shadow_degraded"):
+                out["shadow_degraded"] += 1
+            continue
+        out["shadowed"] += 1
+        try:
+            lat = float(l2.get("latency_ms"))
+            lat_sum += lat
+            lat_n += 1
+        except (TypeError, ValueError):
+            pass
+        ml = l2.get("label")
+        if ml == "CONFIDENTIAL" and sl == "CONFIDENTIAL":
+            out["cells"]["cc"] += 1
+        elif ml == "CONFIDENTIAL":
+            out["cells"]["cn"] += 1
+        elif sl == "CONFIDENTIAL":
+            out["cells"]["nc"] += 1
+        else:
+            out["cells"]["nn"] += 1
+        if l2.get("degraded"):
+            out["main_degraded"] += 1
+            continue
+        out["compared"] += 1
+        if ml == sl:
+            out["agree"] += 1
+    if out["compared"]:
+        out["agree_rate"] = round(out["agree"] / out["compared"], 4)
+    if lat_n:
+        out["avg_main_latency_ms"] = round(lat_sum / lat_n, 1)
+    return out
 
 
 # ---------------- 运维诊断：路由检查器 / provider 健康检查 / 熔断器 ----------------
@@ -1221,7 +1495,7 @@ async def route_inspect_api(body: RouteInspectReq):
                   "findings": {k: v for k, v in (findings0 or {}).items() if v}}
         _gray0 = _m._l2_gray_trigger(findings0)
         l2_out = {"triggered": bool(l2r0),
-                  "trigger": ("length" if len(text.strip()) > 30 else "gray") if l2r0 else None,
+                  "trigger": "gray" if l2r0 else None,
                   "latency_ms": (l2r0 or {}).get("latency_ms"),
                   "label": (l2r0 or {}).get("label"),
                   "confidence": (l2r0 or {}).get("confidence"),
@@ -1229,7 +1503,7 @@ async def route_inspect_api(body: RouteInspectReq):
                   "degraded": _m.is_degraded(l2r0) if l2r0 else False}
         if not l2r0:
             l2_out["skipped"] = ("L1 未放行" if l1["action"] != "allow"
-                                 else f"文本 {len(text.strip())} 字 ≤ 30（L2 门槛）")
+                                 else "未进灰区（L2 只看 risk 灰区[20,60)，不计字数）")
         decision = decision0
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel or "text",
                                      body, _rt, provider_keys)
@@ -1269,14 +1543,14 @@ async def route_inspect_api(body: RouteInspectReq):
             if d is not None:
                 decision = d
         elif l1.get("action") == "allow":
-            # 全是仅文件名：按合并文本走文本门（文件名关键词可进灰区）
+            # 全是仅文件名：按合并文本走文本门（文件名关键词可进灰区；不计字数）
             _gray = _m._l2_gray_trigger(findings)
-            if len(text.strip()) > 30 or _gray:
+            if _gray:
                 t0 = _t.monotonic()
                 res = await _m.small_classify(text, filename="", headers=[], sheet_names=[])
                 l2_out = {
                     "triggered": True,
-                    "trigger": ("gray" if _gray and len(text.strip()) <= 30 else "length"),
+                    "trigger": "gray",
                     "latency_ms": round((_t.monotonic() - t0) * 1000),
                     "label": (res or {}).get("label"),
                     "confidence": (res or {}).get("confidence"),
@@ -1287,7 +1561,7 @@ async def route_inspect_api(body: RouteInspectReq):
                 if d is not None:
                     decision = d
             else:
-                l2_out["skipped"] = f"文本 {len(text.strip())} 字 ≤ 30（L2 门槛）"
+                l2_out["skipped"] = "未进灰区（L2 只看 risk 灰区，不计字数）"
         else:
             l2_out["skipped"] = "L1 未放行"
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel,
@@ -1308,12 +1582,12 @@ async def route_inspect_api(body: RouteInspectReq):
     decision = l1
     l2_out: dict = {"triggered": False}
     _gray = _m._l2_gray_trigger(findings)
-    if l1.get("action") == "allow" and (len(text.strip()) > 30 or _gray):
+    if l1.get("action") == "allow" and _gray:
         t0 = _t.monotonic()
         res = await _m.small_classify(text, filename="", headers=[], sheet_names=[])
         l2_out = {
             "triggered": True,
-            "trigger": ("gray" if _gray and len(text.strip()) <= 30 else "length"),
+            "trigger": "gray",
             "latency_ms": round((_t.monotonic() - t0) * 1000),
             "label": (res or {}).get("label"),
             "confidence": (res or {}).get("confidence"),
@@ -1325,7 +1599,7 @@ async def route_inspect_api(body: RouteInspectReq):
             decision = d
     else:
         l2_out["skipped"] = ("L1 未放行" if l1.get("action") != "allow"
-                             else f"文本 {len(text.strip())} 字 ≤ 30（L2 门槛）")
+                             else "未进灰区（L2 只看 risk 灰区，不计字数）")
 
     return _route_inspect_finish(decision, l1_out, l2_out, [], "text",
                                  body.model, _rt, provider_keys)

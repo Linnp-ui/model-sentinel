@@ -55,10 +55,6 @@ class PolicyTarget(_DictLike):
 
 # cond 写成 dict: { "text contains_any": [...], "findings.pii_count >=": 60 }
 # 自由形式 (key 内嵌运算符), pydantic 校验做不到字面 schema 校验, 只校验 dict[non-empty str, Any]。
-class WhenCondition(_DictLike):
-    model_config = ConfigDict(extra="allow")
-
-
 class Policy(_DictLike):
     """Single policy rule. Pydantic 强校验, 出错立刻 raise."""
 

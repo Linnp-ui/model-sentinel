@@ -1,6 +1,5 @@
-# 模板：安装前替换 your-user / 模型路径 / CUDA_VISIBLE_DEVICES / 日志路径
 [Unit]
-Description=Qwen3-4B-Instruct-2507 via vLLM (L2 confidential classifier, port 8002, TP1 single-card（示例 GPU）)
+Description=Qwen3-4B-Instruct-2507 via vLLM (L2 confidential classifier, port 8002, GPU 4 TP1 single-card)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +8,8 @@ Type=simple
 User=your-user
 WorkingDirectory=/home/your-user
 
-# 与 bge-m3 同卡示例：Qwen util 0.70 + bge util 0.10 = 0.80，余 ~20% 给 CUDA 上下文与碎片。
+# GPU 4 与 bge-m3 同卡（2026-09-16 T36b，用户指定合布 GPU4，腾空 GPU5）：
+# Qwen util 0.70 + bge util 0.10 = 0.80，余 ~20% 给 CUDA 上下文与碎片。
 # L2 prompt 短（classify，max-model-len 2048 / max-num-seqs 32），0.70 的 KV 池足够。
 Environment=CUDA_VISIBLE_DEVICES=4
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1

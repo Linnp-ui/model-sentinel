@@ -19,8 +19,6 @@ import yaml
 
 from .policy import PolicyDoc, decide, invalidate_policy_cache, load_policy, DEFAULT_POLICY
 
-ACTION_ACTION = ("allow", "route_local", "block")
-
 # 5.2 表单的"内容类型" -> when 条件字段的映射（下拉框语义）
 CONTENT_TYPE_FIELD = {
     "prompt": "text",           # 提示词

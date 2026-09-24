@@ -8,6 +8,7 @@ export const RULE_ZH = {
   block_secrets: '\u62e6\u622a\u5bc6\u94a5',
   pii_critical_block: '\u9ad8\u5371\u9690\u79c1\u62e6\u622a',
   pii_weighted_route_local: '\u9690\u79c1\u52a0\u6743\u8f6c\u5185\u7f51',
+  unparsed_binary_route_local: '\u672a\u89e3\u6790\u4e8c\u8fdb\u5236\u8f6c\u5185\u7f51',
   default_allow: '\u9ed8\u8ba4\u653e\u884c',
 };
 

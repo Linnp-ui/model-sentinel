@@ -16,6 +16,11 @@ os.environ.setdefault("AI_GATEWAY_DEV_API_KEY", "pk_live_dev_changeme,sk_test_du
 os.environ.setdefault("OLLAMA_MOCK", "true")
 os.environ.setdefault("SMALL_MODEL_ENABLED", "false")
 os.environ.setdefault("AI_GATEWAY_ADMIN_IP_ALLOWLIST", "127.0.0.1,::1,testclient")
+# 规则5 first-seen 落盘隔离：全 session 共用内存 store，suggestions 会写 marks 文件，
+# 指到系统临时目录，别污染工作区 var/（生产网关读同一文件）。
+import tempfile
+os.environ.setdefault("AI_GATEWAY_SUGGEST_RULE_SEEN_PATH",
+                      os.path.join(tempfile.mkdtemp(prefix="gw-test-seen-"), "rule_first_seen.json"))
 # TestClient 的 client.host 是字面量 "testclient"，命中不了 127. 豁免；把它写进
 # admin allowlist 才能调 /admin/api/*（线上 127 豁免不受影响）。
 

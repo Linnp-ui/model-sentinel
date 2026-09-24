@@ -1,35 +1,56 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import {
-  Layout, Menu, Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space,
-  message, Popconfirm, Typography, Alert, Card, Statistic, Switch, Slider, Tabs,
-  Progress, Checkbox, Tooltip, Row, Col,
-} from 'antd';
-import {
-  ImportOutlined, KeyOutlined, StopOutlined, LockOutlined, ReloadOutlined, BarChartOutlined,
-  ApiOutlined, AuditOutlined, RobotOutlined, ExperimentOutlined,
-  FileSearchOutlined, FundOutlined, SearchOutlined,
-  DownloadOutlined, ClearOutlined, WarningOutlined, ThunderboltOutlined,
-  CopyOutlined,
-} from '@ant-design/icons';
-import { api, errText } from '../api.js';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic } from 'antd';
+import { ReloadOutlined, SearchOutlined, DownloadOutlined, CopyOutlined } from '@ant-design/icons';
+import { api, errText, fetchJson, copyText } from '../api.js';
 
 const { Text } = Typography;
 import { ruleZh, RULE_ZH } from '../ruleNames.jsx';
 // ---------------- 审计面板并入（原 /admin /analytics /metrics/panel HTML 页退役迁入） ----------------
-const fetchJson = async (url, opts = {}) => {
-  const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
-  if (r.status === 401 || r.status === 302) {
-    window.location.href = '/admin/login?next=/admin/app';
-    throw new Error('未登录');
-  }
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${r.status}`);
-  return body;
-};
 
 const ACTION_BADGE = (a) => (a === 'block' ? <Tag color="red">阻断</Tag>
   : a === 'route_local' ? <Tag color="orange">本地路由</Tag>
     : a === 'allow' ? <Tag color="green">放行</Tag> : <Tag>{a || '—'}</Tag>);
+
+const isLocal = (v) => v === true || v === 'true' || v === 1 || v === '1';
+
+// L2 展开行：主判定 + laya 影子（shadow_*）。无 L2 的行不可展开。
+// l2 可能是对象（新接口）或字符串（容错），统一归一化再渲染。
+const normL2 = (l2) => {
+  if (!l2) return null;
+  if (typeof l2 === 'string') { try { return JSON.parse(l2); } catch { return { raw: l2 }; } }
+  return l2;
+};
+const L2Detail = ({ rec }) => {
+  const l2 = normL2(rec.l2);
+  if (!l2) return <Text type="secondary">无 L2 判定（L1 直判，未进语义审查）</Text>;
+  const hasShadow = l2.shadow_label || l2.shadow_conf !== undefined || l2.shadow_degraded;
+  return (
+    <Space direction="vertical" size={2} style={{ fontSize: 12 }}>
+      <Space wrap>
+        <Text strong>主判定：</Text>
+        <Tag color={l2.label === 'CONFIDENTIAL' ? 'red' : 'green'}>{l2.label || '?'}</Tag>
+        <Text type="secondary">conf={l2.confidence ?? '?'}</Text>
+        <Text type="secondary">{l2.reason || ''}</Text>
+        {l2.latency_ms !== undefined && <Text type="secondary">{l2.latency_ms}ms</Text>}
+        {l2.cached && <Tag>缓存</Tag>}
+        {l2.degraded && <Tag color="orange">降级:{l2.degraded_reason || ''}</Tag>}
+      </Space>
+      <Space wrap>
+        <Text strong>影子(laya)：</Text>
+        {!hasShadow && <Text type="secondary">无影子数据（影子未开 / backend=laya / 未进 L2）</Text>}
+        {l2.shadow_degraded && <Tag color="orange">影子失败:{String(l2.shadow_degraded).slice(0, 80)}</Tag>}
+        {l2.shadow_label && (
+          <>
+            <Tag color={l2.shadow_label === 'CONFIDENTIAL' ? 'red' : 'green'}>{l2.shadow_label}</Tag>
+            <Text type="secondary">conf={l2.shadow_conf ?? '?'}</Text>
+            <Text type="secondary">{l2.shadow_reason || ''}</Text>
+            {String(l2.label || '') !== String(l2.shadow_label || '') && <Tag color="purple">与主判定不一致</Tag>}
+          </>
+        )}
+      </Space>
+    </Space>
+  );
+};
 
 // ---------------- 审计日志（原 /admin 审计页） ----------------
 const AUDIT_ACTIONS = [
@@ -53,7 +74,7 @@ export default function AuditPage() {
   const [f, setF] = useState(() => {
     const p = new URLSearchParams(window.location.hash.split('?')[1] || '');
     return { action: p.get('action') || '', since: p.get('since') || '',
-             rule: p.get('rule') || '', q: p.get('q') || '' };
+             rule: p.get('rule') || '', q: p.get('q') || '', shadow: p.get('shadow') || '' };
   });
   const [pageNo, setPageNo] = useState(1);
   const writeUrl = (next) => {
@@ -101,17 +122,29 @@ export default function AuditPage() {
 
   const cols = [
     { title: '时间', dataIndex: 'time', width: 165 },
-    { title: '动作', dataIndex: 'action', width: 95, render: ACTION_BADGE },
+    { title: '动作', dataIndex: 'action', width: 130,
+      render: (v, rec) => (
+        <Space size={4}>
+          {ACTION_BADGE(v)}
+          {v === 'allow' && isLocal(rec.local) && <Tag color="blue">local</Tag>}
+        </Space>
+      ) },
     { title: '规则', dataIndex: 'rule', width: 170, ellipsis: true, render: (v) => <Text code title={v || ''}>{ruleZh(v)}</Text> },
     { title: 'Provider', dataIndex: 'provider', width: 110, render: (v) => v || '—' },
-    { title: '路由', dataIndex: 'local', width: 85,
-      render: (v) => (v === true || v === 'true' || v === 1 || v === '1')
-        ? <Tag color="blue">local</Tag> : <Tag>external</Tag> },
     { title: '模型', dataIndex: 'model', width: 150, ellipsis: true, render: (v) => v || '—' },
-    { title: '调用方 KEY', dataIndex: 'token_masked', width: 130, render: (v) => v ? <Text code title={v}>{v}</Text> : '—' },
+    { title: '调用方名称', dataIndex: 'key_name', width: 130,
+      render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
     { title: '客户端 IP', dataIndex: 'client_ip', width: 120, render: (v) => v || '—' },
     { title: '文件名', dataIndex: 'filename', width: 140, ellipsis: true, render: (v) => v || '—' },
-    { title: '内容摘要', dataIndex: 'text_preview', ellipsis: true },
+    { title: '内容摘要', dataIndex: 'text_preview',
+      render: (v) => (
+        <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
+            title={v}>{v || '—'}</span>
+          {v && <Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制内容摘要"
+            onClick={() => copyText(v)} />}
+        </span>
+      ) },
   ];
 
   return (
@@ -125,7 +158,10 @@ export default function AuditPage() {
           <Select style={{ width: 190 }} value={f.rule || undefined} options={ruleOptions} allowClear showSearch
             optionFilterProp="label" placeholder="规则名"
             onChange={(v) => { const next = { ...f, rule: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/KEY/模型/路由…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
+          <Select style={{ width: 150 }} value={f.shadow}
+            options={[{ value: '', label: '影子：全部' }, { value: 'mismatch', label: '主影不一致' }]}
+            onChange={(v) => { const next = { ...f, shadow: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
+          <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/调用方/模型/L2/影子…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
           <Button type="primary" icon={<SearchOutlined />} onClick={search}>查询</Button>
           <Button icon={<DownloadOutlined />} onClick={exportCsv}>导出 CSV</Button>
           <Button aria-label="刷新" icon={<ReloadOutlined />} onClick={() => load()} />
@@ -143,6 +179,8 @@ export default function AuditPage() {
       )}
       <Table rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}
+        expandable={{ expandedRowRender: (rec) => <L2Detail rec={rec} />,
+          rowExpandable: (rec) => !!normL2(rec.l2) }} 
         pagination={{
           current: data?.page || 1, pageSize: data?.limit || 50, total: data?.total || 0,
           onChange: (pg) => setPageNo(pg), showSizeChanger: false,

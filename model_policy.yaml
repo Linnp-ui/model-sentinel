@@ -2,20 +2,20 @@ model_policy:
   external_candidates:
   - provider: deepseek
     model: deepseek-flash
-    price_per_1m_in: 0.04
-    price_per_1m_out: 2.0
+    price_per_1m_in: 2.0
+    price_per_1m_out: 4.0
+    price_per_1m_cached: 0.04
     context_length: 1000000
-    rate: 1.0
-    note: deepseek 官方
+    note: deepseek 官方（价格单位 ¥/1M tokens）
     enabled: true
     rank: 1
   - provider: deepseek
     model: deepseek-v4-pro
-    price_per_1m_in: 0.15
-    price_per_1m_out: 4.5
+    price_per_1m_in: 9.0
+    price_per_1m_out: 13.5
+    price_per_1m_cached: 0.3
     context_length: 1000000
-    rate: 1.0
-    note: ''
+    note: （价格单位 ¥/1M tokens）
     enabled: true
     rank: 2
   internal_models:
@@ -23,6 +23,18 @@ model_policy:
     model: qwen2.5:7b
     note: 主力本地模型（内容不出境降级目标）
     enabled: true
+    url: http://10.0.0.10:8000/v1
+  - provider: vllm_l2
+    model: Qwen3-4B-Instruct-2507
+    note: L2 审查 qwen（8002，可路由）
+    enabled: true
+    url: http://10.0.0.10:8002/v1
+  - provider: laya
+    model: laya-multilingual
+    note: L2 审查 laya（8003 /classify 决策模型，非 chat 协议，仅审查下拉可选，不暴露）
+    enabled: true
+    url: http://127.0.0.1:8003/classify
+  model_limits: []
   load_balance_mode: none
   review_model:
     threshold: 0.7

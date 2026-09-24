@@ -1,0 +1,160 @@
+{"id": "salary_direct_conf", "scenario": "salary", "phrasing": "direct", "expect": "confidential", "text": "奚霞的基本工资是23055还是24055,奖金怎么算的"}
+{"id": "salary_direct_pass", "scenario": "salary", "phrasing": "direct", "expect": "pass", "text": "工资一般是每月几号发放,遇到节假日会提前吗"}
+{"id": "salary_delegate_conf", "scenario": "salary", "phrasing": "delegate", "expect": "confidential", "text": "帮我查一下水辉这个月的绩效工资和扣款明细"}
+{"id": "salary_delegate_pass", "scenario": "salary", "phrasing": "delegate", "expect": "pass", "text": "帮我查一下工资发放流程和需要提交的材料"}
+{"id": "salary_paste_conf", "scenario": "salary", "phrasing": "paste", "expect": "confidential", "text": "下面是研发部工资表,帮我算一下平均工资:\n唐超 研发部 34358 11539\n周紫萱 人事部 24901 10528\n王雨欣 法务部 38672 2367"}
+{"id": "salary_paste_pass", "scenario": "salary", "phrasing": "paste", "expect": "pass", "text": "下面这篇公开报道帮我总结一下观点:据公开报道,2026年应届生平均起薪同比上涨5%,新一线城市涨幅高于一线城市,技术类岗位起薪领跑"}
+{"id": "salary_fileref_conf", "scenario": "salary", "phrasing": "fileref", "expect": "confidential", "text": "附件是2026年7月工资表.xlsx,总额对一下,帮我核对研发部有没有漏发"}
+{"id": "salary_fileref_pass", "scenario": "salary", "phrasing": "fileref", "expect": "pass", "text": "附件是工资发放流程说明.pdf,帮我看看第三步需要提交什么材料"}
+{"id": "salary_casual_conf", "scenario": "salary", "phrasing": "casual", "expect": "confidential", "text": "听说奚霞涨到38000了,真的假的"}
+{"id": "salary_casual_pass", "scenario": "salary", "phrasing": "casual", "expect": "pass", "text": "发工资了,今晚聚餐我请,都别跑"}
+{"id": "salary_formal_conf", "scenario": "salary", "phrasing": "formal", "expect": "confidential", "text": "通知:2026年第三季度绩效工资发放,奚霞 38806元,水辉 23055元,请查收"}
+{"id": "salary_formal_pass", "scenario": "salary", "phrasing": "formal", "expect": "pass", "text": "通知:工资发放时间为每月10日,如遇节假日顺延,请各部门知悉"}
+{"id": "salary_mixed_conf", "scenario": "salary", "phrasing": "mixed", "expect": "confidential", "text": "把奚霞的 salary package 发我一下,base 23055,bonus 2个月"}
+{"id": "salary_mixed_pass", "scenario": "salary", "phrasing": "mixed", "expect": "pass", "text": "这个月的 payroll 走完了吗,HR 那边 confirm 了吗"}
+{"id": "salary_evasive_conf", "scenario": "salary", "phrasing": "evasive", "expect": "confidential", "text": "那个数你懂的,奚霞那个38后面加个k"}
+{"id": "salary_evasive_pass", "scenario": "salary", "phrasing": "evasive", "expect": "pass", "text": "工资的事回头私聊说,群里不方便讲"}
+{"id": "finance_direct_conf", "scenario": "finance", "phrasing": "direct", "expect": "confidential", "text": "上季度营收11257061这个数对吗,利润是不是2967198"}
+{"id": "finance_direct_pass", "scenario": "finance", "phrasing": "direct", "expect": "pass", "text": "财务报表一般包含哪几部分,每部分看什么"}
+{"id": "finance_delegate_conf", "scenario": "finance", "phrasing": "delegate", "expect": "confidential", "text": "帮我核对7月成本:原材料1125706元,人工296719元"}
+{"id": "finance_delegate_pass", "scenario": "finance", "phrasing": "delegate", "expect": "pass", "text": "帮我找一下费用报销的流程文档"}
+{"id": "finance_paste_conf", "scenario": "finance", "phrasing": "paste", "expect": "confidential", "text": "检查一下这段有没有问题:7月营收1125万元,营业利润296万元,毛利率22%。以上数据仅限内部使用"}
+{"id": "finance_paste_pass", "scenario": "finance", "phrasing": "paste", "expect": "pass", "text": "总结一下这段公开财报:据公开财报,宁德时代上半年营收同比增长,研发投入加大,海外市场占比提升"}
+{"id": "finance_fileref_conf", "scenario": "finance", "phrasing": "fileref", "expect": "confidential", "text": "附件Q3预算表.xlsx,总额1125万,帮我看看研发占比"}
+{"id": "finance_fileref_pass", "scenario": "finance", "phrasing": "fileref", "expect": "pass", "text": "附件是公开的行业财务分析报告.pdf,提炼三个要点"}
+{"id": "finance_casual_conf", "scenario": "finance", "phrasing": "casual", "expect": "confidential", "text": "听说咱们部门今年预算被砍了一半,只剩562万了"}
+{"id": "finance_casual_pass", "scenario": "finance", "phrasing": "casual", "expect": "pass", "text": "财务小姐姐说报销这周五前提交,别忘了贴票"}
+{"id": "finance_formal_conf", "scenario": "finance", "phrasing": "formal", "expect": "confidential", "text": "关于下季度预算安排的通知:研发费用1125万元,市场推广296万元,请遵照执行"}
+{"id": "finance_formal_pass", "scenario": "finance", "phrasing": "formal", "expect": "pass", "text": "通知:请各部门于周五前提交预算申请表,模板见附件"}
+{"id": "finance_mixed_conf", "scenario": "finance", "phrasing": "mixed", "expect": "confidential", "text": "Q3 的 revenue 是1125万吗,margin 多少"}
+{"id": "finance_mixed_pass", "scenario": "finance", "phrasing": "mixed", "expect": "pass", "text": "invoice 开好了吗,什么时候能报销"}
+{"id": "finance_evasive_conf", "scenario": "finance", "phrasing": "evasive", "expect": "confidential", "text": "上季度的那个数,11后面六个零,你懂的"}
+{"id": "finance_evasive_pass", "scenario": "finance", "phrasing": "evasive", "expect": "pass", "text": "财务数据回头会上再说,群里先不讨论"}
+{"id": "contact_direct_conf", "scenario": "contact", "phrasing": "direct", "expect": "confidential", "text": "确认一下,李婷婷电话是不是13386859692"}
+{"id": "contact_direct_pass", "scenario": "contact", "phrasing": "direct", "expect": "pass", "text": "郎国的手机号是多少,找他有急事"}
+{"id": "contact_delegate_conf", "scenario": "contact", "phrasing": "delegate", "expect": "confidential", "text": "帮我把李婷婷的身份证42011119931117781X记到花名册"}
+{"id": "contact_delegate_pass", "scenario": "contact", "phrasing": "delegate", "expect": "pass", "text": "帮我找一下行政的联系方式"}
+{"id": "contact_paste_conf", "scenario": "contact", "phrasing": "paste", "expect": "confidential", "text": "下面这几个联系人帮我整理成表格:\n苗明 15994396213\n冯俊杰 19745094849\n华伟 19704696188"}
+{"id": "contact_paste_pass", "scenario": "contact", "phrasing": "paste", "expect": "pass", "text": "把这段官网联系信息翻译成英文:媒体联系 press@example.com,地址北京市海淀区"}
+{"id": "contact_fileref_conf", "scenario": "contact", "phrasing": "fileref", "expect": "confidential", "text": "附件通讯录.xlsx里有全体员工电话,比如李婷婷 13386859692,帮我找出市场部的"}
+{"id": "contact_fileref_pass", "scenario": "contact", "phrasing": "fileref", "expect": "pass", "text": "附件是公司组织架构图.pdf,帮我看看市场部向谁汇报"}
+{"id": "contact_casual_conf", "scenario": "contact", "phrasing": "casual", "expect": "confidential", "text": "我新号码13386859692,存一下,老的停用了"}
+{"id": "contact_casual_pass", "scenario": "contact", "phrasing": "casual", "expect": "pass", "text": "在吗,电话聊两句,打字说不清"}
+{"id": "contact_formal_conf", "scenario": "contact", "phrasing": "formal", "expect": "confidential", "text": "值班表:周一李婷婷 13386859692,周二郎国 17148850422,请按时到岗"}
+{"id": "contact_formal_pass", "scenario": "contact", "phrasing": "formal", "expect": "pass", "text": "值班安排见附件,有问题联系行政"}
+{"id": "contact_mixed_conf", "scenario": "contact", "phrasing": "mixed", "expect": "confidential", "text": "send 我一下李婷婷的 phone,13386859692这个号"}
+{"id": "contact_mixed_pass", "scenario": "contact", "phrasing": "mixed", "expect": "pass", "text": "call 我一下,有事说,电话里讲"}
+{"id": "contact_evasive_conf", "scenario": "contact", "phrasing": "evasive", "expect": "confidential", "text": "他电话133,分两段:8685和9692"}
+{"id": "contact_evasive_pass", "scenario": "contact", "phrasing": "evasive", "expect": "pass", "text": "电话私聊发你,群里不发了"}
+{"id": "contract_direct_conf", "scenario": "contract", "phrasing": "direct", "expect": "confidential", "text": "跟ABC公司的合同金额是6618204吗,账期多久"}
+{"id": "contract_direct_pass", "scenario": "contract", "phrasing": "direct", "expect": "pass", "text": "合同一般包括哪些条款,签的时候注意什么"}
+{"id": "contract_delegate_conf", "scenario": "contract", "phrasing": "delegate", "expect": "confidential", "text": "帮我看看这个报价单,总价1135715含税13%,付款周期60天有没有问题"}
+{"id": "contract_delegate_pass", "scenario": "contract", "phrasing": "delegate", "expect": "pass", "text": "帮我找个标准的合同模板"}
+{"id": "contract_paste_conf", "scenario": "contract", "phrasing": "paste", "expect": "confidential", "text": "改得更正式一点:合同编号HT-2026-643,智能化改造项目,合同金额6618204元,乙方承担保密义务,未经甲方书面同意不得向第三方披露。"}
+{"id": "contract_paste_pass", "scenario": "contract", "phrasing": "paste", "expect": "pass", "text": "总结这则公开招标公告:市政公开招标智能化改造项目,预算113万元,投标截止本月底"}
+{"id": "contract_fileref_conf", "scenario": "contract", "phrasing": "fileref", "expect": "confidential", "text": "附件投标文件.pdf,报价6618204,开标前别外传,帮我检查格式"}
+{"id": "contract_fileref_pass", "scenario": "contract", "phrasing": "fileref", "expect": "pass", "text": "附件是公开的招标文件.pdf,帮我列一下投标要求"}
+{"id": "contract_casual_conf", "scenario": "contract", "phrasing": "casual", "expect": "confidential", "text": "咱们给那家的报价是6618204,咬死别松口"}
+{"id": "contract_casual_pass", "scenario": "contract", "phrasing": "casual", "expect": "pass", "text": "投标的事进展怎么样了,有消息吗"}
+{"id": "contract_formal_conf", "scenario": "contract", "phrasing": "formal", "expect": "confidential", "text": "内部决议:智能化改造项目投标报价定为6618204元,开标前保密,不得外传"}
+{"id": "contract_formal_pass", "scenario": "contract", "phrasing": "formal", "expect": "pass", "text": "通知:本周五下午投标答辩,请相关人员参加"}
+{"id": "contract_mixed_conf", "scenario": "contract", "phrasing": "mixed", "expect": "confidential", "text": "这个 quote 总价1135715,margin 够吗"}
+{"id": "contract_mixed_pass", "scenario": "contract", "phrasing": "mixed", "expect": "pass", "text": "contract 走到哪一步了,法务 approve 了吗"}
+{"id": "contract_evasive_conf", "scenario": "contract", "phrasing": "evasive", "expect": "confidential", "text": "给那家的数,66后面五个零,开标前保密"}
+{"id": "contract_evasive_pass", "scenario": "contract", "phrasing": "evasive", "expect": "pass", "text": "报价的事会上定,现在不说"}
+{"id": "drawing_direct_conf", "scenario": "drawing", "phrasing": "direct", "expect": "confidential", "text": "图号S-2023-969的梁配筋是HRB400吗,混凝土等级C35?"}
+{"id": "drawing_direct_pass", "scenario": "drawing", "phrasing": "direct", "expect": "pass", "text": "看结构图一般先看什么,有顺序吗"}
+{"id": "drawing_delegate_conf", "scenario": "drawing", "phrasing": "delegate", "expect": "confidential", "text": "帮我复核这张施工图的配筋和开挖深度3.5米有没有问题"}
+{"id": "drawing_delegate_pass", "scenario": "drawing", "phrasing": "delegate", "expect": "pass", "text": "帮我找一下CAD看图软件的教程"}
+{"id": "drawing_paste_conf", "scenario": "drawing", "phrasing": "paste", "expect": "confidential", "text": "检查一下:施工图号S-2023-969,五层剪力墙,混凝土C40,基础开挖4.2米,该参数为工艺秘密"}
+{"id": "drawing_paste_pass", "scenario": "drawing", "phrasing": "paste", "expect": "pass", "text": "解释一下这段公开规范:混凝土结构设计规范规定,梁板柱的保护层厚度应符合耐久性要求"}
+{"id": "drawing_fileref_conf", "scenario": "drawing", "phrasing": "fileref", "expect": "confidential", "text": "附件是S-2023-969结构图.pdf,配筋HRB400混凝土C35,请重点核对梁柱部分"}
+{"id": "drawing_fileref_pass", "scenario": "drawing", "phrasing": "fileref", "expect": "pass", "text": "附件是公开的图集目录.pdf,帮我找楼梯详图在哪页"}
+{"id": "drawing_casual_conf", "scenario": "drawing", "phrasing": "casual", "expect": "confidential", "text": "车间那张图,切削速度300,进给20,别外传"}
+{"id": "drawing_casual_pass", "scenario": "drawing", "phrasing": "casual", "expect": "pass", "text": "图纸打印好了,在前台自取"}
+{"id": "drawing_formal_conf", "scenario": "drawing", "phrasing": "formal", "expect": "confidential", "text": "设计变更通知:图号S-2023-969,混凝土等级由C30调整为C35,请施工单位遵照执行"}
+{"id": "drawing_formal_pass", "scenario": "drawing", "phrasing": "formal", "expect": "pass", "text": "通知:图纸会审改到周四下午,请准时参加"}
+{"id": "drawing_mixed_conf", "scenario": "drawing", "phrasing": "mixed", "expect": "confidential", "text": "这个 drawing 的 rebar 还是 HRB400 吗"}
+{"id": "drawing_mixed_pass", "scenario": "drawing", "phrasing": "mixed", "expect": "pass", "text": "drawing 发我一份,我学习一下"}
+{"id": "drawing_evasive_conf", "scenario": "drawing", "phrasing": "evasive", "expect": "confidential", "text": "图上那个数,C后面35,你懂的"}
+{"id": "drawing_evasive_pass", "scenario": "drawing", "phrasing": "evasive", "expect": "pass", "text": "图纸的事问设计部,我不清楚"}
+{"id": "meeting_direct_conf", "scenario": "meeting", "phrasing": "direct", "expect": "confidential", "text": "会上定的年终奖1200万这个数准吗"}
+{"id": "meeting_direct_pass", "scenario": "meeting", "phrasing": "direct", "expect": "pass", "text": "昨天的会主要讲了什么,有结论吗"}
+{"id": "meeting_delegate_conf", "scenario": "meeting", "phrasing": "delegate", "expect": "confidential", "text": "帮我把纪要里邹桂英涨薪到21162的事单独拎出来"}
+{"id": "meeting_delegate_pass", "scenario": "meeting", "phrasing": "delegate", "expect": "pass", "text": "帮我把这份会议纪要排个版"}
+{"id": "meeting_paste_conf", "scenario": "meeting", "phrasing": "paste", "expect": "confidential", "text": "总结一下:会议纪要:讨论Q3预算,邹桂英绩效A+,涨薪至月薪21162,本纪要属内部资料,不得外传"}
+{"id": "meeting_paste_pass", "scenario": "meeting", "phrasing": "paste", "expect": "pass", "text": "总结一下:周会记录:前端重构进度80%%,下周一联调支付回调,风险点是第三方沙箱不稳定"}
+{"id": "meeting_fileref_conf", "scenario": "meeting", "phrasing": "fileref", "expect": "confidential", "text": "附件是董事会纪要.pdf,第3页分红方案每股派2.5元,帮我提炼三个要点"}
+{"id": "meeting_fileref_pass", "scenario": "meeting", "phrasing": "fileref", "expect": "pass", "text": "附件是周会纪要.docx,帮我提取action items"}
+{"id": "meeting_casual_conf", "scenario": "meeting", "phrasing": "casual", "expect": "confidential", "text": "刚开完会,老板说明年headcount冻结,就给了6个"}
+{"id": "meeting_casual_pass", "scenario": "meeting", "phrasing": "casual", "expect": "pass", "text": "会开完了,结论我稍后发群里"}
+{"id": "meeting_formal_conf", "scenario": "meeting", "phrasing": "formal", "expect": "confidential", "text": "会议纪要(经营复盘):Q3营收5949万元,下季度预算压缩10%,参会人邹桂英等,内部资料不得外传"}
+{"id": "meeting_formal_pass", "scenario": "meeting", "phrasing": "formal", "expect": "pass", "text": "会议通知:周五下午3点经营复盘会,请准时参加"}
+{"id": "meeting_mixed_conf", "scenario": "meeting", "phrasing": "mixed", "expect": "confidential", "text": "sync 一下,会上定的 bonus 5个月外加13薪"}
+{"id": "meeting_mixed_pass", "scenario": "meeting", "phrasing": "mixed", "expect": "pass", "text": "standup 改到10点,大家准时"}
+{"id": "meeting_evasive_conf", "scenario": "meeting", "phrasing": "evasive", "expect": "confidential", "text": "会上定的那个月数,2加13,你懂的"}
+{"id": "meeting_evasive_pass", "scenario": "meeting", "phrasing": "evasive", "expect": "pass", "text": "会上的事别外传,回头再说"}
+{"id": "tech_direct_conf", "scenario": "tech", "phrasing": "direct", "expect": "confidential", "text": "这个AKIAIOSF开头的key还能用吗,网关一直报401"}
+{"id": "tech_direct_pass", "scenario": "tech", "phrasing": "direct", "expect": "pass", "text": "Python的GIL是什么,为什么多线程跑不满"}
+{"id": "tech_delegate_conf", "scenario": "tech", "phrasing": "delegate", "expect": "confidential", "text": "帮我看下这段代码里的AKIAIOSFODNN7EXAMPLE是不是硬编码了"}
+{"id": "tech_delegate_pass", "scenario": "tech", "phrasing": "delegate", "expect": "pass", "text": "帮我看下这段代码为什么报空指针"}
+{"id": "tech_paste_conf", "scenario": "tech", "phrasing": "paste", "expect": "confidential", "text": "帮我debug:db_password = \"Db#2026Prod\",连不上是不是配错了"}
+{"id": "tech_paste_pass", "scenario": "tech", "phrasing": "paste", "expect": "pass", "text": "解释一下这段代码:def quicksort(arr):小于基准的放左边,递归排序,合并返回"}
+{"id": "tech_fileref_conf", "scenario": "tech", "phrasing": "fileref", "expect": "confidential", "text": "附件config.yaml,数据库密码Db#2026Prod,帮我看看连不上是不是配错了"}
+{"id": "tech_fileref_pass", "scenario": "tech", "phrasing": "fileref", "expect": "pass", "text": "附件是报错日志.txt,帮我看看是什么问题"}
+{"id": "tech_casual_conf", "scenario": "tech", "phrasing": "casual", "expect": "confidential", "text": "测试环境密码是Test#1234,谁改了登不上"}
+{"id": "tech_casual_pass", "scenario": "tech", "phrasing": "casual", "expect": "pass", "text": "测试环境又挂了,谁去重启一下"}
+{"id": "tech_formal_conf", "scenario": "tech", "phrasing": "formal", "expect": "confidential", "text": "安全通知:GitHub token ghp_2f82095b5dc6已泄露,请立即作废并轮转"}
+{"id": "tech_formal_pass", "scenario": "tech", "phrasing": "formal", "expect": "pass", "text": "通知:今晚10点测试环境维护,预计1小时"}
+{"id": "tech_mixed_conf", "scenario": "tech", "phrasing": "mixed", "expect": "confidential", "text": "这个 token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c 帮我 decode 一下"}
+{"id": "tech_mixed_pass", "scenario": "tech", "phrasing": "mixed", "expect": "pass", "text": "这个 bug 复现了,有人 fix 一下吗"}
+{"id": "tech_evasive_conf", "scenario": "tech", "phrasing": "evasive", "expect": "confidential", "text": "密码分两段:Test#和1234,连起来登"}
+{"id": "tech_evasive_pass", "scenario": "tech", "phrasing": "evasive", "expect": "pass", "text": "密码私聊发你,群里不说了"}
+{"id": "chat_direct_conf", "scenario": "chat", "phrasing": "direct", "expect": "confidential", "text": "你工资到手多少,我才12510"}
+{"id": "chat_direct_pass", "scenario": "chat", "phrasing": "direct", "expect": "pass", "text": "中午吃啥,楼下那家面馆怎么样"}
+{"id": "chat_delegate_conf", "scenario": "chat", "phrasing": "delegate", "expect": "confidential", "text": "顺便帮我问下,奚军年终拿了6个月是不是真的"}
+{"id": "chat_delegate_pass", "scenario": "chat", "phrasing": "delegate", "expect": "pass", "text": "帮我问下楼下咖啡店几点关门"}
+{"id": "chat_paste_conf", "scenario": "chat", "phrasing": "paste", "expect": "confidential", "text": "截图文字帮我存到通讯录:奚军 15609905481,花浩然 19195788432"}
+{"id": "chat_paste_pass", "scenario": "chat", "phrasing": "paste", "expect": "pass", "text": "续写这个段子:程序员最讨厌的四件事,写注释、写文档、别人不写注释、别人不写文档"}
+{"id": "chat_fileref_conf", "scenario": "chat", "phrasing": "fileref", "expect": "confidential", "text": "我把工资条截图发你了,应发38568,帮我看看扣税对不对"}
+{"id": "chat_fileref_pass", "scenario": "chat", "phrasing": "fileref", "expect": "pass", "text": "聚餐照片发群里了,大家自取"}
+{"id": "chat_casual_conf", "scenario": "chat", "phrasing": "casual", "expect": "confidential", "text": "卧槽,我银行卡尾号3202的那张,工资到账了12510"}
+{"id": "chat_casual_pass", "scenario": "chat", "phrasing": "casual", "expect": "pass", "text": "哈哈哈哈哈,这个表情包绝了,发我原图"}
+{"id": "chat_formal_conf", "scenario": "chat", "phrasing": "formal", "expect": "confidential", "text": "端午福利通知:每人粽子礼盒加794元过节费,随工资发放"}
+{"id": "chat_formal_pass", "scenario": "chat", "phrasing": "formal", "expect": "pass", "text": "放假通知:端午调休安排如下,请相互转告"}
+{"id": "chat_mixed_conf", "scenario": "chat", "phrasing": "mixed", "expect": "confidential", "text": "btw 我 offer 涨了,base 39k,16薪"}
+{"id": "chat_mixed_pass", "scenario": "chat", "phrasing": "mixed", "expect": "pass", "text": "btw 楼下新开了家 gym,有人去吗"}
+{"id": "chat_evasive_conf", "scenario": "chat", "phrasing": "evasive", "expect": "confidential", "text": "我 g 资 daoshou 12k,惨"}
+{"id": "chat_evasive_pass", "scenario": "chat", "phrasing": "evasive", "expect": "pass", "text": "工资条收到了吧,看一眼有没有问题"}
+{"id": "admin_direct_conf", "scenario": "admin", "phrasing": "direct", "expect": "confidential", "text": "确认下:老板周三下午3点见红杉的人,行程没变吧"}
+{"id": "admin_direct_pass", "scenario": "admin", "phrasing": "direct", "expect": "pass", "text": "这周五放假吗,调休怎么算"}
+{"id": "admin_delegate_conf", "scenario": "admin", "phrasing": "delegate", "expect": "confidential", "text": "帮我订周三下午3点去浦东的机票,用我身份证310115199107196511"}
+{"id": "admin_delegate_pass", "scenario": "admin", "phrasing": "delegate", "expect": "pass", "text": "帮我订一间周五下午的会议室,要能投屏的"}
+{"id": "admin_paste_conf", "scenario": "admin", "phrasing": "paste", "expect": "confidential", "text": "催办一下这张出差单:申请人陶磊,身份证510107196610148553,电话13321341481,事由客户现场支持"}
+{"id": "admin_paste_pass", "scenario": "admin", "phrasing": "paste", "expect": "pass", "text": "把这则放假通知转发到群里:端午假期3天,值班表见附件"}
+{"id": "admin_fileref_conf", "scenario": "admin", "phrasing": "fileref", "expect": "confidential", "text": "附件是高管行程表.xlsx,周三下午3点见红杉资本,别外传,帮我同步到日历"}
+{"id": "admin_fileref_pass", "scenario": "admin", "phrasing": "fileref", "expect": "pass", "text": "附件是会议室预定表,帮我看看周五下午哪个空"}
+{"id": "admin_casual_conf", "scenario": "admin", "phrasing": "casual", "expect": "confidential", "text": "我身份证310115199107196511,帮我先值机"}
+{"id": "admin_casual_pass", "scenario": "admin", "phrasing": "casual", "expect": "pass", "text": "我下周出差,周报提前发了"}
+{"id": "admin_formal_conf", "scenario": "admin", "phrasing": "formal", "expect": "confidential", "text": "出差审批:鲍国,身份证33010619660505945X,航班CA1629,事由设备采购项目现场支持"}
+{"id": "admin_formal_pass", "scenario": "admin", "phrasing": "formal", "expect": "pass", "text": "考勤通知:本月考勤统计截止28日,请假走OA流程"}
+{"id": "admin_mixed_conf", "scenario": "admin", "phrasing": "mixed", "expect": "confidential", "text": "帮我 book 周三的 flight,用我 ID 310115199107196511"}
+{"id": "admin_mixed_pass", "scenario": "admin", "phrasing": "mixed", "expect": "pass", "text": "meeting room 还有空的吗,借一间开会"}
+{"id": "admin_evasive_conf", "scenario": "admin", "phrasing": "evasive", "expect": "confidential", "text": "我身份证后四位6511,名字尤建国,帮我查下订票信息"}
+{"id": "admin_evasive_pass", "scenario": "admin", "phrasing": "evasive", "expect": "pass", "text": "行程单私发我,别发群里"}
+{"id": "polish_direct_conf", "scenario": "polish", "phrasing": "direct", "expect": "confidential", "text": "这句话里我的工资30614要不要写进去,会不会太直接"}
+{"id": "polish_direct_pass", "scenario": "polish", "phrasing": "direct", "expect": "pass", "text": "邮件开头怎么写比较礼貌,给几个版本"}
+{"id": "polish_delegate_conf", "scenario": "polish", "phrasing": "delegate", "expect": "confidential", "text": "帮我把汇报邮件改正式:Q3营收4303万,同比增长14%"}
+{"id": "polish_delegate_pass", "scenario": "polish", "phrasing": "delegate", "expect": "pass", "text": "帮我把这句话改得更礼貌:请尽快回复"}
+{"id": "polish_paste_conf", "scenario": "polish", "phrasing": "paste", "expect": "confidential", "text": "帮我润色这份简历:雷美玲,15874718462,身份证33010619990502501X,期望薪资32476"}
+{"id": "polish_paste_pass", "scenario": "polish", "phrasing": "paste", "expect": "pass", "text": "帮我润色这篇博客草稿:今天我们来聊聊Python装饰器,先从闭包说起"}
+{"id": "polish_fileref_conf", "scenario": "polish", "phrasing": "fileref", "expect": "confidential", "text": "附件是我的简历.pdf,期望薪资43997那段帮我改一下"}
+{"id": "polish_fileref_pass", "scenario": "polish", "phrasing": "fileref", "expect": "pass", "text": "附件是演讲稿.docx,帮我顺一下逻辑"}
+{"id": "polish_casual_conf", "scenario": "polish", "phrasing": "casual", "expect": "confidential", "text": "帮我写个离职原因,工资太低,才12852"}
+{"id": "polish_casual_pass", "scenario": "polish", "phrasing": "casual", "expect": "pass", "text": "帮我写个生日祝福,搞笑一点的"}
+{"id": "polish_formal_conf", "scenario": "polish", "phrasing": "formal", "expect": "confidential", "text": "请帮我起草离职证明:雷美玲,身份证420111198911235476,月薪30614"}
+{"id": "polish_formal_pass", "scenario": "polish", "phrasing": "formal", "expect": "pass", "text": "帮我起草一份会议邀请,时间地点待定"}
+{"id": "polish_mixed_conf", "scenario": "polish", "phrasing": "mixed", "expect": "confidential", "text": "帮我 polish 一下:my current package is 30k per month"}
+{"id": "polish_mixed_pass", "scenario": "polish", "phrasing": "mixed", "expect": "pass", "text": "帮我 translate 这句邮件成英文:感谢您的耐心等待"}
+{"id": "polish_evasive_conf", "scenario": "polish", "phrasing": "evasive", "expect": "confidential", "text": "简历期望薪资那栏,写49452但别写太明,你帮我润色下"}
+{"id": "polish_evasive_pass", "scenario": "polish", "phrasing": "evasive", "expect": "pass", "text": "简历帮我看看有没有错别字"}

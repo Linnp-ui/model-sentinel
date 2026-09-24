@@ -1,6 +1,5 @@
-# 模板：安装前替换 your-user / 模型路径 / CUDA_VISIBLE_DEVICES / 日志路径
 [Unit]
-Description=vLLM serving bge-m3 embedding model (port 8001, GPU shared with Qwen3-4B)
+Description=vLLM serving bge-m3 embedding model (port 8001, GPU 4 shared with Qwen3-4B)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +8,9 @@ Type=simple
 User=your-user
 WorkingDirectory=/home/your-user
 
-# 与 vllm-qwen3-4b 同卡示例：bge util 0.10 + Qwen util 0.70 = 0.80，余 ~20% 给 CUDA 上下文与碎片。
+# GPU 4 与 vllm-qwen3-4b 同卡（2026-09-16 T36b，用户指定合布 GPU4，腾空 GPU5）：
+# bge util 0.10 + Qwen util 0.70 = 0.80，余 ~20% 给 CUDA 上下文与碎片。
+# 旧址 GPU 5（2026-09-14 自 GPU 4 迁出）现已释放。
 Environment=CUDA_VISIBLE_DEVICES=4
 Environment=HOME=/home/your-user
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1

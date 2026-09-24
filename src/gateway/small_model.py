@@ -1,7 +1,10 @@
 """
 Small Model Layer — 第二层语义判定
 src/gateway/small_model.py:1
-使用本地小模型 Qwen3-4B-Instruct-2507 (http://10.0.0.10:8002/v1) 对 L1 未命中的模糊内容做二次分类
+对 L1 未命中的模糊内容做二次分类。双后端（AI_GATEWAY_L2_BACKEND）：
+- qwen（默认）：本地 Qwen3-4B-Instruct-2507 (10.0.0.10:8002, OpenAI chat 协议)
+- laya：Laya multilingual 非自回归决策模型 (127.0.0.1:8003 /classify, noul 英文题规格)
+影子双跑（AI_GATEWAY_L2_SHADOW=true）：主后端权威，laya 同流量并行打标 shadow_*。
 """
 from __future__ import annotations
 import asyncio
@@ -12,12 +15,8 @@ import time
 import httpx
 from typing import Dict, Any
 
-SMALL_MODEL_URL = os.getenv("SMALL_MODEL_URL", "http://10.0.0.10:8002/v1/chat/completions")
-SMALL_MODEL_NAME = os.getenv("SMALL_MODEL_NAME", "Qwen3-4B-Instruct-2507")
-TIMEOUT = float(os.getenv("SMALL_MODEL_TIMEOUT", "5"))
 CONFIDENTIAL_THRESHOLD = 0.7
 # 紧凑解码：输出只是小 JSON，48 tokens 绰绰有余（实测 32）；guided_json 定型防坏 JSON
-MAX_TOKENS = int(os.getenv("SMALL_MODEL_MAX_TOKENS", "48"))
 L2_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -27,8 +26,6 @@ L2_RESPONSE_SCHEMA = {
     },
     "required": ["label", "confidence", "reason"],
 }
-# 关掉后只跑 L1 规则（测试/降级用）。运行时改环境变量需重启。
-SMALL_MODEL_ENABLED = os.getenv("SMALL_MODEL_ENABLED", "true").lower() == "true"
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -58,6 +55,25 @@ def l2_max_tokens() -> int:
         return int(os.getenv("SMALL_MODEL_MAX_TOKENS", "48"))
     except (TypeError, ValueError):
         return 48
+
+
+def l2_backend() -> str:
+    """qwen = OpenAI chat 协议（vLLM 8002）；laya = /classify JSON（决策模型 8003）。
+
+    laya 切换前提：影子期数据证明质量达标（AI_GATEWAY_L2_SHADOW）。
+    """
+    return (os.getenv("AI_GATEWAY_L2_BACKEND", "qwen") or "qwen").strip().lower()
+
+
+def _shadow_url() -> str:
+    """影子期 laya 端点；未配置 = 影子关闭（避免误连）。"""
+    return (os.getenv("AI_GATEWAY_L2_SHADOW_URL") or "").strip()
+
+
+def _shadow_enabled() -> bool:
+    """影子期：主后端判定继续权威，laya 同流量并行打标（shadow_* 进审计 l2 字段）。"""
+    return ((os.getenv("AI_GATEWAY_L2_SHADOW") or "").strip().lower() == "true"
+            and bool(_shadow_url()) and l2_backend() != "laya")
 
 # P0-2：L2 "判定不可用" 的归因码。判定不可用 != 判定为 NORMAL —— 调用方必须分开处理，
 # 默认降级到本地模型（route_local），不得当作放行出境。
@@ -213,46 +229,104 @@ async def classify(text: str, filename: str = "", headers: list = None, sheet_na
     if not _cb.allow(_L2_BREAKER_KEY):
         # 连续失败已熔断：不再等超时，直接判定不可用（结果由调用方 fail-local）
         return _degraded(DEGRADED_CIRCUIT, 0)
-    user_prompt = _build_user_prompt(text, filename, headers, sheet_names)
     start = time.time()
     try:
-        client = _get_client()
-        resp = await client.post(l2_url(), json={
-            "model": l2_name(),
-            "messages": [
-                {"role": "system", "content": get_system_prompt()},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,
-            "max_tokens": l2_max_tokens(),
-            "extra_body": {"guided_json": L2_RESPONSE_SCHEMA},
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"] or ""
-        latency = int((time.time() - start) * 1000)
-        m = re.search(r"\{[^}]+\}", content, re.S)
-        if not m:
-            _cb.record_failure(_L2_BREAKER_KEY)
-            return _degraded(DEGRADED_NO_JSON, latency, raw=content[:200])
-        obj = json.loads(m.group(0))
-        label = obj.get("label", "NORMAL")
-        if label not in ("CONFIDENTIAL", "NORMAL"):
-            # 旧行为把它静默改成 NORMAL 并写进缓存 —— 模型输出不可信就不该被采信
-            _cb.record_failure(_L2_BREAKER_KEY)
-            return _degraded(DEGRADED_BAD_LABEL, latency, raw=content[:200])
-        conf = float(obj.get("confidence", 0.5))
-        reason = obj.get("reason", "")
-        res = {"label": label, "confidence": conf, "reason": reason, "latency_ms": latency, "raw": content}
+        if l2_backend() == "laya":
+            res = await _call_laya(text, filename, headers, sheet_names)
+        else:
+            res = await _call_qwen(text, filename, headers, sheet_names)
+    except Exception as e:
+        _cb.record_failure(_L2_BREAKER_KEY)
+        res = _degraded(DEGRADED_EXC, int((time.time() - start) * 1000), error=str(e))
+    if _shadow_enabled():
+        # 影子失败只丢影子数据，绝不影响主判定（上方已定型）
+        await _shadow_run(res, text, filename, headers, sheet_names)
+    if not res.get("degraded"):
         _cb.record_success(_L2_BREAKER_KEY)
         _CACHE[key] = (now, res)
         if len(_CACHE) > 500:
             _CACHE.pop(next(iter(_CACHE)))
-        return res
+    return res
+
+
+async def _call_qwen(text: str, filename: str, headers: list, sheet_names: list) -> Dict[str, Any]:
+    """qwen 后端（vLLM OpenAI chat 协议）。异常直接抛，熔断记账由 classify() 统一做。"""
+    client = _get_client()
+    start = time.time()
+    resp = await client.post(l2_url(), json={
+        "model": l2_name(),
+        "messages": [
+            {"role": "system", "content": get_system_prompt()},
+            {"role": "user", "content": _build_user_prompt(text, filename, headers, sheet_names)},
+        ],
+        "temperature": 0.1,
+        "max_tokens": l2_max_tokens(),
+        "extra_body": {"guided_json": L2_RESPONSE_SCHEMA},
+    })
+    resp.raise_for_status()
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"] or ""
+    latency = int((time.time() - start) * 1000)
+    m = re.search(r"\{[^}]+\}", content, re.S)
+    if not m:
+        return _degraded(DEGRADED_NO_JSON, latency, raw=content[:200])
+    obj = json.loads(m.group(0))
+    label = obj.get("label", "NORMAL")
+    if label not in ("CONFIDENTIAL", "NORMAL"):
+        # 模型输出不可信就不该被采信（不静默改成 NORMAL）
+        return _degraded(DEGRADED_BAD_LABEL, latency, raw=content[:200])
+    return {"label": label, "confidence": float(obj.get("confidence", 0.5)),
+            "reason": obj.get("reason", ""), "latency_ms": latency, "raw": content}
+
+
+async def _call_laya(text: str, filename: str, headers: list, sheet_names: list,
+                     timeout: float | None = None) -> Dict[str, Any]:
+    """laya 后端（/classify JSON，非自回归决策模型）。主备一律走
+    AI_GATEWAY_L2_SHADOW_URL（SMALL_MODEL_URL 是 OpenAI chat 口，打 classify 包过去
+    必 400；2026-09-23 修，否则 BACKEND=laya 当天全灰进 l2_unavailable）。
+    timeout=None 用 l2_timeout()，非 None = 影子短超时。URL 为空直接 degraded。"""
+    client = _get_client()
+    url = _shadow_url()
+    if not url:
+        return _degraded(DEGRADED_EXC, 0, error="AI_GATEWAY_L2_SHADOW_URL 为空")
+    start = time.time()
+    try:
+        resp = await client.post(url, json={
+            "text": (text or "")[:1200],
+            "filename": filename or "",
+            "headers": list(headers or []),
+            "sheet_names": list(sheet_names or []),
+        }, timeout=timeout if timeout is not None else l2_timeout())
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        latency = int((time.time() - start) * 1000)
-        _cb.record_failure(_L2_BREAKER_KEY)
-        return _degraded(DEGRADED_EXC, latency, error=str(e))
+        return _degraded(DEGRADED_EXC, int((time.time() - start) * 1000), error=str(e))
+    latency = int((time.time() - start) * 1000)
+    label = data.get("label")
+    if label not in ("CONFIDENTIAL", "NORMAL"):
+        return _degraded(DEGRADED_BAD_LABEL, latency, raw=str(data)[:200])
+    return {"label": label, "confidence": float(data.get("confidence", 0.0)),
+            "reason": data.get("reason", ""), "latency_ms": latency,
+            "probabilities": data.get("probabilities"),
+            "raw": f"laya {label} p={data.get('confidence')}"}
+
+
+async def _shadow_run(res: Dict[str, Any], text: str, filename: str, headers: list, sheet_names: list) -> None:
+    """影子期：同一段文本问 laya，结果写 shadow_* 键（审计 l2 字段整体 JSON 落库，自动留痕）。
+
+    2s 短超时：laya 服务挂了只让影子数据缺失，不拖主链路。
+    """
+    try:
+        sh = await _call_laya(text, filename, headers, sheet_names, timeout=2.0)
+        if sh.get("degraded"):
+            res["shadow_degraded"] = sh.get("error") or sh.get("degraded_reason") or "error"
+        else:
+            res["shadow_label"] = sh.get("label")
+            res["shadow_conf"] = sh.get("confidence")
+            res["shadow_probabilities"] = sh.get("probabilities")
+            res["shadow_reason"] = sh.get("reason")
+    except Exception as e:
+        res["shadow_degraded"] = str(e)[:120]
 
 def is_confidential(result: Dict[str, Any]) -> bool:
     """1.1: 阈值运行时可调 —— model_policy.yaml review_model.threshold（mtime 热重载）。"""
@@ -263,8 +337,20 @@ def is_confidential(result: Dict[str, Any]) -> bool:
         th = CONFIDENTIAL_THRESHOLD
     return result.get("label") == "CONFIDENTIAL" and float(result.get("confidence", 0)) >= th
 
+_SHADOW_KEYS = ("shadow_label", "shadow_conf", "shadow_probabilities",
+                 "shadow_reason", "shadow_degraded")
+
+
+def _carry_shadow(out: dict, src: dict) -> dict:
+    """多块聚合把影子键从决策块带出来（不带=审计 l2 无影子，覆盖率被低估）。"""
+    for k in _SHADOW_KEYS:
+        if k in src:
+            out[k] = src[k]
+    return out
+
+
 async def classify_chunks(chunks: list, filename: str = "", headers: list = None, sheet_names: list = None,
-                         scopes: list = None) -> Dict[str, Any]:
+                          scopes: list = None) -> Dict[str, Any]:
     """P2：`scopes` 是**纯增量**参数（块与 scope 名按位置一一对应）。
 
     `scopes=None`（或空）时返回**逐字节等于旧实现** —— 默认档 `scopes=["last_user"]`
@@ -287,6 +373,7 @@ async def classify_chunks(chunks: list, filename: str = "", headers: list = None
     for idx, r in enumerate(results):
         if is_confidential(r):
             out = {"label": "CONFIDENTIAL", "confidence": r["confidence"], "reason": r["reason"], "latency_ms": total_lat, "chunks": len(results), "hit_index": idx, "raw": r.get("raw")}
+            _carry_shadow(out, r)  # 影子跟命中块走（主影对同一段文本才可比）
             if scopes:
                 # 命中块 = scope 名（P2 留痕：让「被哪一类内容拦下」可查）
                 out["scope"] = scopes[idx] if idx < len(scopes) else None
@@ -298,6 +385,7 @@ async def classify_chunks(chunks: list, filename: str = "", headers: list = None
     if _bad:
         out = _degraded(_bad[0].get("degraded_reason") or DEGRADED_EXC, total_lat,
                         chunks=len(results), degraded_chunks=len(_bad))
+        _carry_shadow(out, next((r for r in results if r.get("shadow_label")), _bad[0]))
         if scopes:
             # 哪几个 scope 没产出结论 —— 「降级了但不知道是谁超时」是没法定位的
             out["degraded_scopes"] = [scopes[i] for i, r in enumerate(results)
@@ -306,6 +394,7 @@ async def classify_chunks(chunks: list, filename: str = "", headers: list = None
         return out
     best = max(results, key=lambda x: float(x.get("confidence", 0))) if results else {"label":"NORMAL","confidence":0.5}
     out = {"label": "NORMAL", "confidence": best.get("confidence", 0.5), "reason": best.get("reason",""), "latency_ms": total_lat, "chunks": len(results)}
+    _carry_shadow(out, best)
     if scopes:
         out["scopes_run"] = list(scopes[:len(results)])
         out["cached"] = _all_cached
