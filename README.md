@@ -18,6 +18,20 @@
       7. 审计      Redis 热缓存 + MySQL 持久化（90 天，含 L2 判定 JSON），密钥自动脱敏
 ```
 
+## 界面预览
+
+| 演示页（文件上传预检） | 管理台 · 总览 |
+|---|---|
+| ![demo](docs/screenshots/demo-page.png) | ![overview](docs/screenshots/admin-overview.png) |
+
+| 审计日志（含脱敏） | 模型配置（别名/候选/限流） |
+|---|---|
+| ![audit](docs/screenshots/admin-audit.png) | ![model-policy](docs/screenshots/admin-model-policy.png) |
+
+| API KEY 管理 | 统计可视化 |
+|---|---|
+| ![keys](docs/screenshots/admin-keys.png) | ![stats](docs/screenshots/admin-stats.png) |
+
 ## 特性
 
 - **文件维度预检**：xlsx 表名/表头/内容、PDF 文本层/水印、docx、图片 OCR（tesseract/paddle，
