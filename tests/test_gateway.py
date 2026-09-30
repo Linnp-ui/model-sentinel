@@ -208,6 +208,86 @@ def test_circuit_breaker_trip_and_recover(monkeypatch):
     b.record_success(key)
     assert b.state(key) == "closed" and b.allow(key)
 
+def test_alias_candidates_get_own_provider_key(monkeypatch):
+    # 凭据池是 per-provider 的：别名组切到候选 #2 时若沿用候选 #1 的 key，
+    # 就把 A 家的 key 打到 B 家（401，且审计里看不出来源）。
+    # route_chat / route_messages / 两个 stream 路径都必须逐候选解析。
+    import asyncio
+    from src.gateway import routing as _rt
+    from src.gateway.providers import Provider
+    from src.gateway.identity import Identity, set_current_identity
+
+    pa = Provider(name="provA", base_url="http://a.invalid", api_key_value="KEY-A")
+    pb = Provider(name="provB", base_url="http://b.invalid", api_key_value="KEY-B")
+    set_current_identity(Identity(key_id=1, name="t", owner="", source="registry",
+                                  token_fp="fp"))
+
+    class _Cfg:
+        on_missing_key = "reject"
+
+        def get(self, name):
+            return {"provA": pa, "provB": pb}.get(name)
+
+        def external_provider(self):
+            return pa
+
+    monkeypatch.setattr(_rt, "load_routing", lambda: _Cfg())
+    monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: False)
+    monkeypatch.setattr(_rt, "find_provider", lambda name: {"provA": pa, "provB": pb}.get(name))
+    monkeypatch.setattr(_rt, "_alias_context", lambda *a, **k: {"name": "AB", "candidates": []})
+    from src.gateway import alias_router as _ar
+    monkeypatch.setattr(_ar, "alias_candidates",
+                        lambda g, skip=0: [{"provider": "provA", "model": "mA", "idx": 0},
+                                           {"provider": "provB", "model": "mB", "idx": 1}][skip:])
+    monkeypatch.setattr(_ar, "record_alias_result", lambda *a, **k: None)
+
+    seen = []
+
+    async def _fake_post(prov, url, body, ukey=""):
+        seen.append((prov.name, ukey))
+        raise _rt.RoutingError(f"{prov.name} boom", 502)
+
+    monkeypatch.setattr(_rt, "_post", _fake_post)
+
+    async def _failover_once():
+        seen.clear()
+        try:
+            await _rt.route_chat({"model": "AB", "messages": []}, {"action": "allow"})
+        except _rt.RoutingError:
+            pass
+        return list(seen)
+
+    # 候选 #1 失败后切 #2，#2 必须拿到 provB 的 key
+    assert asyncio.run(_failover_once()) == [("provA", "KEY-A"), ("provB", "KEY-B")]
+
+    async def _msg_once():
+        seen.clear()
+        try:
+            await _rt.route_messages({"model": "AB"}, {"action": "allow"})
+        except _rt.RoutingError:
+            pass
+        return list(seen)
+
+    assert asyncio.run(_msg_once()) == [("provA", "KEY-A"), ("provB", "KEY-B")]
+
+def test_cand_key_gates_per_candidate():
+    # 候选可转发性必须按**该候选自己**的 provider 判：用当前 prov 的 key 去筛
+    # 会误杀「有自己凭据」的候选（跨 provider 混排别名组的典型形态）。
+    from src.gateway import routing as _rt
+    from src.gateway.providers import Provider
+    from src.gateway.identity import Identity, set_current_identity
+
+    set_current_identity(Identity(key_id=1, name="t", owner="", source="registry", token_fp="fp"))
+    withkey = Provider(name="withkey", api_key_value="K1")
+    nokey = Provider(name="nokey")
+    assert _rt._cand_key("", withkey) == "K1"
+    assert _rt._cand_key("", nokey) == ""
+    # 客户端自带凭据优先，且对所有候选一致（BYOK 不分 provider）
+    assert _rt._cand_key("client-key", nokey) == "client-key"
+    # 未登记身份 fail-closed
+    set_current_identity(None)
+    assert _rt._cand_key("", withkey) == ""
+
 def test_err_provider_prefers_exc_alias():
     # 别名 503 信封 provider 曾误标预解析的默认 provider（local-model 熔断标成 deepseek）：
     # RoutingError 自带 provider（别名名）优先，否则回落 prov.name，无则空串
@@ -604,3 +684,434 @@ def test_admin_metrics_timeseries_shape():
     d = r.json()
     assert {"interval_s", "ticks", "panel"} <= set(d)
     assert "l2_up" in d["panel"] and "ring" in d["panel"]
+
+
+def test_l2_shadow_trend_and_divergences_shape():
+    # 测试环境无 audit MySQL（l2 列无落库数据）→ 验端点形状/桶数/导出 content-type
+    r = client.get("/admin/api/l2-shadow-trend", params={"hours": 24})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["hours"] == 24 and len(d["buckets"]) == 25
+    assert {"t", "l2_total", "shadowed", "compared", "agree", "cc", "cn", "nc", "nn"} <= set(d["buckets"][0])
+    r2 = client.get("/admin/api/l2-divergences", params={"hours": 24, "cell": "nc"})
+    assert r2.status_code == 200
+    assert {"hours", "total", "items"} <= set(r2.json())
+    r3 = client.get("/admin/api/l2-divergences/export", params={"hours": 24, "labeled": "labeled"})
+    assert r3.status_code == 200
+    assert r3.headers["content-type"].startswith("application/jsonl")
+    assert "attachment" in r3.headers.get("content-disposition", "")
+
+
+def test_l2_divergences_label_roundtrip():
+    from src.gateway.admin_store import get_admin_store
+    st = get_admin_store()
+    r = client.post("/admin/api/l2-divergences/label", json={"req_id": "pytest-l2label-1", "label": 1})
+    assert r.status_code == 200
+    assert st.get_l2_labels(["pytest-l2label-1"]) == {"pytest-l2label-1": 1}
+    client.post("/admin/api/l2-divergences/label", json={"req_id": "pytest-l2label-1", "label": 0})
+    assert st.get_l2_labels(["pytest-l2label-1"]) == {"pytest-l2label-1": 0}
+    client.post("/admin/api/l2-divergences/label", json={"req_id": "pytest-l2label-1", "label": None})
+    assert st.get_l2_labels(["pytest-l2label-1"]) == {}
+    bad = client.post("/admin/api/l2-divergences/label", json={"req_id": "", "label": 1})
+    assert bad.status_code == 422
+
+
+def test_policy_version_rollback(monkeypatch, tmp_path):
+    # 独立 policy 文件，绝不碰生产 policy.yaml
+    import yaml as _yaml
+    from src.gateway import policy_admin
+    from src.gateway.policy import invalidate_policy_cache
+
+    pol = tmp_path / "policy_test_versions.yaml"
+    pol.write_text("policies:\n  - name: base-allow\n    priority: 100\n    action: allow\n    when: always\n",
+                   encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(pol))
+    invalidate_policy_cache()
+    assert [p["name"] for p in policy_admin.list_policies()] == ["base-allow"]
+
+    r = client.post("/admin/api/policies", json={
+        "name": "pytest-rollback-rule", "priority": 5, "action": "block",
+        "when": {"text contains_any": ["pytest-rollback-marker"]}})
+    assert r.status_code == 200, r.text
+    invalidate_policy_cache()
+    assert "pytest-rollback-rule" in [p["name"] for p in policy_admin.list_policies()]
+
+    vs = client.get("/admin/api/policy/versions", params={"limit": 50}).json()["items"]
+    vid = next(v["id"] for v in vs if v["source"] == "save")
+    full = client.get(f"/admin/api/policy/versions/{vid}").json()
+    assert [p["name"] for p in _yaml.safe_load(full["yaml_text"])["policies"]] == ["base-allow"]
+    assert full["rule_count"] == 1
+
+    rb = client.post(f"/admin/api/policy/versions/{vid}/rollback")
+    assert rb.status_code == 200, rb.text
+    invalidate_policy_cache()
+    assert "pytest-rollback-rule" not in [p["name"] for p in policy_admin.list_policies()]
+    vs2 = client.get("/admin/api/policy/versions", params={"limit": 50}).json()["items"]
+    assert vs2[0]["source"] == "rollback"
+    assert vs2[0]["rule_count"] == 2  # 回滚前现状（base-allow + pytest 规则）
+    assert client.get("/admin/api/policy/versions/999999").status_code == 404
+
+
+def test_events_stream_shape():
+    # 测试环境无 audit MySQL → 零事件；验端点形状/桶数/summary 键
+    r = client.get("/admin/api/events", params={"hours": 6})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["hours"] == 6
+    assert d["summary"] == {"degrade": 0, "route_local": 0, "l2_unavailable": 0}
+    assert len(d["by_hour"]) == 7
+    assert {"t", "degrade", "route_local", "l2_unavailable"} <= set(d["by_hour"][0])
+    assert d["recent"] == []
+
+
+def test_admin_csv_export_shape():
+    # 防半截重构复发：486bf71 瘦身C1 曾丢 export_csv 的 cols/buf/w 初始化，
+    # 管理台"导出 CSV"按钮恒 500（NameError: buf），同 timeseries 半截 revert 事故类
+    r = client.get("/admin/csv", params={"since": "24h"})
+    assert r.status_code == 200, r.text[:200]
+    assert r.headers["content-type"].startswith("text/csv")
+    assert r.text.splitlines()[0].startswith("time,type,rule,action")
+    r2 = client.get("/admin/csv", params={})
+    assert r2.status_code == 200, r2.text[:200]
+
+
+def test_rule_hits_shape():
+    # 测试环境无 audit MySQL → 零命中；验端点形状 + default_allow 排除语义
+    r = client.get("/admin/api/rule-hits", params={"hours": 168})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["hours"] == 168 and d["total"] == 0 and d["items"] == []
+
+
+def test_laya_apply_labeled_priority():
+    # 人工标注覆盖 rule 推导（含冲突取密）；不在真实集的标注样本直接进训练
+    import hashlib
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build_laya_dataset", "scripts/build_laya_dataset.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    rt = [{"text": "salary payload", "label": 0, "source": "audit:default_allow"}]
+    re_ = [{"text": "chat text", "label": 1, "source": "audit:l2_confidential"}]
+    labeled = {
+        hashlib.sha1(b"salary payload").hexdigest():
+            {"text": "salary payload", "label": 1, "source": "human:abc", "filename": "", "ts": "x"},
+        hashlib.sha1(b"brand new labeled sample over ten chars").hexdigest():
+            {"text": "brand new labeled sample over ten chars", "label": 0, "source": "human:def", "filename": "", "ts": "x"},
+    }
+    rt2, re2, n_over, n_add = m.apply_labeled(rt, re_, labeled)
+    assert n_over == 1
+    assert rt[0]["label"] == 1 and rt[0]["source"] == "human:abc"  # 人工 1 覆盖 rule 推导 0
+    assert n_add == 1 and len(rt2) == 2 and len(re2) == 1
+    # 幂等：同 source 二次应用不重复计数
+    _, _, n_over2, n_add2 = m.apply_labeled(rt2, re2, labeled)
+    assert n_over2 == 0 and n_add2 == 0
+
+
+def test_l2_retrain_guardrails():
+    r = client.get("/admin/api/l2/retrain/status")
+    assert r.status_code == 200
+    d = r.json()
+    assert {"state", "stage", "min_labels", "labeled_count", "candidate"} <= set(d)
+    assert d["state"] in ("idle", "running", "done", "failed")
+    # 测试环境标注不足 → 启动必须 422（绝不真训练）
+    r2 = client.post("/admin/api/l2/retrain")
+    assert r2.status_code == 422
+    # promote 不存在的版本 → 404（绝不真重启服务）
+    r3 = client.post("/admin/api/l2/retrain/promote", json={"version": 9999})
+    assert r3.status_code == 404
+
+
+def test_l2_retrain_classify_posts_to_classify_path(monkeypatch):
+    # 回归：_classify 必须打 /classify（裸 URL POST / 会 404，v10 eval 即死于此）
+    import json
+    from src.gateway import l2_retrain
+    seen = {}
+
+    class FakeResp:
+        def read(self):
+            return json.dumps({"probabilities": {"CONFIDENTIAL": 0.9}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        return FakeResp()
+
+    monkeypatch.setattr(l2_retrain.urllib.request, "urlopen", fake_urlopen)
+    assert l2_retrain._classify("http://127.0.0.1:8004", "hi") == 0.9
+    assert seen["url"] == "http://127.0.0.1:8004/classify"
+
+
+def test_l2_retrain_score_detail(monkeypatch):
+    # 报告明细：分项 cats + 错题 wrong（含预览截断），供晋升决策
+    from src.gateway import l2_retrain
+    monkeypatch.setattr(l2_retrain, "_classify",
+                        lambda url, t, fn="": 0.9 if t == "secret text" else 0.1)
+    cases = [("probe", "p1", "secret text", "", 1),
+             ("real", "r1", "hello world, this is a much longer benign sentence for preview", "", 0),
+             ("real", "r2", "secret text", "", 0)]
+    s = l2_retrain._score("http://x", cases)
+    assert (s["total"], s["correct"]) == (3, 2)
+    assert s["cats"] == {"probe": {"total": 1, "correct": 1},
+                         "real": {"total": 2, "correct": 1}}
+    assert len(s["wrong"]) == 1 and s["wrong"][0]["name"] == "real:r2"
+    assert s["wrong"][0]["got"] == 1 and s["wrong"][0]["want"] == 0
+
+
+def test_l2_retrain_versions_api():
+    r = client.get("/admin/api/l2/retrain/versions")
+    assert r.status_code == 200
+    d = r.json()
+    assert "versions" in d and "current" in d and isinstance(d["versions"], list)
+
+
+def test_laya_balance_and_hard(tmp_path, monkeypatch):
+    # 配比：多数类下采样到 0.5，只删不造；真实/人工/难例优先保留
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build_laya_dataset", "scripts/build_laya_dataset.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    train = ([{"text": f"pos{i}", "label": 1, "source": "synth_x"} for i in range(80)]
+             + [{"text": f"neg{i}", "label": 0, "source": "synth_x"} for i in range(20)]
+             + [{"text": "real keep", "label": 1, "source": "audit:z"}])
+    out = m.balance(list(train), target=0.5)
+    pos = sum(v["label"] for v in out)
+    assert abs(pos / len(out) - 0.5) <= 0.05
+    assert any(v["text"] == "real keep" for v in out)  # 真实审计没被洗掉
+    # 难例文件缺失 → []，不挡构建
+    monkeypatch.setattr(m, "OUT_DIR", str(tmp_path))
+    assert m.load_hard() == []
+    (tmp_path / "hard.jsonl").write_text('{"text": "hard case one two three", "label": 1}\n', encoding="utf-8")
+    assert m.load_hard() == [{"text": "hard case one two three", "label": 1}]
+
+
+def test_l2_retrain_add_hard(tmp_path, monkeypatch):
+    # 错题入 hard：去重/拦短文本/拦非法 label，文件落盘永不入库
+    from src.gateway import l2_retrain
+    monkeypatch.setattr(l2_retrain, "DATASET_DIR", str(tmp_path))
+    r = l2_retrain.add_hard([
+        {"text": "salary leak sample for hard mining case", "label": 1},
+        {"text": "salary leak sample for hard mining case", "label": 1},
+        {"text": "短", "label": 0},
+        {"text": "benign mail text placeholder case", "label": 2},
+    ])
+    assert r["added"] == 1 and r["skipped"] == 3 and "labeled" in r
+    r2 = client.post("/admin/api/l2/retrain/hard",
+                     json={"items": [{"text": "salary leak sample for hard mining case", "label": 1}]})
+    assert r2.status_code == 200  # 端点只管透传（写真实 ~/models，不在此断言）
+
+
+def test_l2_retrain_prompt_test_guards():
+    # prompt-test 门槛：太短 422（不碰网络）；版本戳形状
+    from src.gateway import l2_retrain
+    import pytest
+    with pytest.raises(ValueError):
+        l2_retrain.prompt_test("太短")
+    info = l2_retrain.current_prompt_info()
+    assert len(info["sha1"]) == 12 and info["chars"] > 100
+    r = client.post("/admin/api/l2/retrain/prompt-test", json={"system_prompt": "x" * 19})
+    assert r.status_code == 422
+
+
+def test_l2_retrain_score_qwen(monkeypatch):
+    # _score_qwen 走候选 prompt 直调 qwen（与 _score 同报告形状）
+    from src.gateway import l2_retrain
+    from src.gateway import small_model as _sm
+
+    async def fake_call_qwen(text, filename="", headers=None, sheet_names=None, system=None,
+                            temperature=0.1):
+        assert system == "CANDIDATE"
+        assert temperature == 0.0, "打分必须 temperature=0（否则同 prompt 两次跑有采样噪声）"
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "degraded": False}
+
+    monkeypatch.setattr(_sm, "_call_qwen", fake_call_qwen)
+    s = l2_retrain._score_qwen([("probe", "p1", "t", "", 1), ("real", "r1", "t", "", 0)], "CANDIDATE")
+    assert (s["total"], s["correct"]) == (2, 1)
+    assert s["wrong"][0]["name"] == "real:r1" and s["wrong"][0]["p"] == 0.95
+
+
+def test_l2_retrain_prompt_test_hashes_raw(monkeypatch):
+    # stamp 必须等于即将应用的原文（strip 哈希曾导致线上永远对不上）
+    import hashlib
+    from src.gateway import l2_retrain
+    monkeypatch.setattr(l2_retrain, "_score_qwen",
+                        lambda cases, system: {"total": 0, "correct": 0, "cats": {}, "wrong": []})
+    raw = "  candidate prompt padding text here  \n"
+    d = l2_retrain.prompt_test(raw)
+    assert d["prompt_sha1"] == hashlib.sha1(raw.encode()).hexdigest()[:12]
+
+
+def test_l2_prompt_versions_roundtrip(monkeypatch):
+    # PUT 前快照 → 列表可见 → 回滚还原（改完必须恢复线上 v1 prompt）。
+    # _l2ov 打 fake：真文件 l2_overrides.yaml 是生产共用，测试绝不碰（曾洗掉线上 v1 prompt）。
+    from src.gateway import admin_api as _aa
+
+    class FakeOv:
+        def __init__(self):
+            self.d = {}
+        def load_overrides(self):
+            return dict(self.d)
+        def save_overrides(self, values, *, delete=None):
+            for k, v in (values or {}).items():
+                self.d[k] = v
+            for k in delete or set():
+                self.d.pop(k, None)
+            return dict(self.d)
+
+    monkeypatch.setattr(_aa, "_l2ov", FakeOv())
+    cur = client.get("/admin/api/l2-prompts").json()["system_prompt"]
+    new = cur + "\n测试追加行（谨慎判密）。"
+    r = client.put("/admin/api/l2-prompts", json={"AI_GATEWAY_L2_SYSTEM_PROMPT": new})
+    assert r.status_code == 200 and r.json()["system_prompt"] == new
+    items = client.get("/admin/api/l2-prompt-versions").json()["items"]
+    assert len(items) >= 1 and items[0]["system_preview"].startswith(cur[:200])
+    assert len(items[0].get("system_sha1", "")) == 12
+    vid = items[0]["id"]
+    d = client.get(f"/admin/api/l2-prompt-versions/{vid}").json()
+    assert d["system_prompt"] == cur
+    rb = client.post(f"/admin/api/l2-prompt-versions/{vid}/rollback").json()
+    assert rb["ok"] is True and rb["system_prompt"] == cur
+    assert client.get("/admin/api/l2-prompt-versions").json()["items"][0]["source"] == "rollback"
+    assert client.get("/admin/api/l2-prompts").json()["system_prompt"] == cur
+    assert client.post("/admin/api/l2-prompt-versions/999999/rollback").status_code == 404
+
+
+def test_l2_divergences_dedup_collapse():
+    # 同文本+文件名+方向折叠：total 去重，dup 计数，防双行双标
+    r = client.get("/admin/api/l2-divergences?hours=1&limit=500")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    keys = [(x["text_preview"], x["filename"], x["cell"]) for x in items]
+    assert len(keys) == len(set(keys))
+    assert all(x.get("dup", 1) >= 1 for x in items)
+
+
+def test_l2_retrain_diff_reports():
+    # 回归定义：上版对、这版错 = 新错；反之为修好
+    from src.gateway import l2_retrain
+    prev = {"battery": {"wrong": [{"name": "real:a"}, {"name": "reg:b"}]}}
+    cur = {"battery": {"wrong": [{"name": "real:a"}, {"name": "probe:c"}]}}
+    d = l2_retrain._diff_reports(prev, cur)
+    assert d == {"new": ["probe:c"], "fixed": ["reg:b"], "still": ["real:a"]}
+    assert l2_retrain._diff_reports(None, cur)["new"] == ["probe:c", "real:a"]
+
+
+def test_l2_propose_apply_patch_dedup():
+    # 补丁拼接：追加一次有效，重复追加不再叠加，空补丁原样返回
+    from src.gateway import l2_retrain
+    cur = "你是分类器。\n规则A。"
+    p1 = l2_retrain._apply_patch(cur, "规则B。")
+    assert p1 == cur + "\n规则B。"
+    assert l2_retrain._apply_patch(p1, "规则B。") == p1
+    assert l2_retrain._apply_patch(cur, "  ") == cur
+
+
+def test_l2_propose_meta_contract():
+    # 自省元提示词 frozen 约束：只允许追加 + 严格 JSON（含 patch 键）
+    from src.gateway import l2_retrain
+    m = l2_retrain.PROPOSE_META_SYSTEM
+    assert "追加" in m and '"patch"' in m and "不准修改现有文字" in m
+
+
+def test_l2_retrain_ensure_overrides(tmp_path, monkeypatch):
+    """量 prompt 前必须应用持久化覆盖，否则独立进程读到内置默认（线上值≠评的值）"""
+    from src.gateway import l2_overrides as ov, l2_retrain
+    f = tmp_path / "ov.yaml"
+    f.write_text("AI_GATEWAY_L2_SYSTEM_PROMPT: PERSISTED_PROMPT\n", encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_L2_OVERRIDES_PATH", str(f))
+    monkeypatch.delenv("AI_GATEWAY_L2_SYSTEM_PROMPT", raising=False)
+    l2_retrain._ensure_overrides()
+    assert ov.load_overrides()["AI_GATEWAY_L2_SYSTEM_PROMPT"] == "PERSISTED_PROMPT"
+    # 契约是「持久化值进 env」（get_system_prompt 优先读内存覆盖，别的测试可能已设过）
+    import os as _os
+    assert _os.environ["AI_GATEWAY_L2_SYSTEM_PROMPT"] == "PERSISTED_PROMPT"
+
+
+def test_div_group_key_ignores_direction():
+    """方向翻转仍是同一条样本：键不含 cell，否则 cn↔nc 翻转会裂成两条（标注看着丢）"""
+    from src.gateway.admin_api import _div_group_key
+    a = {"text_preview": "涨薪结果：王五 月薪 15000", "filename": "", "cell": "cn"}
+    b = dict(a, cell="nc")
+    assert _div_group_key(a) == _div_group_key(b)
+    c = dict(a, filename="salary.xlsx")
+    assert _div_group_key(a) != _div_group_key(c)
+
+
+def test_l2_shadow_samples_shape():
+    """逐条明细：agree/cell 形状 + 窗口上限 24h（分桶端点保留但前端不用了）"""
+    r = client.get("/admin/api/l2-shadow-samples", params={"hours": 999})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["hours"] == 24
+    for it in d["items"]:
+        assert it["main"] in ("CONFIDENTIAL", "NORMAL") and it["shadow"] in ("CONFIDENTIAL", "NORMAL")
+        assert it["agree"] == (it["main"] == it["shadow"])
+        assert it["cell"] == ("" if it["agree"] else ("nc" if it["main"] == "NORMAL" else "cn"))
+
+
+def test_l2_round_marker_and_since_window():
+    """轮次标记 + since 窗口：since 起点优先于 hours（不然两轮灌数同窗 → dup×2）"""
+    import src.gateway.admin_api as aa
+    r = client.get("/admin/api/l2-round")
+    assert r.status_code == 200 and "since" in r.json()
+    import datetime as _dt
+    late = _dt.datetime.utcnow() - _dt.timedelta(seconds=5)
+    c1 = aa._cutoff(24, late.strftime("%Y-%m-%d %H:%M:%S"))
+    assert c1 >= late - _dt.timedelta(seconds=2)
+    c2 = aa._cutoff(1, "垃圾值")           # 坏 since 退回 hours
+    assert (_dt.datetime.utcnow() - c2) <= _dt.timedelta(hours=1, minutes=1)
+
+
+def test_set_prompt_overrides_clears_cache():
+    """改提示词必须清 L2 判定缓存：否则同一文本在 TTL(600s) 内继续吐旧 prompt 结论"""
+    from src.gateway import small_model as sm
+    sm._CACHE["k"] = (9e9, {"label": "NORMAL"})
+    sm.set_prompt_overrides(system="NEW PROMPT")
+    assert not sm._CACHE
+    sm.set_prompt_overrides(system="")
+
+
+def test_labeled_regression_dedup_by_text(monkeypatch):
+    """灌数多轮同一句 → 报告按文本去重（8 条 miss 实为 2 句 ×4 轮），且只调一次模型"""
+    from src.gateway import l2_retrain, admin_store, audit_store
+    calls = []
+
+    class FakeAudit:
+        def query_mysql(self, **kw):
+            return [{"req_id": f"r{i}", "text_preview": "同一句话", "filename": ""} for i in range(4)]
+    class FakeAdmin:
+        def list_l2_labels(self, n):
+            return [{"req_id": f"r{i}", "label": 1} for i in range(4)]
+    monkeypatch.setattr(audit_store, "get_audit_store", lambda: FakeAudit())
+    monkeypatch.setattr(admin_store, "get_admin_store", lambda: FakeAdmin())
+    monkeypatch.setattr(l2_retrain, "_classify", lambda *a: (calls.append(1), 0.01)[1])
+    s = l2_retrain._labeled_regression("http://x")
+    assert s["total"] == 1 and s["matched"] == 0
+    assert len(s["missed"]) == 1 and s["missed"][0]["dup"] == 4
+    assert len(calls) == 1  # 同文本只打一次模型
+
+
+def test_divergence_regression_dedup_and_want(monkeypatch):
+    """历史分歧回归：只考 label!=shadow 的行、按文本去重、截断文本靠前缀匹配 want"""
+    from src.gateway import l2_retrain, audit_store
+
+    class FakeAudit:
+        def query_mysql(self, **kw):
+            return [
+                {"req_id": "a", "text_preview": "同一句分歧", "filename": "",
+                 "l2": '{"label": "NORMAL", "shadow_label": "CONFIDENTIAL"}'},
+                {"req_id": "b", "text_preview": "同一句分歧", "filename": "",
+                 "l2": '{"label": "NORMAL", "shadow_label": "CONFIDENTIAL"}'},  # 多轮重复
+                {"req_id": "c", "text_preview": "主影一致的不考", "filename": "",
+                 "l2": '{"label": "NORMAL", "shadow_label": "NORMAL"}'},
+                {"req_id": "d", "text_preview": "候选表里没有的句子", "filename": "",
+                 "l2": '{"label": "NORMAL", "shadow_label": "CONFIDENTIAL"}'},
+                {"req_id": "e", "text_preview": "没进 L2 的不考", "filename": "", "l2": None},
+            ]
+
+    monkeypatch.setattr(audit_store, "get_audit_store", lambda: FakeAudit())
+    monkeypatch.setattr(l2_retrain, "_candidate_wants", lambda: [("同一句分歧", 1)])
+    monkeypatch.setattr(l2_retrain, "_classify", lambda *a: 0.02)
+    d = l2_retrain._divergence_regression("http://x")
+    assert d["total"] == 1 and d["matched"] == 0
+    assert d["missed"][0]["want"] == 1 and d["missed"][0]["got"] == 0
+    assert d["missed"][0]["dup"] == 2
+    assert d["unmatched"] == 1

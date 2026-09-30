@@ -112,7 +112,8 @@ def classify(r: Req):
 def health():
     if agent is None:
         return JSONResponse({"ok": False, "error": _load_err or "loading"}, status_code=503)
-    return {"ok": True}
+    # model 带路径基名：promote 后核对服务身份（防 env 文件没生效还跑旧权重）
+    return {"ok": True, "model": os.path.basename(MODEL_PATH) if MODEL_PATH else ""}
 
 
 if __name__ == "__main__":

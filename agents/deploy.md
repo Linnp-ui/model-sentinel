@@ -6,12 +6,11 @@
 > → `/health` 冒烟：
 
 ```bash
-HOST=<user>@<gateway-host>; REPO=~/gateway
-ssh $HOST "cp $REPO/src/gateway/xxx.py $REPO/src/gateway/xxx.py.bak_$(date +%Y%m%d_%H%M%S)"
-scp src/gateway/xxx.py $HOST:$REPO/src/gateway/xxx.py
-ssh $HOST "sha256sum $REPO/src/gateway/xxx.py"   # 对 hash
-ssh $HOST "cd $REPO && .venv/bin/python -c \"import ast; ast.parse(open('src/gateway/xxx.py', encoding='utf-8').read())\""
-ssh $HOST "sudo systemctl restart gateway.service && sleep 2 && systemctl show gateway.service -p MainPID && curl -sf http://127.0.0.1:8080/health"
+ssh <user>@<gateway-host> "cp $HOME/gateway/src/gateway/xxx.py $HOME/gateway/src/gateway/xxx.py.bak_$(date +%Y%m%d_%H%M%S)"
+scp src/gateway/xxx.py <user>@<gateway-host>:$HOME/gateway/src/gateway/xxx.py
+ssh <user>@<gateway-host> "sha256sum $HOME/gateway/src/gateway/xxx.py"   # 对 hash
+ssh <user>@<gateway-host> "cd $HOME/gateway && .venv/bin/python -c \"import ast; ast.parse(open('src/gateway/xxx.py', encoding='utf-8').read())\""
+ssh <user>@<gateway-host> "sudo systemctl restart gateway.service && sleep 2 && systemctl show gateway.service -p MainPID && curl -sf http://127.0.0.1:8080/health"
 ```
 
 > 推 `main.py` 前必须先全量对 md5，把它 import 的新符号所属文件一起推；

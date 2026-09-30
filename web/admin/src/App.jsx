@@ -3,7 +3,7 @@ import { Layout, Menu, Button, Tag, Tooltip, Typography, Spin } from 'antd';
 import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
   FileSearchOutlined, ReloadOutlined, ExperimentOutlined, CloudServerOutlined,
-  AuditOutlined, DashboardOutlined,
+  AuditOutlined, DashboardOutlined, SafetyCertificateOutlined,
 } from '@ant-design/icons';
 
 // 页面级代码分割：每个页面独立 chunk，首屏只下 shell，打开哪个页才加载哪个页。
@@ -83,6 +83,7 @@ const PAGES = {
   diagnose: lazy(() => import('./components/DiagnosePage.jsx')),
   rules: lazy(() => import('./components/RulesPage.jsx')),
   stats: lazy(() => import('./StatsPage.jsx')),
+  l2: lazy(() => import('./components/L2Page.jsx')),
   audit: lazy(() => import('./components/AuditPage.jsx')),
   password: lazy(() => import('./components/PasswordPage.jsx')),
 };
@@ -96,6 +97,7 @@ const PAGE_TITLES = {
   diagnose: '路由检查',
   rules: '规则管理',
   stats: '统计可视化',
+  l2: 'L2 影子',
   audit: '审计日志',
   password: '管理员密码',
 };
@@ -148,6 +150,7 @@ export default function App() {
           { type: 'group', label: '观测', children: [
             { key: 'diagnose', icon: <ExperimentOutlined />, label: '路由检查' },
             { key: 'stats', icon: <BarChartOutlined />, label: '统计可视化' },
+            { key: 'l2', icon: <SafetyCertificateOutlined />, label: 'L2 影子' },
             { key: 'audit', icon: <FileSearchOutlined />, label: '审计日志' },
           ]},
           { type: 'group', label: '系统', children: [

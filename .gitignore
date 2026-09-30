@@ -1,9 +1,15 @@
-.env
 .venv/
 var/
-.pytest_cache/
+# 含 8 个真实凭据（admin 密码 + 3 个上游 key），2026-09-29 起脱库。
+# 仍需本机文件：env_file.py 读 Path.cwd()/".env"，systemd EnvironmentFile 也重读它。
+# .env.example 是模板（值为空），继续入库。
+.env
+.env.*
+!.env.example
 _backup/
 *.log
+*.log.*
+.pytest_cache/
 __pycache__/
 *.pyc
 node_modules/

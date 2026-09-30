@@ -66,14 +66,17 @@ export default function UPlotChart({ series, height = 180, yVal = null }) {
       cursor: { show: true },
       series: [
         {},
-        ...series.map((s) => ({
-          label: s.name,
-          stroke: s.color,
-          width: 1.5,
-          points: { show: false },
-          spanGaps: false,
-          paths: uPlot.paths.spline(),
-        })),
+        ...series.map((s) => (s.dots
+          // 散点模式（逐条明细：一次判定一个点，不连线）
+          ? { label: s.name, stroke: s.color, fill: s.color, width: 0, points: { show: true, size: 6 }, paths: () => null }
+          : {
+            label: s.name,
+            stroke: s.color,
+            width: 1.5,
+            points: { show: false },
+            spanGaps: false,
+            paths: uPlot.paths.spline(),
+          })),
       ],
       axes: [
         {},

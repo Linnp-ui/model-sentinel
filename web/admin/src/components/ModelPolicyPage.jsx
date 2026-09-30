@@ -1,74 +1,10 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col } from 'antd';
+import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col, Alert } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
-import { api, errText, RANGES } from '../api.js';
+import { api, errText } from '../api.js';
 
 const { Text } = Typography;
 import ExternalCandidateModal, { ExternalCandidateFormItems } from './ExternalCandidateBits.jsx';
-
-// 调节建议阈值（独立组件、独立保存：只读写 3 个 SUGGEST_* 键，/l2-config 合并式更新不碰 L2 项）
-// 拉黑/用量两项按窗口各配一个阈值（窗口越长累计越多，单值在 30 天窗必误报）；错误率是比率，不随窗口变。
-const WIN_SHORT = { 24: '24h', 168: '7d', 720: '30d' };
-function SuggestThresholdsCard() {
-  const [cfg, setCfg] = useState(null);
-  const [saving, setSaving] = useState(false);
-  const load = useCallback(async () => {
-    try {
-      const d = await api('/l2-config');
-      setCfg({
-        violation: d.AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD,
-        volume: d.AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD,
-        error: d.AI_GATEWAY_SUGGEST_ERROR_RATE,
-      });
-    } catch (e) { message.error(errText(e)); }
-  }, []);
-  useEffect(() => { load(); }, [load]);
-  const setWin = (which, h, v) => setCfg((c) => ({ ...c, [which]: { ...c[which], [h]: v } }));
-  const save = async () => {
-    setSaving(true);
-    try {
-      await api('/l2-config', { method: 'PUT', body: JSON.stringify({
-        AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD: cfg.violation,
-        AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD: cfg.volume,
-        AI_GATEWAY_SUGGEST_ERROR_RATE: cfg.error,
-      }) });
-      message.success('已保存并生效（重启后仍生效）');
-    } catch (e) { message.error(errText(e)); }
-    setSaving(false);
-  };
-  if (!cfg) return <Card title="调节建议阈值" size="small" loading />;
-  const row = (label, which, max) => (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
-      <Text style={{ whiteSpace: 'nowrap', marginLeft: 6 }}>{label}：</Text>
-      <Space size={4}>
-        {RANGES.map((r) => (
-          <React.Fragment key={r.hours}>
-            <Text type="secondary">{WIN_SHORT[r.hours]}</Text>
-            <InputNumber size="small" min={1} max={max} value={cfg[which][r.hours]}
-              onChange={(v) => setWin(which, r.hours, v)} />
-          </React.Fragment>
-        ))}
-      </Space>
-    </div>
-  );
-  return (
-    <Card title="调节建议阈值" size="small"
-      extra={<Text type="secondary" style={{ fontSize: 12 }}>
-        阈值按建议卡所选窗口分别生效（窗口越长应越大）；错误率与窗口无关。默认 拉黑 20 / 用量 1000 / 错误率 10%
-      </Text>}>
-      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-        {row('KEY 拉黑建议（窗口内异常 拦截∪本地路由 次数 ≥）', 'violation', 1000)}
-        {row('IP 用量观察（窗口内调用次数 ≥）', 'volume', 100000)}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
-          <Text style={{ whiteSpace: 'nowrap', marginLeft: 6 }}>模型错误率告警（错误率 ≥ 且调用 ≥ 20）：</Text>
-          <InputNumber size="small" min={0} max={1} step={0.01} value={cfg.error}
-            onChange={(v) => setCfg((c) => ({ ...c, error: v }))} />
-        </div>
-        <div><Button type="primary" size="small" loading={saving} onClick={save}>保存生效</Button></div>
-      </Space>
-    </Card>
-  );
-}
 
 // model_policy 无局部保存接口，整文档按段保存：GET 现值 → 换目标段 → PUT 全文。
 // 候选/内部模型/限流三卡 + 别名弹窗内"新增候选"共用，防漏带其他段（曾漏 model_limits）。
@@ -569,6 +505,15 @@ export function L2PromptsSection() {
   const [draft, setDraft] = useState({ system: '', template: '' });
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [proposing, setProposing] = useState(false);
+  const [proposal, setProposal] = useState(null);
+  const propose = async () => {
+    setProposing(true);
+    try {
+      setProposal(await api('/l2/retrain/prompt-propose', { method: 'POST' }));
+    } catch (e) { message.error(errText(e)); }
+    setProposing(false);
+  };
   const dirty = !!data && (draft.system !== data.system_prompt || draft.template !== data.user_prompt_template);
 
   const load = useCallback(async () => {
@@ -612,6 +557,28 @@ export function L2PromptsSection() {
         <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>SYSTEM</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.system_prompt.slice(0, 200)}{data.system_prompt.length > 200 ? '…' : ''}</Typography.Paragraph></Col>
         <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>USER 模板</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.user_prompt_template}</Typography.Paragraph></Col>
       </Row>
+      <Space style={{ marginTop: 8 }}>
+        <Button loading={proposing} onClick={propose}>自动修补（qwen 自省错题，~2min，只生成不应用）</Button>
+      </Space>
+      {proposal && (
+        <Alert type={proposal.candidate.correct >= proposal.baseline.correct ? 'success' : 'warning'}
+          showIcon style={{ marginTop: 8 }}
+          message={`候选 ${proposal.candidate.correct}/${proposal.candidate.total}（基线 ${proposal.baseline.correct}/${proposal.baseline.total}，${proposal.cases_used} 条主判错题自省）`}
+          description={
+            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <div>补丁：{proposal.patch}</div>
+              {proposal.rationale && <div>理由：{proposal.rationale}</div>}
+              {proposal.candidate.wrong.length > 0
+                && <div>候选仍错：{proposal.candidate.wrong.map((w) => w.name).join('；')}</div>}
+              <Space>
+                <Button size="small" type="primary"
+                  onClick={() => { setDraft({ ...draft, system: proposal.candidate_prompt }); setOpen(true); }}>
+                  填入编辑器（人工确认后保存）
+                </Button>
+                <Button size="small" onClick={() => setProposal(null)}>放弃</Button>
+              </Space>
+            </Space>} />
+      )}
       <Modal title="编辑 L2 提示词" open={open} onCancel={() => setOpen(false)} destroyOnClose
              okText="保存" cancelText="取消" confirmLoading={saving} width={760}
              onOk={async () => { await save(); setOpen(false); }}>
@@ -884,7 +851,6 @@ export default function ModelPolicyPage() {
       <AliasGroupsCard />
       <ExternalCandidatesCard />
       <InternalModelsCard />
-      <SuggestThresholdsCard />
       <ModelLimitsCard />
       <Card title="审查模型">
         <L2RuntimeSection />

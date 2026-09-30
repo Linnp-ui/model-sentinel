@@ -1,10 +1,67 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Row, Col, Card, Typography, Alert, Space, Button, Select } from 'antd';
+import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
 import { SuggestionCard } from './components/KeyRulesPage.jsx';
+
+// ---------------- 降级事件流：流式降级 / 本地路由 / L2 不可用（数据源 audit_logs） ----------------
+const EV_META = [
+  ['degrade', '流式降级', '#ff4d4f'],
+  ['route_local', '本地路由', '#fa8c16'],
+  ['l2_unavailable', 'L2 不可用', '#faad14'],
+];
+
+function EventStreamCard({ events }) {
+  const s = events.summary || {};
+  const series = (events.by_hour || []).length
+    ? [
+      { name: '流式降级', color: '#ff4d4f', points: (events.by_hour || []).map((x) => ({ t: Math.floor(Date.parse(x.t.replace(' ', 'T') + 'Z') / 1000), v: x.degrade })) },
+      { name: '本地路由', color: '#fa8c16', points: (events.by_hour || []).map((x) => ({ t: Math.floor(Date.parse(x.t.replace(' ', 'T') + 'Z') / 1000), v: x.route_local })) },
+      { name: 'L2 不可用', color: '#faad14', points: (events.by_hour || []).map((x) => ({ t: Math.floor(Date.parse(x.t.replace(' ', 'T') + 'Z') / 1000), v: x.l2_unavailable })) },
+    ] : [];
+  const cols = [
+    { title: '时间 (UTC)', dataIndex: 'ts', width: 150 },
+    { title: '事件', dataIndex: 'kinds', width: 190,
+      render: (ks) => (ks || []).map((k) => {
+        const m = EV_META.find(([id]) => id === k);
+        return <Tag key={k} color={m ? m[2] : 'default'} style={{ marginInlineEnd: 4 }}>{m ? m[1] : k}</Tag>;
+      }) },
+    { title: '明细', width: 220,
+      render: (_, r) => (
+        <Tooltip title={`${r.rule || '-'} / ${r.downgraded_from || '-'} / ${r.provider || '-'}${r.model ? ':' + r.model : ''}`}>
+          <span>{[r.downgraded_from, r.rule].filter(Boolean).join(' · ') || '-'}</span>
+        </Tooltip>
+      ) },
+    { title: '内容', dataIndex: 'text_preview', ellipsis: true },
+  ];
+  return (
+    <Card title="降级事件流"
+      extra={
+        <Space size="large">
+          {EV_META.map(([id, label, color]) => (
+            <span key={id}><Typography.Text style={{ color, fontWeight: 600 }}>{s[id] ?? 0}</Typography.Text>
+              <Typography.Text type="secondary"> {label}</Typography.Text></span>
+          ))}
+        </Space>
+      }>
+      {series.length ? (
+        <Row gutter={[12, 12]}>
+          <Col span={12}>
+            <UPlotChart height={200} series={series} />
+          </Col>
+          <Col span={12}>
+            <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" columns={cols} dataSource={events.recent || []}
+              pagination={false} scroll={{ y: 170 }} />
+          </Col>
+        </Row>
+      ) : (
+        <Alert type="success" showIcon message="本窗口无降级事件（外发链路全绿：无流式降级、无本地路由、L2 正常）" />
+      )}
+    </Card>
+  );
+}
 
 const { Text: T } = Typography;
 
@@ -23,7 +80,9 @@ function Kpi({ testid, title, value, suffix, color, go, goLabel }) {
     <Card data-testid={testid} hoverable onClick={() => { window.location.hash = go; }}
       styles={{ body: { height: 112, padding: '12px 16px', display: 'flex', flexDirection: 'column' } }}>
       <T type="secondary" style={{ fontSize: 12 }}>{title}</T>
-      <T strong style={{ fontSize: 24, lineHeight: 1.3, color, whiteSpace: 'nowrap' }}>{value}</T>
+      {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看。body 112px
+          （12px 标题 + 32×1.3 数值 + 12px 后缀 + 11px 详情）仍有余量，不撑高卡片 */}
+      <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
       {suffix && <T type="secondary" style={{ fontSize: 12 }}>{suffix}</T>}
       <div style={{ marginTop: 'auto', fontSize: 11, color: '#bbb', textAlign: 'right' }}>{goLabel || '详情 →'}</div>
     </Card>
@@ -51,10 +110,11 @@ export default function OverviewPage() {
 
   const load = useCallback(async (h = hours) => {
     try {
-      const [ts, ov, ch] = await Promise.all([
+      const [ts, ov, ch, ev] = await Promise.all([
         get('/admin/metrics/timeseries'),
         get(`/admin/api/stats/overview?hours=${h}`),
         get(`/admin/api/stats/chart?hours=${h}`),
+        get(`/admin/api/events?hours=${h}`).catch(() => null),
       ]);
       const w = ts.ticks || [];
       const last = w.slice(-10);
@@ -68,6 +128,7 @@ export default function OverviewPage() {
         routeLocal: ov.local_routed || 0,
         total: ov.total || 0,
         tokens: ov.tokens_total || 0,
+        events: ev,
       });
       setErr('');
     } catch (e) { setErr(errText(e)); }
@@ -152,6 +213,9 @@ export default function OverviewPage() {
           </ChartPanel>
         </Col>
       </Row>
+      {d.events && (
+        <EventStreamCard events={d.events} />
+      )}
       <Row gutter={[12, 12]}>
         <Col span={12}>
           <SuggestionCard />

@@ -16,6 +16,13 @@ os.environ.setdefault("AI_GATEWAY_DEV_API_KEY", "pk_live_dev_changeme,sk_test_du
 os.environ.setdefault("OLLAMA_MOCK", "true")
 os.environ.setdefault("SMALL_MODEL_ENABLED", "false")
 os.environ.setdefault("AI_GATEWAY_ADMIN_IP_ALLOWLIST", "127.0.0.1,::1,testclient")
+# 4. 明细/审计后端强制 memory —— 测试 seed 绝不进生产库。
+#    事故记录（2026-09-29）：stats 用例把 7 行 ts=2030-06-01 的 pytest-chart 种子
+#    写进了 gateway_admin.request_log，而统计窗是 `ts >= since` 无上界 ⇒ 管理台明细/
+#    图表顶部天天出现 2030 的行。env 必须在这里清空（conftest 先于测试模块 import，
+#    store 单例初始化晚于此），空值让 admin_store/audit_store 各自落 memory 后端。
+for _v in ("ADMIN_DB_URL", "DATABASE_URL", "AUDIT_MYSQL_URL", "AUDIT_DATABASE_URL", "REDIS_URL"):
+    os.environ[_v] = ""
 # 规则5 first-seen 落盘隔离：全 session 共用内存 store，suggestions 会写 marks 文件，
 # 指到系统临时目录，别污染工作区 var/（生产网关读同一文件）。
 import tempfile

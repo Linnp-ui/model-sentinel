@@ -43,7 +43,9 @@ import re
 import time
 from typing import Dict, List, Optional, Union
 
-from fastapi import APIRouter, Header, HTTPException, Request
+import json
+
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from src.gateway.admin_store import get_admin_store, mask_key
@@ -949,10 +951,10 @@ def list_policies_api():
 
 
 @router.post("/policies")
-def create_policy_api(body: PolicyRuleReq):
+def create_policy_api(body: PolicyRuleReq, request: Request):
     from src.gateway import policy_admin
     try:
-        rule = policy_admin.upsert_policy(body.model_dump())
+        rule = policy_admin.upsert_policy(body.model_dump(), operator=_operator(request))
     except ValidationError as e:
         raise HTTPException(422, e.errors(include_url=False))
     except ValueError as e:
@@ -961,13 +963,13 @@ def create_policy_api(body: PolicyRuleReq):
 
 
 @router.put("/policies/{name}")
-def update_policy_api(name: str, body: PolicyRuleReq):
+def update_policy_api(name: str, body: PolicyRuleReq, request: Request):
     from src.gateway import policy_admin
     data = body.model_dump()
     new_name = str((data.pop("new_name", None) or "") or name)
     data["name"] = new_name
     try:
-        rule = policy_admin.upsert_policy(data, original_name=name)
+        rule = policy_admin.upsert_policy(data, original_name=name, operator=_operator(request))
     except ValidationError as e:
         raise HTTPException(422, e.errors(include_url=False))
     except ValueError as e:
@@ -976,11 +978,41 @@ def update_policy_api(name: str, body: PolicyRuleReq):
 
 
 @router.delete("/policies/{name}")
-def delete_policy_api(name: str):
+def delete_policy_api(name: str, request: Request):
     from src.gateway import policy_admin
-    if not policy_admin.delete_policy(name):
+    if not policy_admin.delete_policy(name, operator=_operator(request)):
         raise HTTPException(404, "rule not found")
     return {"ok": True, "deleted": name}
+
+
+@router.get("/policy/versions")
+def policy_versions_api(limit: int = 50):
+    """policy.yaml 历史版本列表（每次写盘前快照；yaml_text 仅 200 字预览）。"""
+    return {"items": get_admin_store().list_policy_versions(limit)}
+
+
+@router.get("/policy/versions/{vid}")
+def policy_version_api(vid: int):
+    v = get_admin_store().get_policy_version(vid)
+    if v is None:
+        raise HTTPException(404, "version not found")
+    return v
+
+
+@router.post("/policy/versions/{vid}/rollback")
+def policy_version_rollback_api(vid: int, request: Request):
+    """回滚到指定版本（走 Pydantic 校验 + 原子落盘 + 现状再快照，可再反悔）。"""
+    from src.gateway import policy_admin
+    v = get_admin_store().get_policy_version(vid)
+    if v is None:
+        raise HTTPException(404, "version not found")
+    op = _operator(request)
+    try:
+        n = policy_admin.restore_policy_yaml(v["yaml_text"], operator=op, source="rollback")
+    except (ValueError, ValidationError) as e:
+        raise HTTPException(422, str(e))
+    get_admin_store().log_ops("policy_rollback", f"vid={vid} rules={n}", op)
+    return {"ok": True, "rules": n}
 
 
 @router.post("/policies/test")
@@ -1132,20 +1164,19 @@ def l2_prompts_get():
     }
 
 
-@router.put("/l2-prompts")
-def l2_prompts_put(req: L2PromptsPutReq):
-    """更新 L2 提示词：空串清空（还原默认）；非空即时生效 + 落盘 l2_overrides.yaml。"""
+def _save_prompts(system, template, operator="", source="save"):
+    """L2 提示词写入：先快照现状（可反悔）→ 内存即时覆盖 → 落盘。
+    None=不动，""=还原默认。"""
     from src.gateway import small_model as _sm
-    # 内存级即时覆盖（含 env 注入，set_prompt_overrides 内部同步）
-    _sm.set_prompt_overrides(
-        system=req.AI_GATEWAY_L2_SYSTEM_PROMPT if req.AI_GATEWAY_L2_SYSTEM_PROMPT is not None else None,
-        template=req.AI_GATEWAY_L2_USER_PROMPT_TEMPLATE if req.AI_GATEWAY_L2_USER_PROMPT_TEMPLATE is not None else None,
-    )
-    # 持久化：先合再剔。空串=显式还原（删键）；非空=写值；未传=不动。
-    merged = _l2ov.load_overrides()
+    if system is None and template is None:
+        raise HTTPException(422, "nothing to save")
+    get_admin_store().save_prompt_version(
+        _sm.get_system_prompt(), _sm.get_user_prompt_template(),
+        operator=operator, source=source)
+    _sm.set_prompt_overrides(system=system, template=template)
     to_write, to_delete = {}, set()
-    for k in ("AI_GATEWAY_L2_SYSTEM_PROMPT", "AI_GATEWAY_L2_USER_PROMPT_TEMPLATE"):
-        v = getattr(req, k)
+    for k, v in (("AI_GATEWAY_L2_SYSTEM_PROMPT", system),
+                 ("AI_GATEWAY_L2_USER_PROMPT_TEMPLATE", template)):
         if v is None:
             continue
         if v == "":
@@ -1153,12 +1184,46 @@ def l2_prompts_put(req: L2PromptsPutReq):
         else:
             to_write[k] = v
     _l2ov.save_overrides(to_write, delete=to_delete)
+    get_admin_store().log_ops(f"l2_prompts_{source}",
+                              f"system={'set' if system else 'keep'} template={'set' if template else 'keep'}",
+                              operator)
     return {
         "ok": True,
         "system_prompt": _sm.get_system_prompt(),
         "user_prompt_template": _sm.get_user_prompt_template(),
         "persisted": _l2ov.load_overrides(),
     }
+
+
+@router.put("/l2-prompts")
+def l2_prompts_put(req: L2PromptsPutReq, request: Request):
+    """更新 L2 提示词：空串清空（还原默认）；非空即时生效 + 落盘 l2_overrides.yaml。写前快照，可回滚。"""
+    return _save_prompts(req.AI_GATEWAY_L2_SYSTEM_PROMPT, req.AI_GATEWAY_L2_USER_PROMPT_TEMPLATE,
+                         operator=_operator(request))
+
+
+@router.get("/l2-prompt-versions")
+def l2_prompt_versions_api(limit: int = 50):
+    """L2 提示词历史版本（每次 PUT 前快照；system 只给 200 字预览 + sha12）。"""
+    return {"items": get_admin_store().list_prompt_versions(limit)}
+
+
+@router.get("/l2-prompt-versions/{vid}")
+def l2_prompt_version_api(vid: int):
+    v = get_admin_store().get_prompt_version(vid)
+    if v is None:
+        raise HTTPException(404, "version not found")
+    return v
+
+
+@router.post("/l2-prompt-versions/{vid}/rollback")
+def l2_prompt_version_rollback_api(vid: int, request: Request):
+    """回滚到指定版本（现状再快照，可再反悔；即时生效 + 落盘）。"""
+    v = get_admin_store().get_prompt_version(vid)
+    if v is None:
+        raise HTTPException(404, "version not found")
+    return _save_prompts(v["system_prompt"] or "", v["user_template"] or "",
+                         operator=_operator(request), source="rollback")
 
 
 @router.get("/l2-shadow-health")
@@ -1213,7 +1278,7 @@ def l2_shadow_health(url: str = ""):
 
 
 @router.get("/l2-shadow-stats")
-def l2_shadow_stats(hours: int = 168):
+def l2_shadow_stats(hours: int = 168, since: str = "", until: str = ""):
     """影子（laya）汇总：扫审计热缓存（Redis 近 5000 条），按窗口聚合主/影判定对照。
 
     口径：
@@ -1221,6 +1286,7 @@ def l2_shadow_stats(hours: int = 168):
     - shadowed：l2 含 shadow_label 的条数；shadow_degraded：影子失败只丢影子。
     - 一致率 = 主影 label 相同 / 可比条数（主判定 degraded 的不计入可比，兜底 label 不可比）。
     - cells：主密影密(cc)/主密影放(cn)/主放影密(nc)/主放影放(nn)。
+    - until：显式上界（UTC，灰区灌数轮次用；见 /l2-rounds）。默认无上界。
     """
     import datetime as _dt
 
@@ -1230,13 +1296,21 @@ def l2_shadow_stats(hours: int = 168):
         hours = max(1, min(int(hours), 720))
     except (TypeError, ValueError):
         hours = 168
-    cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    cutoff = _cutoff(hours, since)
+    hi = None
+    if until:
+        try:
+            hi = _dt.datetime.strptime(str(until).strip()[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            hi = None
 
     def _ts(e) -> object:
+        # fromisoformat 而非 strptime：审计尾 5000 条每条都要过这里，实测
+        # strptime 230ms/5万次 vs fromisoformat 7ms（33×，标准库零依赖、同日历语义）。
+        # /l2-rounds 循环调本函数 N 次，这是该端点 265ms 的全部来源。
         try:
-            return _dt.datetime.strptime(
-                str(e.get("time") or e.get("ts") or "").strip().replace("T", " ")[:19],
-                "%Y-%m-%d %H:%M:%S")
+            return _dt.datetime.fromisoformat(
+                str(e.get("time") or e.get("ts") or "").strip().replace("T", " ")[:19])
         except Exception:
             return None
 
@@ -1245,7 +1319,19 @@ def l2_shadow_stats(hours: int = 168):
     except Exception:
         entries = []
     scanned = len(entries)
-    window = [e for e in entries if isinstance(e, dict) and ((_ts(e) or cutoff) >= cutoff)]
+    # 每条只解析一次时间戳。原写法在列表推导里对同一条调 _ts() 达 3 次
+    # （两个条件各一次），5000 条 = 15000 次 strptime，单次调用 24ms；
+    # /l2-rounds 循环调本函数 N 次（N=轮次数），直接是端点耗时的全部来源。
+    window = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        t = _ts(e)
+        if (t or cutoff) < cutoff:
+            continue
+        if hi is not None and (t or hi) > hi:
+            continue
+        window.append(e)
 
     out: dict = {"hours": hours, "scanned": scanned, "l2_total": 0, "shadowed": 0,
                  "compared": 0, "agree": 0, "agree_rate": None,
@@ -1292,6 +1378,434 @@ def l2_shadow_stats(hours: int = 168):
     return out
 
 
+# ---------------- L2 影子看板：趋势 / 分歧样本 / 标注 / 导出（数据源 MySQL audit_logs.l2 列） ----------------
+# l2 列 2026-09-28 才加（此前影子数据只在 Redis 热缓存 5000 条，见 agents/gotchas.md）；
+# ts 存 UTC，cutoff 一律 Python utcnow()，禁用 SQL NOW()（北京时间，窗口恒空）。
+
+def _cutoff(hours: int, since: str = ""):
+    """窗口起点（UTC）：since 显式给（"本轮灌数"用，gray_flood 写的轮次起点）优先于 hours。"""
+    import datetime as _dt
+    if since:
+        try:
+            return _dt.datetime.strptime(str(since).strip()[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+
+
+def _l2_window_rows(hours: int, since: str = ""):
+    """窗口内带 l2 判定的审计行（audit_logs.l2 非空），返回 [(row, l2_dict)]，oldest-first。"""
+    from src.gateway.audit_store import get_audit_store
+
+    rows = get_audit_store().query_mysql(since=_cutoff(hours, since), limit=5000) or []
+    return [(r, r["l2"]) for r in rows if isinstance(r.get("l2"), dict) and r.get("l2")]
+
+
+L2_ROUND_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "var", "l2-round.json")
+L2_ROUNDS_FILE = os.path.join(os.path.dirname(L2_ROUND_FILE), "l2-rounds.jsonl")
+
+
+@router.get("/l2-round")
+def l2_round():
+    """最近一轮灰区灌数标记（scripts/gray_flood.py 写）：{since, started_at, sent, finished_at}。
+
+    「本轮」窗口用：固定小时窗会把两轮灌数装进同一个窗，同一文本就成了 dup×2（看着像重复分歧）。
+    """
+    try:
+        with open(L2_ROUND_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"since": ""}
+    except Exception as e:  # noqa: BLE001
+        return {"since": "", "error": str(e)[:120]}
+
+
+@router.get("/l2-rounds")
+def l2_rounds(limit: int = 30):
+    """灰区灌数轮次历史（var/l2-rounds.jsonl，gray_flood 每轮结束追加一行），倒序。
+
+    为什么要有这个：判定流量是**脉冲式的**（一轮 50 条集中在 40 秒内，其余时间零流量），
+    按小时窗看会误读成"没数据/一致率变差"。轮次是这批流量真实的计量单位。
+    每行的 l2_total/agree/cells 是该轮 [started, finished] 区间内的实算值（扫 Redis 热缓存）。
+    """
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 30
+    try:
+        with open(L2_ROUNDS_FILE, encoding="utf-8") as f:
+            rounds = [json.loads(x) for x in f if x.strip()]
+    except FileNotFoundError:
+        return {"rounds": [], "source": "none"}
+    except Exception as e:  # noqa: BLE001
+        return {"rounds": [], "error": str(e)[:120]}
+    out = []
+    for r in rounds[-limit:][::-1]:
+        s = l2_shadow_stats(hours=720, since=r.get("started", ""), until=r.get("finished", ""))
+        out.append({"started": r.get("started", ""), "finished": r.get("finished", ""),
+                    "sent": r.get("sent"), "laya": r.get("laya", ""),
+                    "l2_total": s["l2_total"], "compared": s["compared"],
+                    "agree": s["agree"], "agree_rate": s["agree_rate"],
+                    "cells": s["cells"]})
+    return {"rounds": out, "total": len(rounds)}
+
+
+def _div_group_key(x: dict) -> str:
+    """分歧去重组键：同文本+文件名（**不含方向**）。label/divergent 两处共用，改口径只改这里。
+
+    不含 cell：主/影任一方升级后同一条样本可能从 cn 翻成 nc（prompt/laya 改版就会发生），
+    键带方向会把它裂成两条独立行——旧标跟旧行、新行显示未标，看着像凭空多一条新分歧。
+    标注是关于文本的判断，与当次谁判密无关，故方向不进键；行上仍显示最新方向。"""
+    import hashlib as _hl
+    import re as _re
+    return _hl.sha1((_re.sub(r"\s+", " ", x.get("text_preview") or "").strip() + "|"
+                     + (x.get("filename") or "")).encode()).hexdigest()
+
+
+def _l2_divergence_rows(hours: int, since: str = ""):
+    """主/影分歧行（可比：主非降级且双方 label 齐全），nc=主放影密 / cn=主密影放。"""
+    out = []
+    for r, l2 in _l2_window_rows(hours, since):
+        ml, sl = l2.get("label"), l2.get("shadow_label")
+        if sl not in ("CONFIDENTIAL", "NORMAL") or ml not in ("CONFIDENTIAL", "NORMAL") \
+                or l2.get("degraded") or ml == sl:
+            continue
+        out.append({
+            "req_id": r.get("req_id") or "",
+            "ts": str(r.get("ts") or ""),
+            "cell": "nc" if ml == "NORMAL" else "cn",
+            "main": ml,
+            "shadow": sl,
+            "shadow_prob": (l2.get("shadow_probabilities") or {}).get("CONFIDENTIAL"),
+            "text_preview": (r.get("text_preview") or "")[:500],
+            "filename": r.get("filename") or "",
+        })
+    return out
+
+
+@router.get("/l2-shadow-samples")
+def l2_shadow_samples(hours: int = 1, limit: int = 3000, since: str = ""):
+    """每次 L2 判定的主/影对照明细（逐条，不分桶）：{ts, main, shadow, agree, cell}。
+
+    影子页画「每次一致率」用：一条点=一次判定，绿=一致、红=分歧，比小时桶直观
+    （桶会把 5 分钟里的 3 条分歧平均掉）。窗口上限 24h / 3000 条（逐条数据量比桶大一个量级）。
+    """
+    try:
+        hours = max(1, min(int(hours), 24))
+    except (TypeError, ValueError):
+        hours = 1
+    limit = max(1, min(int(limit or 3000), 3000))
+    out = []
+    for r, l2 in _l2_window_rows(hours, since):
+        ml, sl = l2.get("label"), l2.get("shadow_label")
+        if sl not in ("CONFIDENTIAL", "NORMAL") or l2.get("degraded") or ml not in ("CONFIDENTIAL", "NORMAL"):
+            continue
+        out.append({"ts": str(r.get("ts") or ""), "main": ml, "shadow": sl,
+                    "agree": ml == sl, "cell": "" if ml == sl else ("nc" if ml == "NORMAL" else "cn")})
+    out.sort(key=lambda x: x["ts"])
+    total = len(out)
+    return {"hours": hours, "total": total, "items": out[-limit:]}
+
+
+@router.get("/l2-shadow-trend")
+def l2_shadow_trend(hours: int = 168):
+    """主/影对照小时桶趋势（一致率 + L2 量 + cells），供 L2 影子页折线。"""
+    import datetime as _dt
+
+    try:
+        hours = max(1, min(int(hours), 720))
+    except (TypeError, ValueError):
+        hours = 168
+    start = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).replace(
+        minute=0, second=0, microsecond=0)
+    buckets: dict[str, dict] = {}
+    for i in range(hours + 1):
+        b = (start + _dt.timedelta(hours=i)).strftime("%Y-%m-%d %H:00")
+        buckets[b] = {"t": b, "l2_total": 0, "shadowed": 0, "compared": 0, "agree": 0,
+                      "cc": 0, "cn": 0, "nc": 0, "nn": 0}
+    for r, l2 in _l2_window_rows(hours):
+        try:
+            ts = _dt.datetime.strptime(str(r.get("ts") or "")[:16], "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+        b = buckets.get(ts.strftime("%Y-%m-%d %H:00"))
+        if b is None:
+            continue
+        b["l2_total"] += 1
+        ml, sl = l2.get("label"), l2.get("shadow_label")
+        if sl not in ("CONFIDENTIAL", "NORMAL"):
+            continue
+        b["shadowed"] += 1
+        if l2.get("degraded") or ml not in ("CONFIDENTIAL", "NORMAL"):
+            continue
+        b["compared"] += 1
+        if ml == sl:
+            b["agree"] += 1
+            b["cc" if ml == "CONFIDENTIAL" else "nn"] += 1
+        else:
+            b["cn" if ml == "CONFIDENTIAL" else "nc"] += 1
+    return {"hours": hours, "buckets": list(buckets.values())}
+
+
+@router.get("/l2-divergences")
+def l2_divergences(hours: int = 168, cell: str = "", limit: int = 200, q: str = "", since: str = ""):
+    """主/影分歧样本清单（nc/cn），join l2_labels 标注状态。"""
+    try:
+        hours = max(1, min(int(hours), 720))
+    except (TypeError, ValueError):
+        hours = 168
+    limit = max(1, min(int(limit or 200), 500))
+    rows = _l2_divergence_rows(hours, since)
+    if cell in ("nc", "cn"):
+        rows = [x for x in rows if x["cell"] == cell]
+    if q:
+        qq = q.strip().lower()
+        rows = [x for x in rows
+                if qq in (x["text_preview"] or "").lower() or qq in (x["filename"] or "").lower()]
+    rows.sort(key=lambda x: x["ts"], reverse=True)
+    # 去重 collapse：同文本+文件名+方向只留最新一条（灌数/重试常有成对重复），dup 计折叠数。
+    # 附带防双标：同一文本只剩一个标注入口（手册 0/1 双标即双行所致）。
+    # 标注继承组内最新已标（_ids 按 ts 倒序=最新在前）：再灌的同文本新行未标也不盖掉旧标注。
+    seen: dict[str, dict] = {}
+    for x in rows:
+        k = _div_group_key(x)
+        if k in seen:
+            seen[k]["dup"] += 1
+            seen[k]["_ids"].append(x["req_id"])
+        else:
+            x["dup"] = 1
+            x["_ids"] = [x["req_id"]]
+            seen[k] = x
+    rows = list(seen.values())
+    rows.sort(key=lambda x: x["ts"], reverse=True)
+    labels = get_admin_store().get_l2_labels([i for x in rows for i in x["_ids"]])
+    for x in rows:
+        x["label"] = next((labels[i] for i in x["_ids"] if labels.get(i) is not None), None)
+        del x["_ids"]
+    return {"hours": hours, "total": len(rows), "items": rows[:limit]}
+
+
+class L2LabelReq(BaseModel):
+    req_id: str = Field(default="", max_length=40)
+    label: Optional[int] = Field(default=None, ge=0, le=1)  # 1=机密 0=非密 null=取消标注
+
+
+@router.post("/l2-divergences/label")
+def l2_divergences_label(req: L2LabelReq):
+    """标注分歧样本（v10 训练原料）。label=null 取消标注。同组（同文本同向）全组联动，
+    新灌重复行自带同标，显示层继承（l2_divergences）兜底历史数据。"""
+    if not req.req_id:
+        raise HTTPException(422, "req_id required")
+    store = get_admin_store()
+    try:
+        allrows = _l2_divergence_rows(720)
+        tk = next((_div_group_key(x) for x in allrows if x["req_id"] == req.req_id), None)
+        ids = [x["req_id"] for x in allrows if tk is not None and _div_group_key(x) == tk]
+    except Exception:
+        ids = []
+    for i in ids or [req.req_id]:
+        store.upsert_l2_label(i, req.label)
+    return {"ok": True, "labeled": len(ids) if ids else 1}
+
+
+@router.get("/l2-divergences/export")
+def l2_divergences_export(hours: int = 168, cell: str = "", labeled: str = "all"):
+    """导出分歧样本 JSONL（含标注），喂 build_laya_dataset / 离线分析。"""
+    try:
+        hours = max(1, min(int(hours), 720))
+    except (TypeError, ValueError):
+        hours = 168
+    rows = _l2_divergence_rows(hours)
+    if cell in ("nc", "cn"):
+        rows = [x for x in rows if x["cell"] == cell]
+    labels = get_admin_store().get_l2_labels([x["req_id"] for x in rows])
+    for x in rows:
+        x["label"] = labels.get(x["req_id"])
+    if labeled == "labeled":
+        rows = [x for x in rows if x["label"] is not None]
+    elif labeled == "unlabeled":
+        rows = [x for x in rows if x["label"] is None]
+    rows.sort(key=lambda x: x["ts"])
+    body = "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows)
+    return Response(content=body, media_type="application/jsonl",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="l2-divergences-{hours}h.jsonl"'})
+
+
+@router.get("/events")
+def events_api(hours: int = 24):
+    """降级事件流：流式降级 downgraded_from / 本地路由 route_local / L2 不可用 l2_unavailable。
+    数据源 audit_logs（ts 存 UTC）。熔断器状态另看 /circuit。"""
+    import datetime as _dt
+    from src.gateway.audit_store import get_audit_store
+
+    try:
+        hours = max(1, min(int(hours), 720))
+    except (TypeError, ValueError):
+        hours = 24
+    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    rows = get_audit_store().query_mysql(since=since, limit=5000) or []
+    start = since.replace(minute=0, second=0, microsecond=0)
+    by_hour: dict[str, dict] = {}
+    for i in range(hours + 1):
+        t = (start + _dt.timedelta(hours=i)).strftime("%Y-%m-%d %H:00")
+        by_hour[t] = {"t": t, "degrade": 0, "route_local": 0, "l2_unavailable": 0}
+    summary = {"degrade": 0, "route_local": 0, "l2_unavailable": 0}
+    recent = []
+    for r in rows:
+        kinds = []
+        if r.get("downgraded_from"):
+            kinds.append("degrade")
+        if r.get("action") == "route_local":
+            kinds.append("route_local")
+        if r.get("rule") == "l2_unavailable":
+            kinds.append("l2_unavailable")
+        if not kinds:
+            continue
+        try:
+            ts = _dt.datetime.strptime(str(r.get("ts") or "")[:16], "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+        b = by_hour.get(ts.strftime("%Y-%m-%d %H:00"))
+        for k in kinds:
+            summary[k] += 1
+            if b is not None:
+                b[k] += 1
+        recent.append({
+            "ts": str(r.get("ts") or ""),
+            "kinds": kinds,
+            "action": r.get("action") or "",
+            "rule": r.get("rule") or "",
+            "downgraded_from": r.get("downgraded_from") or "",
+            "provider": r.get("provider") or "",
+            "model": r.get("model") or "",
+            "text_preview": (r.get("text_preview") or "")[:80],
+            "filename": r.get("filename") or "",
+        })
+    recent.sort(key=lambda x: x["ts"], reverse=True)
+    return {"hours": hours, "summary": summary, "by_hour": list(by_hour.values()),
+            "recent": recent[:100]}
+
+
+@router.get("/rule-hits")
+def rule_hits_api(hours: int = 168):
+    """L1 规则命中统计：audit_logs 窗口按 rule 聚合（排除 default_allow），
+    带 action 分布 + 最后命中（UTC）。沉默规则判断的页面内证据（建议规则 5）。"""
+    import datetime as _dt
+    from src.gateway.audit_store import get_audit_store
+
+    try:
+        hours = max(1, min(int(hours), 720))
+    except (TypeError, ValueError):
+        hours = 168
+    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    rows = get_audit_store().query_mysql(since=since, limit=5000) or []
+    agg: dict[str, dict] = {}
+    total = 0
+    for r in rows:
+        name = r.get("rule") or ""
+        if not name or name == "default_allow":
+            continue
+        total += 1
+        a = agg.setdefault(name, {"rule": name, "count": 0, "actions": {}, "last_seen": ""})
+        a["count"] += 1
+        act = r.get("action") or ""
+        a["actions"][act] = a["actions"].get(act, 0) + 1
+        ts = str(r.get("ts") or "")
+        if ts > a["last_seen"]:
+            a["last_seen"] = ts
+    items = sorted(agg.values(), key=lambda x: -x["count"])
+    return {"hours": hours, "total": total, "items": items}
+
+
+# ---------------- L2 一键优化管道：人工标注 → 数据集 → 微调 → 候选评测 → 晋升影子 ----------------
+# 权威 backend 切换（qwen→laya）永不走这里，仍人工拍板。
+
+class L2PromoteReq(BaseModel):
+    version: int = Field(ge=1, le=9999)
+
+
+@router.post("/l2/retrain")
+def l2_retrain_api():
+    """启动优化训练（后台 ~10-20min：数据集→GPU6 微调→候选评测）。标注不足 422，在跑 409。"""
+    from src.gateway import l2_retrain
+    try:
+        return l2_retrain.start()
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except (FileNotFoundError, OSError) as e:
+        raise HTTPException(503, str(e))
+
+
+@router.get("/l2/retrain/status")
+def l2_retrain_status_api():
+    from src.gateway import l2_retrain
+    return l2_retrain.status()
+
+
+@router.get("/l2/retrain/versions")
+def l2_retrain_versions_api():
+    """盘上可用 checkpoint 版本 + 当前影子版本（晋升下拉用）。"""
+    from src.gateway import l2_retrain
+    return l2_retrain.versions()
+
+
+class PromptTestReq(BaseModel):
+    system_prompt: str = Field(min_length=20, max_length=8000)
+
+
+@router.post("/l2/retrain/prompt-test")
+def l2_retrain_prompt_test_api(req: PromptTestReq):
+    """候选 system prompt 打分：同 battery 打 qwen，不落地（~30-60s）。
+    通过后再 PUT /l2-prompts 应用（即时生效 + 落盘 l2_overrides.yaml）。"""
+    from src.gateway import l2_retrain
+    try:
+        return l2_retrain.prompt_test(req.system_prompt)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@router.post("/l2/retrain/prompt-propose")
+def l2_retrain_prompt_propose_api():
+    """qwen 自省修 prompt：主判错题（已标×与主判相反）→ qwen 提追加补丁 → 同 battery 打基线+候选。
+    只生成不应用（~2min）；应用仍走 PUT /l2-prompts 人工确认（权威链不动自动门）。"""
+    from src.gateway import l2_retrain
+    try:
+        return l2_retrain.propose_prompt_fix()
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+class HardAddReq(BaseModel):
+    items: list = Field(default_factory=list)  # [{text, label}]，label 取错题的 want
+
+
+@router.post("/l2/retrain/hard")
+def l2_retrain_hard_api(req: HardAddReq):
+    """错题一键入 hard.jsonl（下版训练自动加权×4）。文件在 ~/models，永不入库。"""
+    from src.gateway import l2_retrain
+    return l2_retrain.add_hard(req.items)
+
+
+@router.post("/l2/retrain/promote")
+def l2_retrain_promote_api(req: L2PromoteReq):
+    """候选 checkpoint 晋升为影子模型（env 文件 + 无密重启 laya-l2 + 身份核对）。"""
+    from src.gateway import l2_retrain
+    try:
+        return l2_retrain.promote(req.version)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(409, str(e))
+
+
 # ---------------- 运维诊断：路由检查器 / provider 健康检查 / 熔断器 ----------------
 
 class RouteInspectFile(BaseModel):
@@ -1306,8 +1820,9 @@ class RouteInspectReq(BaseModel):
     files: List[RouteInspectFile] = Field(default=[])
 
 
-def _route_inspect_finish(decision, l1_out, l2_out, files_out, channel, model, _rt, provider_keys):
-    """route-inspect 收口：resolve 去向 + 统一响应（含 files/channel）。"""
+def _route_inspect_finish(decision, l1_out, l2_out, files_out, channel, model, _rt, provider_keys,
+                          shadow=None):
+    """route-inspect 收口：resolve 去向 + 统一响应（含 files/channel/shadow 归因）。"""
     try:
         prov, _model, notes = _rt.resolve(decision, {"model": model or ""}, None, kind="chat")
         has_key = bool(provider_keys.gateway_key(prov))
@@ -1328,6 +1843,7 @@ def _route_inspect_finish(decision, l1_out, l2_out, files_out, channel, model, _
     return {
         "l1": l1_out,
         "l2": l2_out,
+        "shadow": shadow,
         "final_action": decision.get("action"),
         "final_rule": decision.get("name"),
         "routing": rout,
@@ -1358,6 +1874,19 @@ async def route_inspect_api(body: RouteInspectReq):
     from src.gateway import policy as _pol
     from src.gateway import provider_keys
     from src.gateway import routing as _rt
+    from src.gateway import small_model as _sm
+
+    async def _shadow_of(t: str, fn: str = ""):
+        """归因用影子：与线上影子同调用直问 laya（bypass 缓存/熔断，看活模型真实判定），
+        2s 短超时；失败只记 degraded，不挡干跑、不落审计、不限流。"""
+        try:
+            sh = await _sm._call_laya(t, fn, [], [], timeout=2.0)
+        except Exception as e:
+            return {"degraded": str(e)[:120]}
+        if sh.get("degraded"):
+            return {"degraded": sh.get("error") or sh.get("degraded_reason") or "error"}
+        return {"label": sh.get("label"), "confidence": sh.get("confidence"),
+                "reason": sh.get("reason"), "latency_ms": sh.get("latency_ms")}
 
     channel = (body.channel or "").strip().lower()
     files = body.files or []
@@ -1505,8 +2034,10 @@ async def route_inspect_api(body: RouteInspectReq):
             l2_out["skipped"] = ("L1 未放行" if l1["action"] != "allow"
                                  else "未进灰区（L2 只看 risk 灰区[20,60)，不计字数）")
         decision = decision0
+        _fn = " ".join((f.filename or "").strip() for f in files if (f.filename or "").strip())
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel or "text",
-                                     body, _rt, provider_keys)
+                                     body, _rt, provider_keys,
+                                     shadow=await _shadow_of(text, _fn))
 
     if channel == "check" and files:
         # ctx/findings 已在上分支建成（含文件合并）；文件式 L2（files/check 同款：allow 即审，分块聚合）
@@ -1565,7 +2096,9 @@ async def route_inspect_api(body: RouteInspectReq):
         else:
             l2_out["skipped"] = "L1 未放行"
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel,
-                                     body.model, _rt, provider_keys)
+                                     body.model, _rt, provider_keys,
+                                     shadow=await _shadow_of(
+                                         text, (file_l2 or {}).get("filename", "")))
 
     # 纯文本旧逻辑（零改动）
     findings = _insp.inspect_text(text) if text else {}
@@ -1602,7 +2135,8 @@ async def route_inspect_api(body: RouteInspectReq):
                              else "未进灰区（L2 只看 risk 灰区，不计字数）")
 
     return _route_inspect_finish(decision, l1_out, l2_out, [], "text",
-                                 body.model, _rt, provider_keys)
+                                 body.model, _rt, provider_keys,
+                                 shadow=await _shadow_of(text))
 
 
 class ProviderCheckReq(BaseModel):

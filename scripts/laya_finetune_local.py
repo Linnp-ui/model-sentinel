@@ -4,7 +4,7 @@
 训练循环/损失/调度/温度拟合与官方一致（RLCD：GRPO 基线 + proper scoring + 软 CE）。
 
 用法:
-  CUDA_VISIBLE_DEVICES=6 ~/venvs/laya/bin/python scripts/laya_finetune_local.py \
+  CUDA_VISIBLE_DEVICES=5 ~/venvs/laya/bin/python scripts/laya_finetune_local.py \
     ~/models/laya/multilingual ~/models/laya-dataset ~/models/laya-finetuned-confidential
 
 ⚠️ QUESTIONS 必须与 scripts/laya_l2_server.py 的 QUESTIONS 逐字一致（训练/推理同题规格）。

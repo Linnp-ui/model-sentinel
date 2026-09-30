@@ -749,3 +749,15 @@ def test_live_small_model_latency():
     # 本地 mock 环境下跳过，CI 用 -k 'not live' 排除
     pytest.skip("live test requires real 10.0.0.10:8002, run manually: pytest -m live")
 
+
+def test_route_inspect_shadow_key():
+    """干跑带影子归因键（测试环境无 laya 只断形状，fail-open 不挡干跑）"""
+    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash",
+        "text": "咨询一下，我们部门涨薪方案什么时候出？"})
+    assert r.status_code == 200
+    assert "shadow" in r.json()
+
+def test_prompt_propose_no_cases_422():
+    """错题不足（测试库无标注）→ 422 提示先标注，不调模型"""
+    r = client.post("/admin/api/l2/retrain/prompt-propose")
+    assert r.status_code == 422

@@ -1,13 +1,13 @@
-# 内网 vLLM 主机（IP/端口按实际部署，示例 10.0.0.10）
+# 内网 vLLM 主机（10.0.0.10）
 
 > 上级：`AGENTS.md`。
 
 | 端口 | systemd unit | 模型 | provider 名 |
 |---|---|---|---|
-| 8000 | `vllm-<main-model>.service` | `qwen2.5:7b`（本地主力模型） | `vllm_local` |
-| 8001 | `vllm-bge-m3.service` | `bge-m3`（embedding） | `bge_m3` |
+| 8000 | `vllm-qwen3-8b.service` | `qwen2.5:7b` (27B-FP8 TP4 GPU0-3) | `vllm_local` |
+| 8001 | `bge-m3` | embedding（待迁移） | `bge_m3` |
 | 8002 | `vllm-qwen3-4b.service` | `Qwen3-4B-Instruct-2507` (L2 分类) | `vllm_l2` |
-| 8003 | `laya-l2.service` | `Laya multilingual`（L2 决策模型，影子双跑） | `AI_GATEWAY_L2_SHADOW_URL` |
+| 8003 | `laya-l2.service` | `Laya multilingual` (L2 影子双跑，GPU5) | `AI_GATEWAY_L2_SHADOW_URL` |
 
 > `laya-l2.service` **不是 vllm unit**：Laya 是非自回归决策模型，无 OpenAI 协议、
 > vLLM 跑不了，走 Python SDK + FastAPI wrapper（`scripts/laya_l2_server.py`，
@@ -15,9 +15,14 @@
 > `~/models/laya/multilingual`（sha256 已验真）；当前跑微调版
 > `~/models/laya-finetuned-confidential`（审计语料+合成增广，2026-09-22）；
 > 运行时 `HF_HUB_OFFLINE=1` 无外联。换 checkpoint = 换 `LAYA_MODEL_PATH` + 重启 unit。
+> **2026-09-28 起 `LAYA_MODEL_PATH` 走 `EnvironmentFile=-/home/your-user/gateway/var/laya-l2.env`**
+> （服务用户可写，覆盖 unit 内的 Environment 默认值 v9）：管理台「L2 影子→优化管道」
+> promote 只写这个 env 文件 + `systemctl restart laya-l2.service`（可配 sudoers 免密放行这一条命令）。
+> `/health` 现返回 `{"ok":true,"model":"<基名>"}`，换 checkpoint 后必须核对 model 身份。
+> 手改 unit 文件需 root（备份 `laya-l2.service.bak-20260928`）；改 env 文件即可换模型。
 
 - 单元 `--port` ↔ `routing.yaml` provider `base_url` ↔ 网关 env **三者一一对应**
-- 模板：`scripts/vllm-<model-slug>.service`（安装前替换 `your-user` / 模型路径 / GPU）
+- 模板：`scripts/vllm-<model-slug>.service`；安装脚本：`scripts/install_vllm_<model_slug>.sh`
 - 新增模型前先 `ss -lntp | grep <port>` + `nvidia-smi --query-gpu=index,memory.used --format=csv` 验端口/GPU，再同步本表 + `routing.yaml`
 
 ## 硬约束：进程操作必须显式带进程名

@@ -96,6 +96,9 @@ export default function RulesPage() {
   const [modelOptions, setModelOptions] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsFailed, setModelsFailed] = useState(false);
+  const [versions, setVersions] = useState([]);
+  const [verView, setVerView] = useState(null);
+  const [hits, setHits] = useState({});  // rule 名 -> {count, actions, last_seen}（168h）
   const loadProviders = useCallback(async () => {
     try {
       const d = await api('/providers');
@@ -163,12 +166,30 @@ export default function RulesPage() {
     }
   };
 
+  const loadVersions = useCallback(async () => {
+    try { setVersions((await api('/policy/versions?limit=50')).items || []); } catch { setVersions([]); }
+  }, []);
   const load = useCallback(async () => {
     setLoading(true);
     try { setItems((await api('/policies')).items); } catch (e) { message.error(errText(e)); }
     setLoading(false);
-  }, []);
+    loadVersions();
+    api('/rule-hits?hours=168').then((d) => {
+      setHits(Object.fromEntries((d.items || []).map((i) => [i.rule, i])));
+    }).catch(() => {});
+  }, [loadVersions]);
   useEffect(() => { load(); }, [load]);
+
+  const viewVersion = async (vid) => {
+    try { setVerView((await api(`/policy/versions/${vid}`)).yaml_text); } catch (e) { message.error(errText(e)); }
+  };
+  const rollback = async (vid) => {
+    try {
+      await api(`/policy/versions/${vid}/rollback`, { method: 'POST' });
+      message.success('已回滚并即时生效（现状已留版本，可再反悔）');
+      load();
+    } catch (e) { message.error(errText(e)); }
+  };
 
   const openEdit = (rec) => {
     setEditing(rec ? rec.name : null);
@@ -259,6 +280,16 @@ export default function RulesPage() {
     { title: '动作', dataIndex: 'action', width: 110,
       render: (v) => <Tag color={v === 'block' ? 'red' : v === 'route_local' ? 'orange' : 'green'}>{v}</Tag> },
     { title: '条件', dataIndex: 'when', width: 450, ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
+    { title: <Tooltip title="近 7 天命中次数（审计库口径，排除 default_allow）">168h 命中</Tooltip>, width: 100,
+      render: (_, r) => {
+        const h = hits[r.name];
+        if (!h) return <Text type="secondary">0</Text>;
+        return (
+          <Tooltip title={`动作分布：${Object.entries(h.actions).map(([k, v]) => `${k}×${v}`).join(' ')}；最后命中 ${h.last_seen} UTC`}>
+            <Text strong={h.count >= 50} style={{ color: h.count >= 50 ? '#fa8c16' : undefined }}>{h.count}</Text>
+          </Tooltip>
+        );
+      } },
     { title: '说明', dataIndex: 'description', ellipsis: true },
     { title: '操作', width: 150,
       render: (_, rec) => (
@@ -321,6 +352,36 @@ export default function RulesPage() {
           </Card>
         </Col>
       </Row>
+
+      <Card title="历史版本（每次保存前快照；回滚走校验+原子落盘）" style={{ marginTop: 12 }}
+        extra={<Button size="small" type="text" onClick={loadVersions}>刷新</Button>}>
+        {versions.length ? (
+          <Table rowKey="id" size="small" pagination={false} dataSource={versions} columns={[
+            { title: '时间', dataIndex: 'ts', width: 170 },
+            { title: '操作者', dataIndex: 'operator', width: 140, ellipsis: true },
+            { title: '来源', dataIndex: 'source', width: 90,
+              render: (s) => (s === 'rollback' ? <Tag color="orange">rollback</Tag> : <Tag>save</Tag>) },
+            { title: '规则数', dataIndex: 'rule_count', width: 80 },
+            { title: '预览', dataIndex: 'yaml_text', ellipsis: true },
+            { title: '操作', width: 150, render: (_, r) => (
+              <Space size={4}>
+                <Button size="small" type="link" onClick={() => viewVersion(r.id)}>查看</Button>
+                <Popconfirm title={`回滚到该版本（${r.rule_count} 条规则）？现状也会存一版，可再反悔。`}
+                  onConfirm={() => rollback(r.id)}>
+                  <Button size="small" type="link" danger>回滚</Button>
+                </Popconfirm>
+              </Space>
+            ) },
+          ]} />
+        ) : (
+          <Alert type="info" showIcon message="暂无历史版本（第一次保存规则时自动生成）" />
+        )}
+      </Card>
+
+      <Modal title="版本内容" open={verView != null} onCancel={() => setVerView(null)}
+        footer={null} width={720}>
+        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 12 }}>{verView || ''}</pre>
+      </Modal>
 
       <Modal title={editing ? `编辑规则：${editing}` : '新增规则'} open={modalOpen}
         destroyOnClose onOk={submit} onCancel={() => setModalOpen(false)} width={680}>

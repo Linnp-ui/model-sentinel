@@ -3305,6 +3305,17 @@ async def export_csv(
     """
     import csv, io
     store = get_audit_store()
+    cols = ["time", "type", "rule", "action", "provider", "local", "model", "requested_model",
+            "downgraded_from", "filename", "text_preview", "id", "client_ip", "token_masked", "key_name"]
+
+    def _csv_safe(v):  # 防 Excel 公式注入：=,+,-,@ 开头加单引号前缀
+        if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+            return "'" + v
+        return v
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols)
+    w.writeheader()
     if since or until:
         since_dt = _parse_window_ts(since)
         until_dt = _parse_window_ts(until, default=datetime.now(), is_until=True)

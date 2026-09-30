@@ -63,6 +63,9 @@ export default function RouteInspectCard() {
                   {res.l2.triggered
                     ? <span>L2：{res.l2.label} conf={res.l2.confidence}（{res.l2.latency_ms}ms）</span>
                     : <span>L2 跳过：{res.l2.skipped || '-'}</span>}
+                  {res.shadow && !res.shadow.degraded
+                    ? <span>影子：{res.shadow.label} conf={res.shadow.confidence}（{res.shadow.latency_ms}ms）</span>
+                    : res.shadow && <span>影子降级：{res.shadow.degraded}</span>}
                   {res.channel && res.channel !== 'text' && <span>通道：{res.channel}</span>}
                   <Text code>去向：{res.routing.provider || res.routing.error} {res.routing.local ? '（内网）' : '（外网）'} {res.routing.model || ''}</Text>
                 </Space>

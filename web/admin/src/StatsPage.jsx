@@ -21,7 +21,7 @@ const DONUT_COLORS = ['#1677ff', '#52c41a', '#faad14', '#ff4d4f', '#722ed1',
   '#13c2c2', '#eb2f96', '#fa8c16', '#2f54eb', '#a0d911'];
 
 // fmt：数值格式化（金额传 v => `¥${v.toFixed(2)}`；缺省原样显示）
-function DonutChart({ items, labelKey, testid, fmt }) {
+export function DonutChart({ items, labelKey, testid, fmt }) {
   if (!items || !items.length) return <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Text type="secondary">暂无数据</Text></div>;
   const total = items.reduce((s, x) => s + (x.count || 0), 0) || 1;
   const f = fmt || ((v) => String(v));
@@ -122,6 +122,15 @@ function TrendBars({ slots, counts, routes, blocks }) {
   const x = (i) => pad + 6 + i * ((W - pad * 2) / slots.length);
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%' }}>
+      {/* 图例放图内右上角：标题栏只留「时间趋势」，颜色含义在图里直接对照，不用来回找 */}
+      <g fontSize="11" fill="#666">
+        {[['#1677ff', '放行'], ['#faad14', '本地路由'], ['#ff4d4f', '拦截']].map(([c, name], k) => (
+          <g key={name} transform={`translate(${W - pad - 210 + k * 70}, 14)`}>
+            <rect width="9" height="9" fill={c} rx="1" />
+            <text x="13" y="8">{name}</text>
+          </g>
+        ))}
+      </g>
       {[0, 0.5, 1].map((fr) => (
         <g key={fr}>
           <line x1={pad} x2={W - pad / 2} y1={H - pad - scale(maxV * fr)}
@@ -204,8 +213,6 @@ export default function StatsPage() {
   const [keyModels, setKeyModels] = useState([]);
   const [keyCalls, setKeyCalls] = useState([]);
   const [billing, setBilling] = useState(null);
-  // 影子（laya）汇总：独立数据源（审计热缓存），失败不拖累主统计
-  const [shadow, setShadow] = useState(null);
 
   // 单一数据源 request_log：KPI 卡 / 趋势 / Top 榜同窗口同口径，页面数字不再打架
   // 单端点 /stats/summary 单遍聚合（后端 7 端点合并，口径与各自端点逐字段一致）
@@ -229,9 +236,6 @@ export default function StatsPage() {
       setKeyModels(m.items || []); setKeyCalls(k.items || []); setBilling(b);
     } catch (e) { message.error(errText(e)); }
     finally { setLoading(false); }
-    try {
-      setShadow(await api(`/l2-shadow-stats?hours=${h}`));
-    } catch (e) { setShadow(null); }
   }, [hours]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
@@ -316,7 +320,7 @@ export default function StatsPage() {
 
       {ov && (
         <>
-          <Card title="时间趋势（蓝=放行 橙=本地路由 红=拦截）" style={{ marginTop: 12 }}
+          <Card title="时间趋势" style={{ marginTop: 12 }}
             extra={<Text type="secondary" style={{ fontSize: 12 }}>
               本窗口 {ov.total - ov.blocked - ov.local_routed} 放行 / {ov.local_routed} 本地路由 / {ov.blocked} 拦截
             </Text>}>
@@ -345,42 +349,6 @@ export default function StatsPage() {
             </Card>
           </div>
           <MetricsSection hours={hours} />
-          <Card title="影子（laya）汇总" style={{ marginTop: 12 }}
-            extra={<Text type="secondary" style={{ fontSize: 12 }}>
-              数据源审计热缓存（近 5000 条）；只有进 L2 的灰区流量才有影子
-            </Text>}>
-            {!shadow || !shadow.shadowed ? (
-              <Alert type="info" showIcon
-                message="本窗口暂无影子数据（影子只在进 L2 的灰区流量上产生；backend=laya 时影子自动停）" />
-            ) : (
-              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
-                <Space size="large" wrap>
-                  <Statistic title={<Tooltip title="口径：主影 label 相同 / 可比条数（主判定降级的兜底项不计入）">主影一致率</Tooltip>}
-                    value={shadow.agree_rate == null ? '-' : (shadow.agree_rate * 100).toFixed(1)} suffix="%"
-                    valueStyle={{ fontSize: 24 }} />
-                  <Statistic title="影子样本" value={`${shadow.agree}/${shadow.compared}`}
-                    valueStyle={{ fontSize: 24 }} />
-                  <Statistic title={<Tooltip title="口径：有影子打标 / 进 L2 的条数">影子覆盖率</Tooltip>}
-                    value={shadow.l2_total ? (shadow.shadowed / shadow.l2_total * 100).toFixed(1) : '-'} suffix="%"
-                    valueStyle={{ fontSize: 24 }} />
-                  <Statistic title="影子失败" value={shadow.shadow_degraded} valueStyle={{ fontSize: 24 }} />
-                </Space>
-                <div style={{ flex: 1, minWidth: 380 }}>
-                  <DonutChart
-                    items={[
-                      { label: '主密·影密', count: shadow.cells.cc, color: '#52c41a' },
-                      { label: '主放·影放', count: shadow.cells.nn, color: '#1677ff' },
-                      { label: '主密·影放（影子漏报嫌疑）', count: shadow.cells.cn, color: '#faad14' },
-                      { label: '主放·影密（影子误报嫌疑）', count: shadow.cells.nc, color: '#ff4d4f' },
-                    ]}
-                    labelKey="label" testid="shadow-cells-donut" />
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    主判定降级 {shadow.main_degraded} 条未计入一致率；影子样本主判定平均延迟 {shadow.avg_main_latency_ms ?? '?'}ms
-                  </Text>
-                </div>
-              </div>
-            )}
-          </Card>
           <Card title={`Token 计费${billing ? `（合计 ¥${billing.total_cost}）` : ''}`} style={{ marginTop: 12 }}
             extra={<Text type="secondary" style={{ fontSize: 12 }}>内部分摊口径≠上游账单；缓存单价未配按全价（高估）；上游不回用量记0（少计）</Text>}>
             <div style={{ marginBottom: 12, display: 'flex', gap: 24, flexWrap: 'wrap' }}>

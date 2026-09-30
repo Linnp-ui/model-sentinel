@@ -95,8 +95,8 @@ class Provider:
         ``on_missing_key`` 给 503。原 ``or self.api_key`` 会在空串时静默用上 env
         里的公司凭据 ⇒ 未登记身份绕过准入白吃公司额度。
         内网 provider 反而**必须忽略** override：``gateway_only`` 下
-        ``upstream_key()`` 返回的是默认外网 provider 的 key，透传会把公司凭据
-        写进 vLLM 的请求头与访问日志。
+        候选循环会把 ``default_external`` 的 key 传进来（单 provider 路径），
+        透传会把公司凭据写进 vLLM 的请求头与访问日志。
         """
         if self.local:
             key = self.api_key

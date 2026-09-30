@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
-import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic } from 'antd';
-import { ReloadOutlined, SearchOutlined, DownloadOutlined, CopyOutlined } from '@ant-design/icons';
+import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
+import { ReloadOutlined, SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
 import { api, errText, fetchJson, copyText } from '../api.js';
 
 const { Text } = Typography;
@@ -61,7 +61,6 @@ const AUDIT_ACTIONS = [
 ];
 const AUDIT_RANGES = [
   { value: '', label: '全部时间' },
-  { value: '1h', label: '最近 1 小时' },
   { value: '24h', label: '最近 24 小时' },
   { value: '7d', label: '最近 7 天' },
   { value: '30d', label: '最近 30 天' },
@@ -121,8 +120,8 @@ export default function AuditPage() {
   const setFld = (k) => (e) => { const next = { ...f, [k]: e.target.value }; setF(next); writeUrl(next); };
 
   const cols = [
-    { title: '时间', dataIndex: 'time', width: 165 },
-    { title: '动作', dataIndex: 'action', width: 130,
+    { title: '时间', dataIndex: 'time', width: 165, align: 'center' },
+    { title: '动作', dataIndex: 'action', width: 130, align: 'center',
       render: (v, rec) => (
         <Space size={4}>
           {ACTION_BADGE(v)}
@@ -130,11 +129,11 @@ export default function AuditPage() {
         </Space>
       ) },
     { title: '规则', dataIndex: 'rule', width: 170, ellipsis: true, render: (v) => <Text code title={v || ''}>{ruleZh(v)}</Text> },
-    { title: 'Provider', dataIndex: 'provider', width: 110, render: (v) => v || '—' },
-    { title: '模型', dataIndex: 'model', width: 150, ellipsis: true, render: (v) => v || '—' },
-    { title: '调用方名称', dataIndex: 'key_name', width: 130,
+    { title: 'Provider', dataIndex: 'provider', width: 110, align: 'center', render: (v) => v || '—' },
+    { title: '模型', dataIndex: 'model', width: 150, align: 'center', ellipsis: true, render: (v) => v || '—' },
+    { title: '调用方名称', dataIndex: 'key_name', width: 130, align: 'center',
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
-    { title: '客户端 IP', dataIndex: 'client_ip', width: 120, render: (v) => v || '—' },
+    { title: '客户端 IP', dataIndex: 'client_ip', width: 120, align: 'center', render: (v) => v || '—' },
     { title: '文件名', dataIndex: 'filename', width: 140, ellipsis: true, render: (v) => v || '—' },
     { title: '内容摘要', dataIndex: 'text_preview',
       render: (v) => (
@@ -177,10 +176,12 @@ export default function AuditPage() {
           <Statistic data-testid="audit-stat-ext" title="外部处理" value={data.c_ext} />
         </Space>
       )}
-      <Table rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
+      <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}
         expandable={{ expandedRowRender: (rec) => <L2Detail rec={rec} />,
-          rowExpandable: (rec) => !!normL2(rec.l2) }} 
+          rowExpandable: (rec) => !!normL2(rec.l2),
+          /* 展开列原本是 48px 空白表头，装饰一个朝下箭头提示「这列能展开看 L2 详情」 */
+          columnTitle: <Tooltip title="展开查看该行的 L2 判定详情"><DownOutlined style={{ color: 'rgba(0,0,0,0.35)' }} /></Tooltip> }}
         pagination={{
           current: data?.page || 1, pageSize: data?.limit || 50, total: data?.total || 0,
           onChange: (pg) => setPageNo(pg), showSizeChanger: false,

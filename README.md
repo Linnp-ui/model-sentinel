@@ -20,9 +20,9 @@
 
 ## 界面预览
 
-| 演示页（文件上传预检） | 管理台 · 总览 |
+| 管理台 · 总览 | 演示页（文件上传预检） |
 |---|---|
-| ![demo](docs/screenshots/demo-page.png) | ![overview](docs/screenshots/admin-overview.png) |
+| ![overview](docs/screenshots/admin-overview.png) | ![demo](docs/screenshots/demo-page.png) |
 
 | 审计日志（含脱敏） | 模型配置（别名/候选/限流） |
 |---|---|
@@ -32,12 +32,19 @@
 |---|---|
 | ![keys](docs/screenshots/admin-keys.png) | ![stats](docs/screenshots/admin-stats.png) |
 
+| L2 影子（双跑看板/提示词/重训管道） | |
+|---|---|
+| ![l2](docs/screenshots/admin-l2.png) | |
+
 ## 特性
 
 - **文件维度预检**：xlsx 表名/表头/内容、PDF 文本层/水印、docx、图片 OCR（tesseract/paddle，
   缺引擎 fail-closed 转本地，绝不静默放行）；扩展名不可信，按 magic bytes 嗅探
 - **L2 双后端 + 影子双跑**：`AI_GATEWAY_L2_BACKEND=qwen|laya`；影子期主后端权威、
   laya 同流量并行打标，数据达标后一键切换；L2 提示词可管理台热改
+- **L2 一键重训管道**：审计人工标注 ≥10 条 → `POST /admin/api/l2/retrain`
+  （数据集构建 → GPU 微调 → 候选服务跑 battery/标注回归/历史分歧回归）→ 人工 promote
+  切换影子权重；管理台 L2 页含影子趋势/分歧标注/导出；`scripts/l2_check.py` 一条命令体检候选版本
 - **会话级机密粘性**：`X-Session-ID` 下文件/内联图命中机密后，同会话后续请求强制本地
 - **协议桥**：OpenAI chat / Anthropic Messages / OpenAI Responses 互转，推理流（reasoning）透传
 - **运维**：三态熔断（provider + prov::model 两级）、令牌桶限流（客户端级 + **模型级全局 RPM**：
@@ -116,7 +123,8 @@ web/admin/         管理台前端源码（React+antd+uPlot，npm run build 输�
 demo/              示例财务表格/图纸的生成脚本与样例文件
 docs/              用户说明书 / 管理台操作手册
 agents/            分层运维文档（部署 / vLLM 主机 / 策略路由 / env / 坑位记录）
-scripts/           内网 vLLM/Laya systemd 模板、L2 评估与数据集工具、灰区灌数
+scripts/           内网 vLLM/Laya systemd 模板、L2 数据集/微调/评估（OOD/留出）、
+                   候选体检 l2_check.py、标注挖掘 mine_audit_labels.py、影子轮次 shadow_pulse.py、灰区灌数
 policy.yaml        策略（priority 升序命中即停，Pydantic 强校验）
 routing.yaml       provider 注册表（密钥只存 env 变量名，${VAR:default} 展开）
 model_policy.yaml  外网候选/内网模型/模型限流(model_limits)/负载均衡

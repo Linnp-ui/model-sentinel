@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, List } from 'antd';
-import { StopOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, List, InputNumber } from 'antd';
+import { StopOutlined, ReloadOutlined, ThunderboltOutlined, SlidersOutlined } from '@ant-design/icons';
 import { api, errText, RANGES } from '../api.js';
 
 const { Text } = Typography;
@@ -14,10 +14,73 @@ const sugTitleOf = (meta, h) => {
     : `${base}（${RANGE_LABEL(h)}）`;
 };
 const sevColor = { high: 'red', warn: 'orange', info: 'blue' };
+// 调节建议阈值（挂在建议卡上的弹窗：只读写 3 个 SUGGEST_* 键，/l2-config 合并式更新不碰 L2 项）
+// 拉黑/用量两项按窗口各配一个阈值（窗口越长累计越多，单值在 30 天窗必误报）；错误率是比率，不随窗口变。
+const WIN_SHORT = { 24: '24h', 168: '7d', 720: '30d' };
+function SuggestThresholdsModal({ open, onClose }) {
+  const [cfg, setCfg] = useState(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    api('/l2-config')
+      .then((d) => setCfg({
+        violation: d.AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD,
+        volume: d.AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD,
+        error: d.AI_GATEWAY_SUGGEST_ERROR_RATE,
+      }))
+      .catch((e) => message.error(errText(e)));
+  }, [open]);
+  const setWin = (which, h, v) => setCfg((c) => ({ ...c, [which]: { ...c[which], [h]: v } }));
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api('/l2-config', { method: 'PUT', body: JSON.stringify({
+        AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD: cfg.violation,
+        AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD: cfg.volume,
+        AI_GATEWAY_SUGGEST_ERROR_RATE: cfg.error,
+      }) });
+      message.success('已保存并生效（重启后仍生效）');
+    } catch (e) { message.error(errText(e)); }
+    setSaving(false);
+  };
+  const row = (label, which, max) => (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
+      <Text style={{ whiteSpace: 'nowrap' }}>{label}：</Text>
+      <Space size={4}>
+        {RANGES.map((r) => (
+          <React.Fragment key={r.hours}>
+            <Text type="secondary">{WIN_SHORT[r.hours]}</Text>
+            <InputNumber size="small" min={1} max={max} value={cfg[which][r.hours]}
+              onChange={(v) => setWin(which, r.hours, v)} />
+          </React.Fragment>
+        ))}
+      </Space>
+    </div>
+  );
+  return (
+    <Modal title="调节建议阈值" open={open} onCancel={onClose} width={560} destroyOnClose
+      okText="保存生效" cancelText="取消" confirmLoading={saving} okButtonProps={{ disabled: !cfg }}
+      onOk={save}>
+      {cfg ? <Space direction="vertical" size={10} style={{ width: '100%' }}>
+        {row('KEY 拉黑建议（窗口内异常 拦截∪本地路由 次数 ≥）', 'violation', 1000)}
+        {row('IP 用量观察（窗口内调用次数 ≥）', 'volume', 100000)}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
+          <Text style={{ whiteSpace: 'nowrap' }}>模型错误率告警（错误率 ≥ 且调用 ≥ 20）：</Text>
+          <InputNumber size="small" min={0} max={1} step={0.01} value={cfg.error}
+            onChange={(v) => setCfg((c) => ({ ...c, error: v }))} />
+        </div>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          阈值按建议卡所选窗口分别生效（窗口越长应越大）；错误率与窗口无关。默认 拉黑 20 / 用量 1000 / 错误率 10%
+        </Text>
+      </Space> : <Card size="small" loading />}
+    </Modal>
+  );
+}
 export function SuggestionCard({ onApplied }) {
   const [hours, setHours] = useState(168);
   const [sug, setSug] = useState([]);
   const [sugMeta, setSugMeta] = useState(null);
+  const [thOpen, setThOpen] = useState(false);
   const loadSug = useCallback(async (h = hours) => {
     try {
       const s = await api(`/suggestions?hours=${h}`);
@@ -32,17 +95,22 @@ export function SuggestionCard({ onApplied }) {
     } catch (e) { message.error(errText(e)); }
   };
   return (
+    <>
     <Card title={sugTitleOf(sugMeta, hours)}
       extra={<Space>
         <Select value={hours} onChange={setHours} style={{ width: 130 }}
           options={RANGES.map((r) => ({ value: r.hours, label: r.label }))} />
+        <Button icon={<SlidersOutlined />} onClick={() => setThOpen(true)}>阈值</Button>
         <Button icon={<ReloadOutlined />} onClick={() => loadSug()}>刷新</Button>
       </Space>}>
       {sug.length === 0
         ? <Alert type="success" showIcon
             message="当前无建议：各指标均在阈值内"
             description={sugMeta
-              ? `触发口径 ${sugMeta.trigger}；KEY 分级窗口 ${Math.round(sugMeta.key_tier_window_hours / 24)} 天，规则 1/2/3 窗口 ${sugMeta.window_hours} 小时。`
+              ? <Space direction="vertical" size={4}>
+                  <span>{`触发口径 ${sugMeta.trigger}；KEY 分级窗口 ${Math.round(sugMeta.key_tier_window_hours / 24)} 天，规则 1/2/3 窗口 ${sugMeta.window_hours} 小时。`}</span>
+                  <Button size="small" icon={<SlidersOutlined />} onClick={() => setThOpen(true)}>查看/调整阈值</Button>
+                </Space>
               : null} />
         : <List
             size="small"
@@ -70,6 +138,8 @@ export function SuggestionCard({ onApplied }) {
             )}
           />}
     </Card>
+    <SuggestThresholdsModal open={thOpen} onClose={() => setThOpen(false)} />
+    </>
   );
 }
 // ---------------- 2 KEY 黑白名单 ----------------

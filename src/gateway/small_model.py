@@ -174,7 +174,13 @@ def get_user_prompt_template() -> str:
 
 
 def set_prompt_overrides(system: str | None = None, template: str | None = None) -> dict:
-    """内存级即时覆盖（admin PUT 调用）。空串表示还原默认。"""
+    """内存级即时覆盖（admin PUT 调用）。空串表示还原默认。
+
+    改提示词必须清判定缓存：_CACHE 按文本键，TTL 600s，不清的话同一文本会继续吐旧
+    prompt 的结论（2026-09-28 v3 落地后干跑仍报 NORMAL 就是这个，缓存条目 TTL 内不重算）。
+    """
+    if system is not None or template is not None:
+        _CACHE.clear()
     if system is not None:
         if system == "":
             _PROMPT_OVERRIDES.pop("AI_GATEWAY_L2_SYSTEM_PROMPT", None)
@@ -249,17 +255,19 @@ async def classify(text: str, filename: str = "", headers: list = None, sheet_na
     return res
 
 
-async def _call_qwen(text: str, filename: str, headers: list, sheet_names: list) -> Dict[str, Any]:
-    """qwen 后端（vLLM OpenAI chat 协议）。异常直接抛，熔断记账由 classify() 统一做。"""
+async def _call_qwen(text: str, filename: str = "", headers: list = None, sheet_names: list = None,
+                   system: str | None = None, temperature: float = 0.1) -> Dict[str, Any]:
+    """qwen 后端（vLLM OpenAI chat 协议）。异常直接抛，熔断记账由 classify() 统一做。
+    temperature：生产 0.1；prompt 打分传 0 —— 候选/基线比分数时不能有采样噪声（同 prompt 两次跑曾差 2 分）。"""
     client = _get_client()
     start = time.time()
     resp = await client.post(l2_url(), json={
         "model": l2_name(),
         "messages": [
-            {"role": "system", "content": get_system_prompt()},
+            {"role": "system", "content": system if system is not None else get_system_prompt()},
             {"role": "user", "content": _build_user_prompt(text, filename, headers, sheet_names)},
         ],
-        "temperature": 0.1,
+        "temperature": temperature,
         "max_tokens": l2_max_tokens(),
         "extra_body": {"guided_json": L2_RESPONSE_SCHEMA},
     })

@@ -24,6 +24,7 @@ import pymysql
 OUT_DIR = os.path.expanduser("~/models/laya-dataset")
 AUDIT_URL = dict(host="127.0.0.1", user="root", password="changeme",
                  database="gateway_audit", charset="utf8mb4")
+MIN_LABEL_CHARS = 10  # 人工标注样本长度下限（比 MIN_CHARS 松：分歧样本可短，排除极短噪声）
 POS_RULES = {"l2_confidential", "pii_weighted_route_local", "financial_local_only",
              "block_secrets", "pii_critical_block", "drawing_local_only"}
 NEG_RULES = {"default_allow"}
@@ -56,6 +57,59 @@ def extract_real():
     items = sorted(seen.values(), key=lambda v: hashlib.sha1(v["text"].encode()).hexdigest())
     n_eval = max(1, int(len(items) * EVAL_FRAC))
     return items[n_eval:], items[:n_eval]  # 确定性切分
+
+
+# ---------------------------------------------------------------- 人工标注（l2_labels，ground truth 最高优先级）
+def extract_labeled():
+    """管理台「L2 影子」页的人工标注（gateway_admin.l2_labels × audit_logs）。
+    两库各查一次、Python 侧按 req_id join：跨库 SQL JOIN 受两表排序规则漂移影响
+    （2026-09-28 实测 1267 mix of collations，标注静默丢失），Python join 对 collation 免疫。
+    返回 {sha1(norm): sample}。DB 不可用时返回 {}（不挡数据集构建）。"""
+    try:
+        conn = pymysql.connect(**AUDIT_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT req_id, label FROM gateway_admin.l2_labels WHERE label IS NOT NULL")
+        labels = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+        out = {}
+        if labels:
+            ids = list(labels)
+            cur.execute(
+                "SELECT req_id, text_preview, filename, ts FROM audit_logs WHERE req_id IN (%s)"
+                % ",".join(["%s"] * len(ids)), ids)
+            for req_id, text, fn, ts in cur.fetchall():
+                if text is None:
+                    continue
+                norm = re.sub(r"\s+", " ", text).strip()
+                if len(norm) < MIN_LABEL_CHARS:
+                    continue
+                out[hashlib.sha1(norm.encode()).hexdigest()] = {
+                    "text": norm, "label": labels[str(req_id)], "source": f"human:{str(req_id)[:12]}",
+                    "filename": fn or "", "ts": str(ts)}
+        conn.close()
+        return out
+    except Exception as e:
+        print(f"[build_laya_dataset] extract_labeled failed（忽略，继续无标注构建）: {e!r}")
+        return {}
+
+
+def apply_labeled(real_train, real_eval, labeled):
+    """人工标注纯覆盖 rule 推导（人标 0 也盖掉规则 1，标错即投毒——2026-09-28 实测:
+    涨薪结果+姓名薪资被标 0 进训练集）；标注样本不在真实集的直接进训练。
+    返回 (real_train, real_eval, n_override, n_added)。"""
+    n_over = 0
+    for bucket in (real_train, real_eval):
+        for v in bucket:
+            h = hashlib.sha1(v["text"].encode()).hexdigest()
+            if h in labeled and v["source"] != labeled[h]["source"]:
+                v["label"], v["source"] = labeled[h]["label"], labeled[h]["source"]
+                n_over += 1
+    have = {hashlib.sha1(v["text"].encode()).hexdigest() for v in real_train + real_eval}
+    n_add = 0
+    for h in sorted(labeled):
+        if h not in have:
+            real_train.append(labeled[h])
+            n_add += 1
+    return real_train, real_eval, n_over, n_add
 
 
 # ---------------------------------------------------------------- 合成增广
@@ -622,9 +676,65 @@ def synth_zhformal(n_each=120):
     return pos, neg
 
 
+HARD_WEIGHT = int(os.getenv("LAYA_HARD_WEIGHT", "4"))  # 难例复制倍数
+POS_RATIO = float(os.getenv("LAYA_POS_RATIO", "0.5"))  # 目标正样本占比
+
+
+def _sha1(text):
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def load_hard():
+    """难例文件（OUT_DIR/hard.jsonl，每行 {text, label}）：上版 battery 错题，人工挑过。
+    含真实审计原文，文件留 ~/models 永不入库。缺失返回 []。"""
+    path = os.path.join(OUT_DIR, "hard.jsonl")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def balance(train, target=POS_RATIO):
+    """多数类下采样到目标正比：只删不造；优先删合成，真实审计/人工/难例尽量保留。"""
+    pos = [x for x in train if x["label"] == 1]
+    neg = [x for x in train if x["label"] == 0]
+    total = len(pos) + len(neg)
+    if not pos or not neg or total == 0:
+        return train
+
+    def down(items, keep):
+        keep = max(1, keep)
+        if len(items) <= keep:
+            return items
+        keep_ids = {id(x) for x in items
+                    if str(x.get("source", "")).startswith(("audit:", "human:", "hard:"))}
+        keepers = [x for x in items if id(x) in keep_ids]
+        rest = [x for x in items if id(x) not in keep_ids]
+        if len(keepers) >= keep:
+            return random.sample(keepers, keep)
+        return keepers + random.sample(rest, keep - len(keepers))
+
+    if len(pos) / total > target:
+        pos = down(pos, int(len(neg) * target / (1 - target)))
+    elif len(neg) / total > 1 - target:
+        neg = down(neg, int(len(pos) * (1 - target) / target))
+    return pos + neg
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     real_train, real_eval = extract_real()
+    real_train, real_eval, n_labeled_over, n_labeled_add = apply_labeled(
+        real_train, real_eval, extract_labeled())
+    hard = [h for h in load_hard()
+            if isinstance(h.get("text"), str) and h.get("label") in (0, 1)]
+    hard_ids = {_sha1(re.sub(r"\s+", " ", h["text"]).strip()) for h in hard}
+    # 防泄漏：难例多半来自上版留出，进训练就必须同步移出留出（否则 battery 自测虚高）
+    real_eval = [r for r in real_eval if _sha1(re.sub(r"\s+", " ", r["text"]).strip()) not in hard_ids]
+    hard_train = [{"text": re.sub(r"\s+", " ", h["text"]).strip(), "label": int(h["label"]),
+                   "source": "hard:v11", "filename": h.get("filename", "")}
+                  for h in hard for _ in range(HARD_WEIGHT)]
     synth_pos = synth_positives()
     synth_neg = synth_negatives()
     cpos, cneg = synth_contrast()
@@ -633,6 +743,7 @@ def main():
     mpos, mneg = synth_mention()
     zpos, zneg = synth_zhformal()
     train = real_train + synth_pos + synth_neg + cpos + cneg + tpos + tneg + clpos + clneg + mpos + mneg + zpos + zneg
+    train = balance(train + hard_train)
     random.shuffle(train)
 
     def dump(name, items):
@@ -648,6 +759,9 @@ def main():
         "seed": SEED,
         "real_train": len(real_train), "real_eval": len(real_eval),
         "real_train_pos": sum(v["label"] for v in real_train),
+        "labeled_human_total": n_labeled_over + n_labeled_add,
+        "labeled_human_override": n_labeled_over,
+        "labeled_human_added": n_labeled_add,
         "synth_pos": len(synth_pos), "synth_neg": len(synth_neg),
         "synth_contrast_pos": len(cpos), "synth_contrast_neg": len(cneg),
         "synth_tables_pos": len(tpos), "synth_tables_neg": len(tneg),
@@ -656,6 +770,9 @@ def main():
         "synth_zhformal_pos": len(zpos), "synth_zhformal_neg": len(zneg),
         "total_train": len(train),
         "train_pos": sum(v["label"] for v in train),
+        "train_pos_ratio": round(sum(v["label"] for v in train) / max(1, len(train)), 3),
+        "hard_total": len(hard), "hard_weight": HARD_WEIGHT,
+        "hard_train_rows": len(hard_train),
         "real_pos_source": dict(Counter(v["source"] for v in real_train + real_eval if v["label"] == 1)),
         "real_len_p50_pos": statistics.median(lp) if lp else 0,
         "real_len_p50_neg": statistics.median(ln) if ln else 0,

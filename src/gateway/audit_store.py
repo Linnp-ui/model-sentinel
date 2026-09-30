@@ -355,6 +355,8 @@ class AuditStore:
     def _init(self):
         self._mem: List[dict] = []
         self._mem_lock = threading.Lock()
+        self._tail_cache: dict = {}   # n -> (Redis 版本签名, 解析好的 oldest-first 行)
+        self._tail_lock = threading.Lock()
         self._r: Optional["redis.Redis"] = None
         self._r_url: Optional[str] = None
         self._r_disabled = False
@@ -453,6 +455,15 @@ class AuditStore:
         # Prefer Redis shared view for multi-worker consistency
         if self._r is not None:
             try:
+                # 版本签名 = (LLEN, 最新一条)：lpush 只往头部加、ltrim 只裁尾部，
+                # 签名不变即内容不变 → 翻页/改筛选不必重做 5000 次 json.loads（~45ms/次）。
+                # ponytail: 缓存整份解析结果 ≈10MB/进程；返回 list 浅拷贝，调用方
+                # 若要就地改 dict 只允许幂等补字段（现只 key_name 兜底），别改语义。
+                sig = (self._r.llen(REDIS_KEY), self._r.lindex(REDIS_KEY, 0))
+                with self._tail_lock:
+                    hit = self._tail_cache.get(n)
+                    if hit is not None and hit[0] == sig:
+                        return list(hit[1])
                 raw = self._r.lrange(REDIS_KEY, 0, n - 1)
                 out = []
                 for item in raw:
@@ -464,7 +475,11 @@ class AuditStore:
                     except Exception:
                         continue
                 if out:
-                    return list(reversed(out))  # lpush gives newest first, return oldest-first for display
+                    # lpush gives newest first, return oldest-first for display
+                    rows = list(reversed(out))
+                    with self._tail_lock:
+                        self._tail_cache[n] = (sig, rows)
+                    return list(rows)
             except Exception:
                 pass
         with self._mem_lock:

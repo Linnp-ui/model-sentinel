@@ -341,10 +341,10 @@ def upstream_key(
     ``prov`` = 本次实际要用的 provider；省略 ⇒ 回落 ``default_external``。
 
     ⚠️ 网关持的凭据是 **per-provider** 的（``provider_keys.gateway_key(prov)``）：把 A 家的
-    key 打到 B 家 ⇒ 401，且审计里看不出来源。已知限制（P2 待办）：别名组 / 多候选路径在
-    循环外只解析一次凭据 ⇒ 回落恒取 ``default_external``。生产别名组成员同属 ``deepseek``
-    （2026-09-17 实测 ext-flash / ext-pro 各 1 名成员），故当前无实际影响；**跨 provider 混排
-    的别名组必须先改成 per-candidate 解析**。
+    key 打到 B 家 ⇒ 401，且审计里看不出来源。别名组 / 故障切换路径**必须逐候选解析**，
+    用 ``_request_credential``（客户端自带那半，每请求一次）+ ``_cand_key``（网关那半，
+    每候选一次）；在本函数里循环调用会重复计入
+    ``gateway_upstream_key_passthrough_total``（切 ``gateway_only`` 的判据）。
 
     模式由 ``AI_GATEWAY_UPSTREAM_KEY_MODE`` 决定（见 ``provider_keys``）。回落准入 =
     「具名登记身份」（``provider_keys.may_use_gateway_key``）：未登记身份（env 共享 dev key /
@@ -372,7 +372,8 @@ def _gateway_upstream_key(identity, prov: Provider | None = None) -> str:
     """回落路径：取网关持有的上游凭据（P1 只读 env；P2 起池 → env）。
 
     ``prov`` 必须传**本次实际要用的 provider** —— 凭据池是 per-provider 的。省略时回落
-    ``default_external``，只留给「别名组候选共用一把凭据」的路径（见 ``upstream_key``）。
+    ``default_external``（单 provider 路径如 ``/v1/*`` 兜底代理用；候选循环一律走
+    ``_cand_key`` 逐候选传）。
 
     未登记身份 / 无可用凭据 ⇒ 空串（fail-closed）。**不抛错** —— 让
     ``validate_environment()`` 统一给 503 报文，避免错误在多层重复构造。
@@ -388,6 +389,16 @@ def _gateway_upstream_key(identity, prov: Provider | None = None) -> str:
         _note_exhausted(prov.name)
     return key
 
+
+def _cand_key(rc: str, prov) -> str:
+    """候选循环内取凭据。
+
+    ``rc`` = 本请求客户端自带的凭据（**只解析一次**，见 ``_request_credential``
+    的指标口径：``gateway_upstream_key_passthrough_total`` 重复解析归不了零）；
+    网关持有的凭据是 **per-provider** 的，必须逐候选取 —— 复用上一候选的 key
+    会把 A 家的 key 打到 B 家（401，且审计里看不出来源）。
+    """
+    return rc or _gateway_upstream_key(_current_identity(), prov)
 
 
 def resolve(
@@ -647,14 +658,18 @@ def _mp_initial_ctx(prov_name: str, model: str) -> int:
     return 0
 
 
-def _mp_next(tried: list, reason: str, cur_ctx: int, cfg, ukey, kind: str = "chat"):
-    """Next external candidate (prov, model, ctx) or None."""
+def _mp_next(tried: list, reason: str, cur_ctx: int, cfg, rc, kind: str = "chat"):
+    """Next external candidate (prov, model, ctx) or None。
+
+    ``rc`` = 客户端自带凭据（每请求解析一次）；候选的可转发性按**该候选自己的**
+    provider 判（凭据池 per-provider，用当前 prov 的 key 去筛候选会误杀有凭据的候选）。
+    """
     from .model_policy import pick_fallback_candidates
     for cand in pick_fallback_candidates(tried, reason, cur_ctx):
         pcfg = cfg.get(cand["provider"]) or find_provider(cand["provider"])
         if pcfg is None or pcfg.local or pcfg.kind != kind:
             continue
-        if not (ukey or pcfg.local):
+        if not (_cand_key(rc, pcfg) or pcfg.local):
             continue
         return (pcfg, cand["model"], cand.get("context_length", 0))
     return None
@@ -681,7 +696,9 @@ async def route_chat(
 
     # 凭据解析必须在 prov 定了之后：网关回落是 **per-provider** 的。原实现恒取
     # default_external ⇒ pin 别的 provider / 用户自配模型时会拿到**别家**的 key（401）。
-    ukey = upstream_key(headers, prov=prov)
+    # 切换候选后必须重取（原实现沿用候选 #1 的 key ⇒ 别家 key 打到本家）。
+    rc = _request_credential(headers)
+    ukey = _cand_key(rc, prov)
 
     if _mock_enabled(cfg, prov, bool(ukey)):
         return _mock_chat(prov, model, decision)
@@ -730,7 +747,7 @@ async def route_chat(
                 pcfg = cfg.get(cand["provider"]) or find_provider(cand["provider"])
                 if pcfg is None or pcfg.local or pcfg.kind != "chat":
                     continue
-                if not (ukey or pcfg.local):
+                if not (_cand_key(rc, pcfg) or pcfg.local):
                     continue
                 nxt = (pcfg, cand["model"], 0)
                 _alias_next = cand["idx"] + 1
@@ -738,8 +755,7 @@ async def route_chat(
         else:
             # _pinned_local 时不给任何候选 -> 本地失败直接 fail-loud，原文不出境
             _nxt = (None if (not mp_on or _pinned_local) else
-                    _mp_next(tried, reason, cur_ctx, cfg,
-                             upstream_key(headers, prov=prov)))
+                    _mp_next(tried, reason, cur_ctx, cfg, rc))
             if _nxt is not None:
                 nxt = _nxt
         if nxt is None:
@@ -751,6 +767,7 @@ async def route_chat(
             "error": str(exc)[:200],
         })
         prov, model, cur_ctx = nxt[0], nxt[1], nxt[2]
+        ukey = _cand_key(rc, prov)
 
 
 # 流式请求专用超时：read 是"相邻 chunk 的最大间隔"，推理模型思考阶段可远超 60s。
@@ -789,6 +806,7 @@ async def route_chat_stream(
         cur_ctx = _mp_initial_ctx(_prov0.name, _model0) if mp_on else 0
         tried: list = []
         prov, model = _prov0, _model0
+        rc = _request_credential(headers)
         while True:
             sent = False
             try:
@@ -802,7 +820,7 @@ async def route_chat_stream(
                 tried.append(f"{prov.name}/{model}")
                 reason = classify_failure(exc.status_code, str(exc))
                 nxt = (None if (not mp_on or _pinned_local) else
-                       _mp_next(tried, reason, cur_ctx, cfg, upstream_key(headers, prov=prov)))
+                       _mp_next(tried, reason, cur_ctx, cfg, rc))
                 if nxt is None:
                     raise
                 push_fallback({"from": tried[-1], "to": f"{nxt[0].name}/{nxt[1]}",
@@ -817,12 +835,12 @@ async def route_chat_stream(
                                provider=alias["name"])
     last_exc: RoutingError | None = None
     cfg = load_routing()
-    ukey = upstream_key(headers)
+    rc = _request_credential(headers)
     for cand in cands:
         prov = cfg.get(cand["provider"]) or find_provider(cand["provider"])
         if prov is None or prov.kind != "chat":
             continue
-        if not (ukey or prov.local):
+        if not (_cand_key(rc, prov) or prov.local):
             continue
         sent = False
         try:
@@ -964,8 +982,9 @@ async def route_messages(
     cfg = load_routing()
     alias = _alias_context(body, decision, headers)
     if alias is not None:
-        # 别名组：候选共用一次解析（见 upstream_key 的已知限制）
-        ukey = upstream_key(headers)
+        # 凭据逐候选解析（凭据池 per-provider）：候选共用一次解析会把 default_external
+        # 的 key 打到候选 #2 的 provider 上（401，且审计里看不出来源）。
+        rc = _request_credential(headers)
         from .alias_router import alias_candidates, record_alias_result
         _alias_ctx_start(alias["name"])
         cands = alias_candidates(alias)
@@ -977,7 +996,8 @@ async def route_messages(
             pcfg = cfg.get(cand["provider"]) or find_provider(cand["provider"])
             if pcfg is None or pcfg.local or pcfg.kind != "chat":
                 continue
-            if not (ukey or pcfg.local):
+            ukey = _cand_key(rc, pcfg)
+            if not ukey:
                 continue
             try:
                 out = await _messages_once(pcfg, cand["model"], body, ukey)
@@ -993,7 +1013,8 @@ async def route_messages(
         raise RoutingError(f"alias {alias['name']}: no usable candidate", 503)
 
     prov, model, _ = resolve(decision, {"model": str(body.get("model") or "")}, headers, kind="chat")
-    ukey = upstream_key(headers, prov=prov)
+    rc = _request_credential(headers)
+    ukey = _cand_key(rc, prov)
     if _mock_enabled(cfg, prov, bool(ukey)):
         return {
             "id": "msg_gateway", "type": "message", "role": "assistant", "model": model,
@@ -1013,14 +1034,13 @@ async def route_messages(
             tried.append(f"{prov.name}/{model}")
             reason = classify_failure(exc.status_code, str(exc))
             nxt = (None if (not mp_on or _pinned_local) else
-                   _mp_next(tried, reason, cur_ctx, cfg,
-                            upstream_key(headers, prov=prov)))
+                   _mp_next(tried, reason, cur_ctx, cfg, rc))
             if nxt is None:
                 raise
             push_fallback({"from": tried[-1], "to": f"{nxt[0].name}/{nxt[1]}",
                            "reason": reason, "error": str(exc)[:200]})
             prov, model, cur_ctx = nxt[0], nxt[1], nxt[2]
-            ukey = upstream_key(headers, prov=prov)
+            ukey = _cand_key(rc, prov)
 
 
 async def _messages_once(prov, model: str, body: Dict[str, Any], ukey: str | None) -> Dict[str, Any]:
@@ -1061,6 +1081,7 @@ async def route_messages_stream(
         cur_ctx = _mp_initial_ctx(_prov0.name, _model0) if mp_on else 0
         tried: list = []
         prov, model = _prov0, _model0
+        rc = _request_credential(headers)
         while True:
             sent = False
             try:
@@ -1074,7 +1095,7 @@ async def route_messages_stream(
                 tried.append(f"{prov.name}/{model}")
                 reason = classify_failure(exc.status_code, str(exc))
                 nxt = (None if (not mp_on or _pinned_local) else
-                       _mp_next(tried, reason, cur_ctx, cfg, upstream_key(headers, prov=prov)))
+                       _mp_next(tried, reason, cur_ctx, cfg, rc))
                 if nxt is None:
                     raise
                 push_fallback({"from": tried[-1], "to": f"{nxt[0].name}/{nxt[1]}",
@@ -1089,12 +1110,12 @@ async def route_messages_stream(
                                provider=alias["name"])
     last_exc: RoutingError | None = None
     cfg = load_routing()
-    ukey = upstream_key(headers)
+    rc = _request_credential(headers)
     for cand in cands:
         prov = cfg.get(cand["provider"]) or find_provider(cand["provider"])
         if prov is None or prov.kind != "chat":
             continue
-        if not (ukey or prov.local):
+        if not (_cand_key(rc, prov) or prov.local):
             continue
         sent = False
         try:
@@ -1228,7 +1249,8 @@ async def route_responses(
         prov, model, _alias, _idx = _ar
     else:
         prov, model, _ = resolve(decision, {"model": str(body.get("model") or "")}, headers, kind="chat")
-    ukey = upstream_key(headers, prov=prov)
+    rc = _request_credential(headers)
+    ukey = _cand_key(rc, prov)
     # 上游只应看到**解析后**的模型名；原实现把客户端原始 body 原样转发，
     # 别名/前缀/用户自定义模型名会被原样送出（见模块下方 responses 端点注释）。
     body = {**body, "model": model}
@@ -1264,7 +1286,7 @@ async def route_responses(
     cur_ctx = _mp_initial_ctx(prov.name, model) if mp_on else 0
     tried: list = []
     while True:
-        ukey = upstream_key(headers, prov=prov)
+        ukey = _cand_key(rc, prov)
         body = {**body, "model": model}
         r = await _post(prov, prov.endpoint("proxy", custom_path="responses"), body, ukey)
         if r.status_code in (404, 405, 501):
@@ -1276,7 +1298,7 @@ async def route_responses(
         tried.append(f"{prov.name}/{model}")
         reason = classify_failure(exc.status_code, str(exc))
         nxt = (None if (not mp_on or _pinned_local) else
-               _mp_next(tried, reason, cur_ctx, cfg, ukey))
+               _mp_next(tried, reason, cur_ctx, cfg, rc))
         if nxt is None:
             raise exc
         push_fallback({"from": tried[-1], "to": f"{nxt[0].name}/{nxt[1]}",
@@ -1345,7 +1367,8 @@ async def route_responses_stream(
         prov, model, _alias, _idx = _ar
     else:
         prov, model, _ = resolve(decision, {"model": str(body.get("model") or "")}, headers, kind="chat")
-    ukey = upstream_key(headers, prov=prov)
+    rc = _request_credential(headers)
+    ukey = _cand_key(rc, prov)
     body = {**body, "model": model}
 
     if _mock_enabled(cfg, prov, bool(ukey)):
@@ -1375,7 +1398,7 @@ async def route_responses_stream(
     cur_ctx = _mp_initial_ctx(prov.name, model) if mp_on else 0
     tried: list = []
     while True:
-        ukey = upstream_key(headers, prov=prov)
+        ukey = _cand_key(rc, prov)
         body = {**body, "model": model}
         sent = False
         try:
@@ -1397,7 +1420,7 @@ async def route_responses_stream(
             tried.append(f"{prov.name}/{model}")
             reason = classify_failure(exc.status_code, str(exc))
             nxt = (None if (not mp_on or _pinned_local) else
-                   _mp_next(tried, reason, cur_ctx, cfg, ukey))
+                   _mp_next(tried, reason, cur_ctx, cfg, rc))
             if nxt is None:
                 raise
             push_fallback({"from": tried[-1], "to": f"{nxt[0].name}/{nxt[1]}",

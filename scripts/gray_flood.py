@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import urllib.request
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -15,6 +16,17 @@ from src.gateway.inspection import inspect_text  # noqa: E402
 
 KEY = os.environ["AI_GATEWAY_DEV_API_KEY"]
 URL = "http://127.0.0.1:8080/v1/chat/completions"
+
+
+def _utc(ts):
+    try:
+        return datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime.min
+
+
+def bj(dt):
+    return (dt + timedelta(hours=8)).strftime("%m-%d %H:%M:%S")
 
 # (text, 预期影子标签: 1=机密 0=非密)
 CANDIDATES = [
@@ -74,7 +86,6 @@ CANDIDATES = [
     ("采购合同：总价 86 万，分三期付款", 1),
     ("本项目底价 560 万，投标方 7 家", 1),
     ("施工图参数：图号 A-102，基础开挖深度 3.2 米", 1),
-    ("数据库密码 P@ssw0rd123 忘了，怎么重置？", 1),
     ("工资表：姓名,部门,基本工资,奖金 / 张三 研发部 18500 3200", 1),
     ("我的银行卡号 6222020200001234567 丢了要挂失", 1),
     ("身份证号 110101199003071234 的证件照要求", 1),
@@ -115,11 +126,69 @@ def main():
         print(f"  剔 risk={s} want={w} {t[:30]}")
 
     t0 = time.time()
+    # 本轮起点（审计 ts 存 UTC）：写 var/l2-round.json 供管理台「本轮」窗口用 ——
+    # 固定小时窗会把两轮灌数装进同一个窗，同一文本就成 dup×2（看着像重复分歧，2026-09-28 踩过）
+    since = datetime.utcnow()
+    mark = {"since": since.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": bj(since), "planned": len(keep), "sent": 0}
+    _write_mark(mark)
     for i, (text, want, risk) in enumerate(keep):
         send(text)
         print(f"  [{i+1}/{len(keep)}] risk={risk} want={want} {text[:26]}")
         time.sleep(0.25)
     print(f"发送完成 {len(keep)} 条，耗时 {time.time()-t0:.0f}s")
+    mark.update(sent=len(keep), finished_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    _write_mark(mark)
+    _append_round(mark)
+    time.sleep(8)  # 等审计后台线程批量落库
+    report_round(since, keep)
+
+
+def _append_round(mark):
+    """追加一行到 var/l2-rounds.jsonl（管理台 /l2-rounds 轮次历史表读）。
+
+    带上当时现役的影子版本：换版后老轮次的一致率属于旧模型，混在一起看没有意义。
+    """
+    laya = ""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8003/health", timeout=5) as r:
+            laya = (json.load(r) or {}).get("model", "")
+    except Exception:
+        pass
+    path = os.path.join(ROOT, "var", "l2-rounds.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"started": mark["since"], "finished": mark.get("finished_at", ""),
+                            "sent": mark.get("sent"), "laya": laya}, ensure_ascii=False) + "\n")
+
+
+def _write_mark(mark):
+    path = os.path.join(ROOT, "var", "l2-round.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(mark, f, ensure_ascii=False)
+
+
+def report_round(since, keep):
+    """打印本轮（since 之后）新增分歧：方向/主→影/影p/标注。"""
+    want_of = {t: w for t, w, _ in keep}
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8080/admin/api/l2-divergences?hours=1&limit=500",
+                                    timeout=60) as r:
+            items = json.load(r)["items"]
+    except Exception as e:
+        print(f"取本轮分歧失败：{e!r}")
+        return
+    rows = [x for x in items if _utc(x["ts"]) >= since - timedelta(seconds=5)]
+    print(f"\n=== 本轮分歧 {len(rows)} 条（{bj(since)} 起）===")
+    for x in sorted(rows, key=lambda i: i["ts"]):
+        p = x.get("shadow_prob")
+        p = f"{p:.3f}" if isinstance(p, (int, float)) else "-"
+        cell = "主放·影密" if x["cell"] == "nc" else "主密·影放"
+        lab = "未标" if x["label"] is None else f"已标{x['label']}"
+        agree = "✓" if x["label"] == want_of.get(x["text_preview"]) else ""
+        print(f"  {cell} {x['main'][:4]}→{x['shadow'][:4]} p={p} {lab} {agree} "
+              f"want={want_of.get(x['text_preview'], '?')} {x['text_preview'][:40]}")
 
 
 if __name__ == "__main__":

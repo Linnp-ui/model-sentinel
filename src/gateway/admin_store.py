@@ -138,6 +138,36 @@ ops_log = Table(
     Column("operator", String(128), nullable=False, default=""),
 )
 
+l2_labels = Table(
+    "l2_labels",
+    metadata,
+    Column("req_id", String(40), primary_key=True),  # audit_logs.req_id（32 位，极小概率撞键，覆盖即可）
+    Column("label", Integer, nullable=True),  # 1=机密 0=非密 NULL=未标注
+    Column("updated_at", DateTime, nullable=False),
+)
+
+policy_versions = Table(
+    "policy_versions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, nullable=False),
+    Column("operator", String(128), nullable=False, default=""),
+    Column("source", String(16), nullable=False, default="save"),  # save|rollback
+    Column("yaml_text", Text, nullable=False),
+    Column("rule_count", Integer, nullable=False, default=0),
+)
+
+prompt_versions = Table(
+    "prompt_versions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, nullable=False),
+    Column("operator", String(128), nullable=False, default=""),
+    Column("source", String(16), nullable=False, default="save"),  # save|rollback
+    Column("system_prompt", Text, nullable=False, default=""),
+    Column("user_template", Text, nullable=False, default=""),
+)
+
 
 # ---------------- 密码哈希（stdlib scrypt） ----------------
 
@@ -292,6 +322,11 @@ class AdminStore:
         # 运维操作留痕（内存后端数据）
         self._ops_logs: list[dict] = []
         self._ops_seq = 1
+        self._l2_labels: dict[str, dict] = {}  # L2 影子分歧标注（内存后端数据）
+        self._policy_versions: list[dict] = []  # policy.yaml 历史版本（内存后端数据）
+        self._policy_version_seq = 1
+        self._prompt_versions: list[dict] = []  # L2 提示词历史版本（内存后端数据）
+        self._prompt_version_seq = 1
         self._entry_cache: dict[str, tuple[float, int, tuple]] = {}  # P1: key -> (ts, ver, entry)
         self._entry_ver: int = 0
         self._window_cache: Optional[tuple] = None  # (key, ts, raw_rows) 时间窗拉取去重
@@ -666,6 +701,176 @@ class AdminStore:
                 print(f"[admin_store] ops_log select failed, fallback memory: {e!r}")
         with self._mem_lock:
             return [dict(r) for r in list(reversed(self._ops_logs))[:limit]]
+
+    # ---------- L2 影子分歧标注（v10 训练原料；内存/MySQL 双后端） ----------
+
+    def upsert_l2_label(self, req_id: str, label: Optional[int]) -> None:
+        req_id = str(req_id or "")[:40]
+        if not req_id:
+            return
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        if self._backend != "memory":
+            try:
+                from sqlalchemy.dialects.mysql import insert as my_insert
+                with self._engine.begin() as conn:
+                    ins = my_insert(l2_labels).values(req_id=req_id, label=label, updated_at=now)
+                    conn.execute(ins.on_duplicate_key_update(
+                        label=ins.inserted.label, updated_at=ins.inserted.updated_at))
+                return
+            except Exception as e:
+                print(f"[admin_store] l2_labels upsert failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            self._l2_labels[req_id] = {"label": label, "updated_at": now}
+
+    def get_l2_labels(self, req_ids) -> dict:
+        """req_id -> label（无标注/不存在的 id 不在返回里）。"""
+        ids = [str(i)[:40] for i in req_ids if i]
+        if not ids:
+            return {}
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    rows = conn.execute(
+                        select(l2_labels).where(l2_labels.c.req_id.in_(ids))
+                    ).mappings().all()
+                    return {r["req_id"]: r["label"] for r in rows if r["label"] is not None}
+            except Exception as e:
+                print(f"[admin_store] l2_labels select failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            return {rid: self._l2_labels[rid]["label"]
+                    for rid in ids
+                    if rid in self._l2_labels and self._l2_labels[rid]["label"] is not None}
+
+    def list_l2_labels(self, limit: int = 500) -> list[dict]:
+        """已标注行（label 非空），供优化管道：样本量门槛 + 标注回归评测集。"""
+        limit = max(1, min(int(limit or 500), 2000))
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    rows = conn.execute(
+                        select(l2_labels).where(l2_labels.c.label.is_not(None)).limit(limit)
+                    ).mappings().all()
+                    return [dict(r) for r in rows]
+            except Exception as e:
+                print(f"[admin_store] l2_labels list failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            return [{"req_id": k, "label": v["label"], "updated_at": v["updated_at"]}
+                    for k, v in self._l2_labels.items() if v["label"] is not None][:limit]
+
+    # ---------- policy.yaml 历史版本（每次写盘前快照，供回滚） ----------
+
+    def save_policy_version(self, yaml_text: str, operator: str = "", source: str = "save",
+                            rule_count: int = 0) -> None:
+        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "operator": str(operator or "")[:128],
+               "source": str(source or "save")[:16],
+               "yaml_text": yaml_text,
+               "rule_count": int(rule_count or 0)}
+        if self._backend != "memory":
+            try:
+                with self._engine.begin() as conn:
+                    conn.execute(insert(policy_versions).values(**row))
+                return
+            except Exception as e:
+                print(f"[admin_store] policy_versions insert failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            self._policy_version_seq += 1
+            self._policy_versions.append(dict(row, id=self._policy_version_seq))
+            if len(self._policy_versions) > 200:  # 内存后端只留最近 200 版
+                del self._policy_versions[:-200]
+
+    def list_policy_versions(self, limit: int = 50) -> list[dict]:
+        limit = max(1, min(int(limit or 50), 200))
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    rows = conn.execute(
+                        select(policy_versions).order_by(policy_versions.c.id.desc()).limit(limit)
+                    ).mappings().all()
+                    out = [dict(r) for r in rows]
+                    for r in out:
+                        r["yaml_text"] = (r["yaml_text"] or "")[:200]  # 列表只给预览
+                    return out
+            except Exception as e:
+                print(f"[admin_store] policy_versions list failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            out = [dict(r) for r in list(reversed(self._policy_versions))[:limit]]
+            for r in out:
+                r["yaml_text"] = (r["yaml_text"] or "")[:200]
+            return out
+
+    def get_policy_version(self, vid: int) -> Optional[dict]:
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    row = conn.execute(
+                        select(policy_versions).where(policy_versions.c.id == int(vid))
+                    ).mappings().first()
+                    return dict(row) if row else None
+            except Exception as e:
+                print(f"[admin_store] policy_versions get failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            return next((dict(r) for r in self._policy_versions if r["id"] == int(vid)), None)
+
+    # ---------- L2 提示词历史版本（每次 PUT 前快照，供回滚） ----------
+
+    def save_prompt_version(self, system_prompt: str, user_template: str,
+                            operator: str = "", source: str = "save") -> None:
+        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "operator": str(operator or "")[:128],
+               "source": str(source or "save")[:16],
+               "system_prompt": system_prompt or "",
+               "user_template": user_template or ""}
+        if self._backend != "memory":
+            try:
+                with self._engine.begin() as conn:
+                    conn.execute(insert(prompt_versions).values(**row))
+                return
+            except Exception as e:
+                print(f"[admin_store] prompt_versions insert failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            self._prompt_version_seq += 1
+            self._prompt_versions.append(dict(row, id=self._prompt_version_seq))
+            if len(self._prompt_versions) > 200:
+                del self._prompt_versions[:-200]
+
+    def list_prompt_versions(self, limit: int = 50) -> list[dict]:
+        """历史版本列表（system_prompt 只给 200 字预览 + sha12，详情走 get）。"""
+        import hashlib as _hl
+        limit = max(1, min(int(limit or 50), 200))
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    rows = conn.execute(
+                        select(prompt_versions).order_by(prompt_versions.c.id.desc()).limit(limit)
+                    ).mappings().all()
+                    return [{**dict(r),
+                             "system_preview": (r["system_prompt"] or "")[:200],
+                             "system_sha1": _hl.sha1((r["system_prompt"] or "").encode()).hexdigest()[:12],
+                             "system_prompt": ""}
+                            for r in rows]
+            except Exception as e:
+                print(f"[admin_store] prompt_versions list failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            out = [dict(r) for r in list(reversed(self._prompt_versions))[:limit]]
+            for r in out:
+                r["system_sha1"] = _hl.sha1((r["system_prompt"] or "").encode()).hexdigest()[:12]
+                r["system_preview"] = (r["system_prompt"] or "")[:200]
+                r["system_prompt"] = ""
+            return out
+
+    def get_prompt_version(self, vid: int) -> Optional[dict]:
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    row = conn.execute(
+                        select(prompt_versions).where(prompt_versions.c.id == int(vid))
+                    ).mappings().first()
+                    return dict(row) if row else None
+            except Exception as e:
+                print(f"[admin_store] prompt_versions get failed, fallback memory: {e!r}")
+        with self._mem_lock:
+            return next((dict(r) for r in self._prompt_versions if r["id"] == int(vid)), None)
 
     # ---------- 对外模型别名（ext-flash / ext-pro 动态路由；纯 DB/Console 管理，无内置种子） ----------
 

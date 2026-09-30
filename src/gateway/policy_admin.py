@@ -45,8 +45,28 @@ def _validate_doc(doc: Dict[str, Any]) -> None:
     PolicyDoc.model_validate(doc)
 
 
-def _write_doc(doc: Dict[str, Any]) -> None:
+def _snapshot_old(operator: str = "", source: str = "save") -> None:
+    """写盘前把现网 policy.yaml 存进版本表（可回滚）。fail-open：快照失败不挡保存。
+
+    空文件/空 policies 不留版本（没有可回滚的东西）。"""
+    try:
+        p = _policy_path()
+        if not p.exists():
+            return
+        old = p.read_text(encoding="utf-8")
+        doc = yaml.safe_load(old) or {}
+        n = len(doc.get("policies", [])) if isinstance(doc, dict) else 0
+        if not old.strip() or n == 0:
+            return
+        from .admin_store import get_admin_store
+        get_admin_store().save_policy_version(old, operator=operator, source=source, rule_count=n)
+    except Exception as e:
+        print(f"[policy_admin] version snapshot failed (not blocking save): {e!r}")
+
+
+def _write_doc(doc: Dict[str, Any], operator: str = "", source: str = "save") -> None:
     _validate_doc(doc)
+    _snapshot_old(operator=operator, source=source)
     text = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
     p = _policy_path()
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -55,7 +75,17 @@ def _write_doc(doc: Dict[str, Any]) -> None:
     invalidate_policy_cache()  # P1: 写后失效，读走 mtime 缓存
 
 
-def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None) -> Dict[str, Any]:
+def restore_policy_yaml(yaml_text: str, operator: str = "", source: str = "rollback") -> int:
+    """回滚：把历史快照写回 policy.yaml（同样走 Pydantic 校验 + 原子落盘 + 现状再快照，可反悔）。"""
+    doc = yaml.safe_load(yaml_text)
+    if not isinstance(doc, dict) or not isinstance(doc.get("policies"), list):
+        raise ValueError("invalid policy yaml (no policies list)")
+    _write_doc(doc, operator=operator, source=source)
+    return len(doc["policies"])
+
+
+def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None,
+                  operator: str = "") -> Dict[str, Any]:
     """新增/更新一条规则。original_name 给定时为重命名更新。校验失败抛 pydantic.ValidationError。"""
     data = yaml.safe_load(_policy_path().read_text(encoding="utf-8")) or {}
     policies: List[Dict[str, Any]] = data.get("policies", []) if isinstance(data, dict) else []
@@ -70,17 +100,17 @@ def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None) -> 
         policies = [p for p in policies if p.get("name") != original_name]
     policies = [p for p in policies if p.get("name") != name] + [rule]
     policies.sort(key=lambda x: int(x.get("priority", 100)))
-    _write_doc({"policies": policies})
+    _write_doc({"policies": policies}, operator=operator)
     return rule
 
 
-def delete_policy(name: str) -> bool:
+def delete_policy(name: str, operator: str = "") -> bool:
     data = yaml.safe_load(_policy_path().read_text(encoding="utf-8")) or {}
     policies: List[Dict[str, Any]] = data.get("policies", []) if isinstance(data, dict) else []
     kept = [p for p in policies if p.get("name") != name]
     if len(kept) == len(policies):
         return False
-    _write_doc({"policies": kept})
+    _write_doc({"policies": kept}, operator=operator)
     return True
 
 

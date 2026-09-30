@@ -23,8 +23,18 @@
   font-size: 16px !important;
 }
 .ant-card-head-title { padding: 0 !important; }
-/* 表格单元格左侧留白 +6px（small 表基础 padding 8px → 14px） */
-.ant-table-cell { padding-left: 14px !important; }
+/* 表格单元格左侧留白 +16px（small 表基础 padding 8px → 24px） */
+.ant-table-cell { padding-left: 24px !important; }
+/* 表头与内容一律居中：管理台 17 张表、列宽各异，左对齐时表头与内容对不上（列窄时尤甚）。
+   !important 必需——antd 的 css-xxx 内联类会压掉普通 text-align。 */
+.ant-table thead > tr > th,
+.ant-table tbody > tr > td { text-align: center !important; }
+/* 例外：会截断省略的列（antd 自带 .ant-table-cell-ellipsis）左对齐。这类列内容长度
+   可变——长时占满整列、短时只占一半，居中会让每行文字左右跳。省略号居中更难认。 */
+.ant-table tbody > tr > td.ant-table-cell-ellipsis { text-align: left !important; }
+/* 审计表 10 列且窄（最小 110px），表头挤在左边认不出对应哪列：左右留白对称。
+   只审计表需要，用组件根 class 限定作用域，别改全局 .ant-table-cell。 */
+.audit-table .ant-table-cell { padding-left: 12px !important; padding-right: 12px !important; }
 /* L2 运行配置块（审查模型卡片内）垂直居中 */
 .ant-card-body:has(> [data-testid="l2cfg-section"]) {
   display: flex;
