@@ -4,7 +4,7 @@ python-multipart==0.0.9
 pydantic==2.9.*
 sqlalchemy==2.0.*
 redis==5.0.*
-pymysql==1.1.*  # audit MySQL backend
+pymysql==1.1.*  # audit MySQL backend (use existing docker-mysql-1)
 httpx==0.27.*
 pypdf==4.2.*
 openpyxl==3.1.*

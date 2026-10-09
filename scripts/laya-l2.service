@@ -4,6 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# 模板说明：本文件应与 /etc/systemd/system/laya-l2.service 保持一致。
+# 改动后：备份已装版本 → diff 核对 → cp 到 /etc → daemon-reload → 重启 → /health 核对
+# model 身份（配方见 AGENTS.md 部署节）。现役影子权重见 var/laya-l2.env（v30，2026-09-30 实查）。
 Type=simple
 User=your-user
 WorkingDirectory=/home/your-user
@@ -13,7 +16,11 @@ Environment=CUDA_VISIBLE_DEVICES=5
 # 代价是两条退化样本（重复样板/截断样板）回退；swap/长表/灰区回归探针 7/7 全过）。
 # 同日修服务渲染：空 文件名/Sheet/表头 字段不再渲染（空前缀把 v8 CAP 0.013 抬到
 # 0.96，灰区误报放大器）。回退链：v8 → v5 → v4 → 零样本 `.../laya/multilingual`
-Environment=LAYA_MODEL_PATH=/home/your-user/models/laya-finetuned-confidential-v9
+# 模型路径由下面这行 EnvironmentFile 提供（现役指针在 /home/your-user/gateway/var/laya-l2.env，
+# `var/` 在 .gitignore 里所以不入库）。**别在此硬编码版本号**：L2 promote 流程只改这个
+# env 文件再重启本 unit，写死会让 promote 静默失效。
+# 前置条件（systemd 允许注释落在 EnvironmentFile 行之后）：
+EnvironmentFile=-/home/your-user/gateway/var/laya-l2.env
 Environment=USE_TF=0
 # 运行时禁 huggingface_hub 外联（权重已本地，load 只读本地目录）
 Environment=HF_HUB_OFFLINE=1

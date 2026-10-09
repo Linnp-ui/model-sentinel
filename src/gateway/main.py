@@ -1,15 +1,21 @@
 """
+Gateway 主入口 — 公司内网大模型请求的统一出口。
 
-Gateway 主入口 — 公司内网大模型请求的统一出口
+请求链路（/v1/*，客户端用 OpenAI 兼容协议接入）:
+    auth 鉴权（key 必带且须在管理台登记，否则 401）
+      -> L1 规则（policy.yaml，_review_text / _review_file_ctx）
+      -> L2 小模型判密（仅灰区 risk_score ∈ [20,60) 触发，门逻辑见 AGENTS.md「L1/L2 门」）
+      -> 通过: 转发外网 provider（routing.yaml 声明）
+      -> 不通过: 自动降级内网模型（内容不出境，调用方无感知）
 
-src/gateway/main.py
+文件区段地图:
+    auth / admin_auth                /v1/* key 校验；/admin 登录（cookie 会话）
+    _review_text / _review_file_ctx  L1+L2 审查调度，返回 allow/route_local/block 判定
+    log_entry / log_upstream_failure 审计双写（Redis 热 + MySQL 持久，见 audit_store.py）
+    「# ---- 端点 ----」区段          /v1/* 转发端点、/v1/files/check、/admin* 页面
+    admin_api.py（include 的 router） 管理面 REST：key/规则/模型/provider/审计/L2 影子
 
-
-
-请求链路：审查（L1 规则 -> L2 小模型） -> 通过则发外网 provider
-
-        不通过则自动降级到本地模型（内容不出境，调用方无感知）
-
+改 src/*.py 后必须重启 gateway.service 并核对 MainPID 变更（流程见 agents/deploy.md）。
 """
 
 from __future__ import annotations
@@ -59,6 +65,7 @@ from starlette.concurrency import run_in_threadpool
 from .inspection import inspect_text
 
 from .file_inspector import inspect_file, inspect_inline_bytes, collect_inline_blobs_chat, collect_inline_blobs_anthropic, collect_inline_blobs_responses
+from .llms.bridges import clip_audit, clip_audit_url, sse as _sse
 
 from .policy import load_policy, decide
 
@@ -96,7 +103,7 @@ from .metrics import get_current_status, get_metrics, set_current_status, GATEWA
 from .redaction import redact_audit_entry
 from .responses_filectx import extract_responses_filectx, responses_should_mark
 
-from .stat_scope import is_blocked, is_local_route, resolve_action, to_local_naive
+from .stat_scope import is_blocked, is_local_route, resolve_action, to_beijing, to_local_naive
 
 from .rate_limit import get_limiter, extract_client_key as _rl_key
 from .identity import (
@@ -105,6 +112,7 @@ from .identity import (
     identity_v2_enabled as _identity_v2,
     local_identity as _local_identity,
     identity_from_entry as _identity_from_entry,
+    current_identity,
 )
 
 
@@ -524,15 +532,6 @@ class ChatMessage(BaseModel):
     tool_calls: Any = None
     tool_call_id: Any = None
 
-def _clip_audit(s: Any, n: int) -> str:
-    if s is None:
-        return ""
-    return str(s)[:n]
-
-def _clip_audit_url(url: Any) -> str:
-    u = str(url or "")
-    return u[:200] if u.startswith("data:") else u[:2000]
-
 def _hdr_safe(v: Any) -> str:
     """HTTP 头值必须 latin-1 可编码（RFC 7230 / starlette init_headers）。
 
@@ -567,20 +566,20 @@ def _chat_part_ref(p: Any) -> str:
         url = iu.get("url", "") if isinstance(iu, dict) else iu
         if not url:
             url = p.get("url", "")
-        return _clip_audit_url(url)
+        return clip_audit_url(url)
     if t in ("file", "input_file"):
         f = p.get("file", {})
         if isinstance(f, dict):
-            return " ".join(_clip_audit(f.get(k, ""), 500) for k in ("filename", "file_id")).strip()
+            return " ".join(clip_audit(f.get(k, ""), 500) for k in ("filename", "file_id")).strip()
         for k in ("filename", "file_id"):
             if p.get(k):
-                return _clip_audit(p[k], 500)
+                return clip_audit(p[k], 500)
         return ""
     if t in ("input_audio", "audio"):
         return ""
     for k in ("filename", "file_id"):
         if isinstance(p.get(k), str) and p[k]:
-            return _clip_audit(p[k], 500)
+            return clip_audit(p[k], 500)
     return ""
 
 def _msg_content_to_str(content: Any) -> str:
@@ -604,9 +603,9 @@ def _tool_calls_text(tool_calls: Any) -> str:
         if not isinstance(fn, dict):
             continue
         if fn.get("name"):
-            parts.append(_clip_audit(fn["name"], 200))
+            parts.append(clip_audit(fn["name"], 200))
         if fn.get("arguments"):
-            parts.append(_clip_audit(fn["arguments"], 4000))
+            parts.append(clip_audit(fn["arguments"], 4000))
     return " ".join(parts)
 
 def _last_user_text_chat(messages) -> str:
@@ -685,6 +684,26 @@ def _last_user_text_responses(body) -> str:
     return ""
 
 
+def _slim_client_envelope(s: str) -> str:
+    """剥客户端塞进 user 正文的环境样板，只留用户真问题（**纯展示**）。
+
+    IDE 类客户端（workbuddy / codex）把 user_info、cwd、craft_mode、当前时间塞在
+    `<system-reminder data-role="user-context">` / `<environment_context>` 里，正文裹在
+    `<user_query>`（内含「用户输入 / 当前时间 / 期望返回」分段）或 `<session>` 里。原样截
+    200 字 ⇒ 审计摘要里只看得到 OS 版本和工作区路径，真问题被埋在 200 字之后。
+
+    `<user_query>` 取「用户输入」段（文件路径另有 filename 列、时间是样板）；认不出的形状
+    原样返回，不丢内容。L1/L2 审的是 `text`/`last_user` 全文，不走这里。
+    """
+    for tag in ("system-reminder", "environment_context"):
+        s = re.sub(rf"<{tag}\b.*?</{tag}>", " ", s, flags=re.S)
+    m = re.search(r"<user_query\b[^>]*>(.*?)</user_query>", s, re.S)
+    if m:
+        q = re.search(r"用户输入[：:]\s*(.*)", m.group(1))
+        s = (q.group(1).strip() if q else m.group(1).strip())
+    return re.sub(r"</?session\b[^>]*>", " ", s).strip()
+
+
 _CODEX_TITLE_HEAD = "You are a helpful assistant. You will be presented with a user prompt"
 _CODEX_TITLE_NOISE = ("You are a helpful assistant.", "The tasks typically have to do with")
 
@@ -695,6 +714,7 @@ def _audit_preview_responses(body, text: str) -> str:
        （文件名另有 filename 列）；② 内部标题生成调用 → 剥掉开头样板行，留被
        起标题的用户 prompt。都认不出时原样回退，不丢内容。"""
     s = _last_user_text_responses(body) or (text or "")
+    s = _slim_client_envelope(s) or s
     m = re.search(r"##\s*My request:\s*(.*)", s, re.S)
     if m and m.group(1).strip():
         s = m.group(1).strip()
@@ -799,17 +819,31 @@ _L2_SCOPE_TAIL = "tail"
 # 写进配置只留痕、不产块 —— 防止有人以为「配上就生效」。
 _L2_SCOPE_EXCLUDED = ("system", "developer", "instructions", "history")
 _L2_SCOPE_MAX_BLOCKS = 5      # = classify_chunks 的 chunks[:5] 硬上限
-# 灰区强制 L2 下限（env 可调）：risk_score ∈ [FLOOR, 60) 且 L1 放行的文本，
-# 无论长短都送 L2 语义复核（短句语义泄密是 L1 格式规则的真空带）；≥60 已转本地，无需 L2。
+# 灰区强制 L2 下限（env 可调）：L1 放行且 risk_score >= FLOOR 的文本，无论长短都送
+# L2 语义复核（短句语义泄密是 L1 格式规则的真空带）。
+#
+# 2026-09-30 修：原上界是 `risk_score < 60`（RISK_THRESHOLD_ROUTE_LOCAL），**这条上界
+# 只在 risk_score 全部来自 PII 时才成立**。risk_score = weighted_pii + keyword_score，
+# 而唯一按分值判定的 policy 规则（priority 5）读的是 **weighted_pii_score**，
+# 不含关键词分 —— 于是「关键词堆叠到 >=60」既超灰区上界（L2 不触发）、
+# 又匹配不上 priority 5（L1 放行），两条路都漏，内容直出外网。
+# 实测「工资 薪资 奖金」kw=60 → allow/deepseek；单词「机密」kw=30 → route_local（堆得越多越危险）。
+#
+# 现在**去掉上界**：PII>=60 的请求不会走到这里——priority 5 已判 route_local，
+# 门的第一个条件 `action == "allow"` 就是 False，对 PII 是零行为变化（死代码）。
+# 剩下的全是「L1 放行但分值偏高」= 关键词驱动，交给 L2 语义判定。
 _L2_GRAY_FLOOR = int((os.getenv("AI_GATEWAY_L2_GRAY_FLOOR", "20") or 20).strip() or 20)
 
 
 def _l2_gray_trigger(findings) -> bool:
-    """灰区命中即 True（供 _review_text 门与 route-inspect 干跑共用，保持口径一致）。"""
+    """灰区命中即 True（供 _review_text 门与 route-inspect 干跑共用，保持口径一致）。
+
+    只看下限、不设上界：`risk_score` 混了关键词分，上界用总分会漏掉关键词堆叠的情况
+    （见上方注释）。上界天然由 policy 的 `action != allow` 承担。
+    """
     try:
-        from .inspection import RISK_THRESHOLD_ROUTE_LOCAL
         s = int((findings or {}).get("risk_score") or 0)
-        return _L2_GRAY_FLOOR <= s < RISK_THRESHOLD_ROUTE_LOCAL
+        return s >= _L2_GRAY_FLOOR
     except Exception:
         return False
 
@@ -939,8 +973,9 @@ def _extract_chat_bundle(messages):
         except Exception:
             pass
     text = " ".join(parts + tool_parts)
+    raw = last_user or text
     return {"text": text, "last_user": last_user, "total_chars": total_chars,
-            "audit_preview": (last_user or text)[:200]}
+            "audit_preview": (_slim_client_envelope(raw) or raw)[:200]}
 
 
 def _truncate_messages_for_limit(messages: list, max_chars: int = 100000) -> list:
@@ -1206,6 +1241,10 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
         "findings": text_findings,
         "session": {"confidential": session_conf},
         "tainted_file": {"hit": bool(_taint_name), "name": _taint_name},
+        # 规则可匹配维度（管理台 5.2 匹配方式构造器）：模型名/客户端登记名/本地时段
+        "model": model or "",
+        "client": {"key": (_ident.name if (_ident := current_identity()) else "")},
+        "time": {"hour": datetime.now().hour},
 
     }
     decision = decide(load_policy(), ctx)
@@ -1749,23 +1788,15 @@ def _parse_sse_usage_event(ev: bytes, out: dict, client_wants_usage: bool) -> by
         return ev
 
 
-def _sse_err(obj: dict) -> bytes:
-    """SSE 错误事件（流式响应中途路由失败时用）"""
-    return f"event: error\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
-
 
 # ---------------------------------------------------------------- 端点
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 
 async def index():
-    p = os.path.join(os.path.dirname(__file__), "../../static/index.html")
-    if os.path.exists(p):
-
-        return FileResponse(p)
-
-    return HTMLResponse("<h3>Secure Gateway running. POST /v1/chat/completions or /v1/files/check</h3>")
+    # 演示页已删（验证功能并入管理台「路由检查」页）；根路径 302 到管理台
+    return RedirectResponse("/admin")
 
 
 @app.get("/favicon.ico")
@@ -1781,6 +1812,11 @@ async def favicon():
 @app.get("/health")
 
 async def health():
+    return _health_payload()
+
+
+def _health_payload() -> dict:
+    """状态条 SSE（admin_api.status_stream）复用同一份逻辑，故拆成同步函数。"""
     cfg = load_routing()
     return {
 
@@ -1817,7 +1853,7 @@ async def register_model(req: RegisterReq, request: Request, identity: Identity 
 
     """
     session_id = extract_session_id(request.headers)
-    owner = request.headers.get("X-Gateway-User") or "anonymous"
+    owner = identity.name or "anonymous"
     err = validate(req.name, req.base_url, req.api_key, req.api_mode)
     if err:
 
@@ -1845,15 +1881,16 @@ async def register_model(req: RegisterReq, request: Request, identity: Identity 
 @app.delete("/v1/models/{name}")
 
 async def unregister_model(name: str, request: Request, identity: Identity = Depends(_bind_identity_ctx)):
-    """注销用户自定义模型（仅本人或管理员可删；管理员通过 X-Gateway-Admin: 1 标识）"""
+    """注销用户自定义模型（仅本人或管理员可删；管理员 = key 名在 AI_GATEWAY_ADMIN_KEY_NAMES 里）"""
     store = get_store()
     m = store.get(name)
     if m is None:
 
         raise HTTPException(404, detail={"type": "not_found", "message": f"模型 {name} 不存在"})
 
-    caller = request.headers.get("X-Gateway-User") or "anonymous"
-    is_admin = request.headers.get("X-Gateway-Admin") == "1"
+    caller = identity.name or "anonymous"
+    _admin_names = {n.strip() for n in os.getenv("AI_GATEWAY_ADMIN_KEY_NAMES", "").split(",") if n.strip()}
+    is_admin = identity.name in _admin_names
     if not is_admin and m.owner != caller:
 
         raise HTTPException(403, detail={"type": "forbidden",
@@ -2329,8 +2366,8 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="upstream",
                      session_id=session_id, text_preview=audit_preview)
-                yield _sse_err({"type": "error", "error": {"type": "gateway_error", "message": str(exc)},
-                "session_id": session_id,})
+                yield _sse({"type": "error", "error": {"type": "gateway_error", "message": str(exc)},
+                "session_id": session_id,}, "error")
 
             except Exception as exc:
 
@@ -2338,8 +2375,8 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="internal",
                      session_id=session_id, text_preview=audit_preview)
-                yield _sse_err({"type": "error", "error": {"type": "gateway_error", "message": f"gateway stream error: {exc}"},
-                "session_id": session_id,})
+                yield _sse({"type": "error", "error": {"type": "gateway_error", "message": f"gateway stream error: {exc}"},
+                "session_id": session_id,}, "error")
 
 
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
@@ -2540,7 +2577,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="upstream",
                      session_id=session_id, text_preview=audit_preview)
-                yield _sse_err({"type": "response.failed", "response": {"status": "failed", "error": {"message": str(exc)}}, "session_id": session_id})
+                yield _sse({"type": "response.failed", "response": {"status": "failed", "error": {"message": str(exc)}}, "session_id": session_id}, "error")
 
             except Exception as exc:
 
@@ -2548,7 +2585,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="internal",
                      session_id=session_id, text_preview=audit_preview)
-                yield _sse_err({"type": "response.failed", "response": {"error": {"message": f"gateway stream error: {exc}"}}, "session_id": session_id,})
+                yield _sse({"type": "response.failed", "response": {"error": {"message": f"gateway stream error: {exc}"}}, "session_id": session_id,}, "error")
 
 
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
@@ -2664,7 +2701,10 @@ def _body_text(payload: Any, _depth: int = 0, _budget: list | None = None) -> st
 @app.post("/v1/files/check")
 
 async def files_check(request: Request, file: UploadFile = File(...), identity: Identity = Depends(_rate_limit_files)):
-    data = await file.read()
+    _max = int(os.getenv("AI_GATEWAY_FILES_CHECK_MAX_BYTES", str(25 * 1024 * 1024)))
+    data = await file.read(_max + 1)
+    if len(data) > _max:
+        raise HTTPException(413, detail={"type": "file_too_large", "message": f"文件超过 {_max // (1024*1024)}MB 上限"})
     filename = file.filename or "unknown"
 
     # 异步线程池，避免阻塞事件循环（Excel/PDF 解析 20-100ms）
@@ -3029,30 +3069,6 @@ async def admin_login_submit(request: Request, next: Optional[str] = None):
     return resp
 
 
-@app.get("/admin/logout")
-async def admin_logout():
-    resp = RedirectResponse("/admin/login", status_code=303)
-    resp.delete_cookie(_ADMIN_COOKIE, path="/")
-    return resp
-
-
-def _to_beijing(value):
-    """审计时间落库为 UTC（naive），展示时 +8h 对齐北京时间。解析失败原样返回。
-
-    只在**读/展示**路径调用（entries API / CSV 导出），存储与 since/until 过滤
-    仍按 UTC，避免口径漂移；服务器时区是 UTC，别把这里挪到写路径。
-    """
-    if not value:
-        return value
-    try:
-        if isinstance(value, datetime):
-            dt = value
-        else:
-            dt = datetime.strptime(str(value).strip().replace("T", " ")[:19], "%Y-%m-%d %H:%M:%S")
-        return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
-
 
 def _audit_key_name_map() -> dict:
     """token_masked -> 登记名：读时 enrichment 用（审计写时只存脱敏 key，反解不出名）。
@@ -3251,8 +3267,22 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     c_route = sum(1 for e in entries if is_local_route(e.get("action")))
     c_block = sum(1 for e in entries if _entry_blocked(e))
     c_other = total - c_allow - c_route - c_block
-    c_local = sum(1 for e in entries if e.get("local"))
-    c_ext = total - c_local
+
+    # KPI 真值：筛选可用 SQL 表达（时间/动作/规则）时走审计库聚合（90 天留存），
+    # 否则回退热窗口径。列表始终受 Redis 热窗 ≤5000 条限制（audit_store.MAX_ENTRIES），
+    # 两口径并存，kpi.source 让前端标注来源；顶层 total/c_* 仍是窗口口径（分页用）。
+    kpi = {"total": total, "c_allow": c_allow, "c_route": c_route,
+           "c_block": c_block, "c_other": c_other, "source": "window"}
+    _un_sqlable = any((x or "").strip() for x in (ip, token, provider, q, shadow))
+    if not _un_sqlable:
+        _c = store.count_mysql(since=since_dt, until=until_dt,
+                               action=(action or "").strip() or None,
+                               rule=(rule or "").strip() or None)
+        if _c:
+            kpi = {"total": _c["total"], "c_allow": _c["c_allow"], "c_route": _c["c_route"],
+                   "c_block": _c["c_block"],
+                   "c_other": _c["total"] - _c["c_allow"] - _c["c_route"] - _c["c_block"],
+                   "source": "mysql"}
     def _plain(v):
         if v is None or isinstance(v, (str, int, float, bool)):
             return v
@@ -3263,9 +3293,11 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     return JSONResponse({
         "total": total, "page": page, "pages": total_pages, "limit": limit,
         "c_allow": c_allow, "c_route": c_route, "c_block": c_block,
-        "c_other": c_other, "c_local": c_local, "c_ext": c_ext,
+        "c_other": c_other,
+        # 头部 KPI 口径（source=mysql 审计库真值 / window 热窗 ≤5000）；顶层 total/c_* 保持窗口口径供分页
+        "kpi": kpi,
         # l2 保持对象原样（主判定 + 影子 shadow_*），前端展开行渲染；_plain 会把 dict 压成 str，不用它
-        "entries": [{k: (_to_beijing(e.get(k)) if k == "time" else (e.get(k) if k == "l2" else _plain(e.get(k)))) for k in _keys} for e in page_entries],
+        "entries": [{k: (to_beijing(e.get(k)) if k == "time" else (e.get(k) if k == "l2" else _plain(e.get(k)))) for k in _keys} for e in page_entries],
     })
 
 
@@ -3348,7 +3380,7 @@ async def export_csv(
 
             _row = {
 
-                "time": _to_beijing(r.get("ts", "")),
+                "time": to_beijing(r.get("ts", "")),
                 "type": r.get("type", ""),
                 "rule": r.get("rule", ""),
                 "action": r.get("action", ""),
@@ -3374,7 +3406,7 @@ async def export_csv(
         for e in rows_hot:
             if not e.get("key_name"):
                 e["key_name"] = e.get("token_masked") or ""
-            w.writerow({k: (_csv_safe(_to_beijing(e.get(k, ""))) if k == "time" else (_csv_safe(e.get(k, "")) if k != "local" else (1 if e.get(k) else 0))) for k in cols})
+            w.writerow({k: (_csv_safe(to_beijing(e.get(k, ""))) if k == "time" else (_csv_safe(e.get(k, "")) if k != "local" else (1 if e.get(k) else 0))) for k in cols})
 
 
     return HTMLResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=gateway_audit.csv"})
@@ -3385,10 +3417,6 @@ async def export_csv(
 async def metrics_endpoint(_ip: str = Depends(admin_auth)):
     return Response(content=get_metrics().render(), media_type=f"text/plain; version={GATEWAY_VERSION}")
 
-
-@app.get("/admin/metrics/data", dependencies=[Depends(admin_page_auth)])
-async def metrics_data():
-    return JSONResponse(get_metrics().export_panel())
 
 @app.get("/admin/metrics/timeseries", dependencies=[Depends(admin_page_auth)])
 async def metrics_timeseries():
@@ -3412,19 +3440,6 @@ async def metrics_timeseries():
     panel["l2_up"] = _last["l2_up"] if _last else None
     panel["ring"] = ring.status()
     return JSONResponse({"interval_s": ring.tick_s, "ticks": list(ring.points), "panel": panel})
-
-
-@app.get("/admin/metrics/panel", dependencies=[Depends(admin_page_auth)])
-async def metrics_panel_redirect():
-    """旧指标面板 HTML 页已退役，统一跳转 Admin Console SPA。"""
-    return RedirectResponse("/admin/app", status_code=302)
-
-
-@app.get("/admin/circuit")
-
-async def circuit_state(_ip: str = Depends(admin_auth)):
-    from .circuit_breaker import get_breaker
-    return JSONResponse(get_breaker().snapshot())
 
 
 @app.get("/admin/audit/status")
@@ -3480,115 +3495,6 @@ def _parse_window_ts(v, now=None, is_until=False, default=None):
     except Exception:
         return default
 
-
-def _analytics_aggregate(entries, since=None, until=None):
-    """按所选时间跨度聚合；趋势固定 60 桶，桶宽 = 跨度/60（自适应标签粒度）。"""
-    now0 = datetime.now()
-    def _t(v):
-        return _parse_window_ts(v, now=now0)
-
-    end = _t(until) or now0
-    start = _t(since)
-    if start is None:
-        start = end - timedelta(hours=1)
-
-    filtered = []
-    for e in entries:
-        t = _t(e.get("time") or "")
-        if t is None:
-            t = _t(str(e.get("time") or "")[:19].replace("T", " "))
-        if t is None:
-            continue
-        if t < start or t >= end:
-            continue
-        filtered.append((t, e))
-    entries = [e for _, e in filtered]
-    total = len(entries)
-    c_allow = sum(1 for e in entries if e.get("action") == "allow")
-    c_route = sum(1 for e in entries if is_local_route(e.get("action")))
-    c_block = sum(1 for e in entries if _entry_blocked(e))
-    c_other = total - c_allow - c_route - c_block
-    c_local = sum(1 for e in entries if e.get("local"))
-    rule_counts = {}
-    for e in entries:
-        r = e.get("rule") or ""
-        rule_counts[r] = rule_counts.get(r, 0) + 1
-    rule_top = sorted(rule_counts.items(), key=lambda x: -x[1])[:10]
-    risk_buckets = {"0-19": 0, "20-39": 0, "40-59": 0, "60-79": 0, "80-99": 0, "100+": 0}
-    for e in entries:
-        f = e.get("findings") or {}
-        try:
-            _rs = e.get("risk_score")
-            if _rs is None:
-                # 旧条目无顶层 risk_score，回退 findings（文件流特征字典）
-                s = int(f.get("weighted_pii_score") or f.get("risk_score") or 0)
-            else:
-                s = int(_rs)
-        except (TypeError, ValueError):
-            s = 0
-        if s <= 19:
-            risk_buckets["0-19"] += 1
-        elif s <= 39:
-            risk_buckets["20-39"] += 1
-        elif s <= 59:
-            risk_buckets["40-59"] += 1
-        elif s <= 79:
-            risk_buckets["60-79"] += 1
-        elif s <= 99:
-            risk_buckets["80-99"] += 1
-        else:
-            risk_buckets["100+"] += 1
-    n = 60
-    width = max((end - start).total_seconds(), float(n)) / n
-    counts = [0] * n
-    rout = [0] * n
-    blk = [0] * n
-    for t, e in filtered:
-        idx = int((t - start).total_seconds() // width)
-        if 0 <= idx < n:
-            counts[idx] += 1
-            if is_local_route(e.get("action")):
-                rout[idx] += 1
-            elif _entry_blocked(e):
-                blk[idx] += 1
-    # 时段桶标签 +8h 对齐北京时间（分桶 idx 仍用 UTC 的 t/start，只平移标签）
-    if (end - start).total_seconds() <= 26 * 3600:
-        slots = [(start + timedelta(hours=8, seconds=i * width)).strftime("%H:%M") for i in range(n)]
-    else:
-        slots = [(start + timedelta(hours=8, seconds=i * width)).strftime("%m-%d") for i in range(n)]
-    pc = {}
-    for e in entries:
-        p = e.get("provider") or "unknown"
-        pc[p] = pc.get(p, 0) + 1
-    provider_top = sorted(pc.items(), key=lambda x: -x[1])[:8]
-    ap = {}
-    for e in entries:
-        p = e.get("provider") or "unknown"
-        a = e.get("action") or "unknown"
-        ap.setdefault(p, {})
-        ap[p][a] = ap[p].get(a, 0) + 1
-    return {"total": total, "c_allow": c_allow, "c_route": c_route, "c_block": c_block,
-            "c_local": c_local, "c_ext": total - c_local, "c_other": c_other,
-            "override_denied": sum(1 for e in entries if e.get("override_denied")),
-            "fallback": sum(1 for e in entries if (e.get("downgraded_from") or "")),
-            "rule_top": [{"rule": k, "count": v} for k, v in rule_top],
-            "risk_buckets": risk_buckets, "time_slots": slots, "time_counts": counts,
-            "time_route": rout, "time_block": blk,
-            "provider_top": [{"provider": k, "count": v} for k, v in provider_top],
-            "action_provider": {p: dict(a) for p, a in ap.items()}}
-
-
-@app.get("/admin/analytics/data", dependencies=[Depends(admin_page_auth)])
-async def analytics_data(since: Optional[str] = None, until: Optional[str] = None, limit: Optional[int] = None):
-    limit = limit or 5000
-    store = get_audit_store()
-    entries = store.tail(limit)
-    return JSONResponse(_analytics_aggregate(entries, since=since, until=until))
-
-@app.get("/admin/analytics", dependencies=[Depends(admin_page_auth)])
-async def analytics_redirect():
-    """旧可视化 HTML 页已退役，统一跳转 Admin Console SPA。"""
-    return RedirectResponse("/admin/app", status_code=302)
 
 
 from . import admin_api as _admin_api

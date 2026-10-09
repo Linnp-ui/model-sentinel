@@ -1,17 +1,17 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
 import { ReloadOutlined, SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
 import { api, errText, fetchJson, copyText } from '../api.js';
 
 const { Text } = Typography;
 import { ruleZh, RULE_ZH } from '../ruleNames.jsx';
-// ---------------- 审计面板并入（原 /admin /analytics /metrics/panel HTML 页退役迁入） ----------------
 
-const ACTION_BADGE = (a) => (a === 'block' ? <Tag color="red">阻断</Tag>
-  : a === 'route_local' ? <Tag color="orange">本地路由</Tag>
-    : a === 'allow' ? <Tag color="green">放行</Tag> : <Tag>{a || '—'}</Tag>);
-
-const isLocal = (v) => v === true || v === 'true' || v === 1 || v === '1';
+// 动作+规则合并成一列：Tag 底色仍是动作口径，文字是具体规则
+const ACTION_INFO = {
+  block: ['阻断', 'red'],
+  route_local: ['本地路由', 'orange'],
+  allow: ['放行', 'green'],
+};
 
 // L2 展开行：主判定 + laya 影子（shadow_*）。无 L2 的行不可展开。
 // l2 可能是对象（新接口）或字符串（容错），统一归一化再渲染。
@@ -121,20 +121,21 @@ export default function AuditPage() {
 
   const cols = [
     { title: '时间', dataIndex: 'time', width: 165, align: 'center' },
-    { title: '动作', dataIndex: 'action', width: 130, align: 'center',
-      render: (v, rec) => (
-        <Space size={4}>
-          {ACTION_BADGE(v)}
-          {v === 'allow' && isLocal(rec.local) && <Tag color="blue">local</Tag>}
-        </Space>
-      ) },
-    { title: '规则', dataIndex: 'rule', width: 170, ellipsis: true, render: (v) => <Text code title={v || ''}>{ruleZh(v)}</Text> },
+    { title: '动作 / 规则', width: 190, align: 'center', ellipsis: true, className: 'cell-center',
+      render: (_, r) => {
+        const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
+        return (
+          <Tag color={color} title={`动作：${name}｜规则：${r.rule || '—'}`} style={{ marginInlineEnd: 0 }}>
+            {r.rule ? ruleZh(r.rule) : name}
+          </Tag>
+        );
+      } },
     { title: 'Provider', dataIndex: 'provider', width: 110, align: 'center', render: (v) => v || '—' },
-    { title: '模型', dataIndex: 'model', width: 150, align: 'center', ellipsis: true, render: (v) => v || '—' },
+    { title: '模型', dataIndex: 'model', width: 150, align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
     { title: '调用方名称', dataIndex: 'key_name', width: 130, align: 'center',
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
     { title: '客户端 IP', dataIndex: 'client_ip', width: 120, align: 'center', render: (v) => v || '—' },
-    { title: '文件名', dataIndex: 'filename', width: 140, ellipsis: true, render: (v) => v || '—' },
+    { title: '文件名', dataIndex: 'filename', width: 220, ellipsis: true, render: (v) => v || '—' },
     { title: '内容摘要', dataIndex: 'text_preview',
       render: (v) => (
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
@@ -167,14 +168,19 @@ export default function AuditPage() {
         </Space>
       </Card>
       {data && (
-        <Space size="large" wrap>
-          <Statistic data-testid="audit-stat-total" title="命中总数" value={data.total} />
-          <Statistic data-testid="audit-stat-allow" title="放行" value={data.c_allow} valueStyle={{ color: '#52c41a' }} />
-          <Statistic data-testid="audit-stat-route" title="本地路由" value={data.c_route} valueStyle={{ color: '#faad14' }} />
-          <Statistic data-testid="audit-stat-block" title="阻断" value={data.c_block} valueStyle={{ color: '#ff4d4f' }} />
-          <Statistic data-testid="audit-stat-local" title="本地处理" value={data.c_local} />
-          <Statistic data-testid="audit-stat-ext" title="外部处理" value={data.c_ext} />
-        </Space>
+        <>
+          <Space size="large" wrap>
+            <Statistic data-testid="audit-stat-total" title="命中总数" value={data.kpi.total} />
+            <Statistic data-testid="audit-stat-allow" title="放行" value={data.kpi.c_allow} valueStyle={{ color: '#52c41a' }} />
+            <Statistic data-testid="audit-stat-route" title="本地路由" value={data.kpi.c_route} valueStyle={{ color: '#faad14' }} />
+            <Statistic data-testid="audit-stat-block" title="阻断" value={data.kpi.c_block} valueStyle={{ color: '#ff4d4f' }} />
+          </Space>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {data.kpi?.source === 'mysql'
+              ? 'KPI 口径：审计库（近 90 天，跟随筛选条件）；下方列表为 Redis 热窗，最多展示 5000 条，两者独立存储'
+              : 'KPI 口径：Redis 热窗（≤5000 条）；当前筛选（全文/调用方/IP/影子等）无法计入审计库，真值见导出 CSV'}
+          </Text>
+        </>
       )}
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}

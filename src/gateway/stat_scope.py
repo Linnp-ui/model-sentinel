@@ -21,10 +21,10 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 __all__ = ["is_abnormal", "is_blocked", "is_local_route", "resolve_action",
-           "to_local_naive"]
+           "to_beijing", "to_local_naive"]
 
 
 def _norm_action(action) -> str:
@@ -95,3 +95,22 @@ def to_local_naive(dt):
     if dt.tzinfo is not None:
         return dt.astimezone().replace(tzinfo=None)
     return dt
+
+
+def to_beijing(value):
+    """审计时间落库为 UTC（naive），展示时 +8h 对齐北京时间。解析失败原样返回。
+
+    只在**读/展示**路径调用（entries API / CSV 导出 / 分日聚合），存储与
+    since/until 过滤仍按 UTC，避免口径漂移；服务器时区是 UTC，别挪到写路径。
+    接收 datetime 或 str（容忍 'T' 分隔与秒后尾巴）。
+    """
+    if not value:
+        return value
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.strptime(str(value).strip().replace("T", " ")[:19], "%Y-%m-%d %H:%M:%S")
+        return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return value

@@ -59,6 +59,9 @@ class _MySQLWriter:
         self._last_error: Optional[str] = None
         self._has_l2 = False  # audit_logs.l2 列存在性（l2/影子 JSON 落库，见 _ensure_l2_column）
         self._l2_ensure_ts = 0.0
+        # 丢行计数：fail-open 的代价要可观测。每个键只被单一线程写
+        # （disabled/queue_full ← enqueue 所在线程；build/insert/flush ← writer 线程）
+        self._dropped = {"disabled": 0, "queue_full": 0, "build": 0, "insert": 0, "flush": 0}
         self._start()
 
     def _start(self):
@@ -72,6 +75,7 @@ class _MySQLWriter:
                 self._err_count = 0
                 self._disabled_since = None
             else:
+                self._dropped["disabled"] += 1
                 return
         # Note: don't bail on _stop.is_set() — caller may want final flush
         try:
@@ -81,6 +85,7 @@ class _MySQLWriter:
             try:
                 self._q.get_nowait()
                 self._q.put_nowait(entry)
+                self._dropped["queue_full"] += 1
             except Exception:
                 pass
 
@@ -160,20 +165,39 @@ class _MySQLWriter:
         try:
             conn = self._connect()
             with conn.cursor() as cur:
+                rows = []
                 for entry in batch:
                     row = self._row(entry)
                     if row is None:
-                        continue
+                        self._dropped["build"] += 1
+                    else:
+                        rows.append(row)
+                if rows:
                     try:
-                        cur.execute(self._insert_sql(), row)
+                        # pymysql 把单行模板重写为多行 VALUES 并按 max_stmt_length 分块，
+                        # 一批从 ~N 次查询往返降到 ~1 次/块（旧实现逐行 execute）
+                        cur.executemany(self._insert_sql(), rows)
                     except Exception as e:
-                        self._last_error = f"insert failed: {e}"
+                        # 单条坏行会弄挂整条语句 ⇒ 先回滚已执行块（防重复），
+                        # 再逐行兜底，保留「丢坏行、留好行」原语义
+                        self._last_error = f"batch insert failed, per-row fallback: {e}"
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        for row in rows:
+                            try:
+                                cur.execute(self._insert_sql(), row)
+                            except Exception as e2:
+                                self._dropped["insert"] += 1
+                                self._last_error = f"insert failed: {e2}"
                 conn.commit()
             self._err_count = 0
             if self._disabled:
                 self._disabled = False
                 self._disabled_since = None
         except Exception as e:
+            self._dropped["flush"] += len(batch)  # 连接/commit 失败 = 整批不重入，全丢
             self._last_error = f"connect/flush failed: {e}"
             self._err_count += 1
             if self._err_count >= 3:
@@ -253,12 +277,15 @@ class _MySQLWriter:
         retry_in = 0
         if self._disabled and self._disabled_since is not None:
             retry_in = max(0, int(MYSQL_RETRY_INTERVAL - (time.time() - self._disabled_since)))
+        dropped = dict(self._dropped)
+        dropped["total"] = sum(dropped.values())
         return {
             "enabled": not self._disabled,
             "queue_size": self._q.qsize(),
             "last_error": self._last_error,
             "err_count": self._err_count,
             "retry_in": retry_in,
+            "dropped": dropped,
             "cfg": {"host": self.cfg["host"], "port": self.cfg["port"], "database": self.cfg["database"]},
         }
 
@@ -320,25 +347,49 @@ class _MySQLWriter:
             return [{"error": f"query failed: {e}"}]
 
     @staticmethod
-    def cleanup_old(cfg: dict, days: int = 90) -> int:
-        """Delete rows older than N days. Returns row count deleted."""
+    def count(cfg: dict, since: Optional[datetime] = None, until: Optional[datetime] = None,
+              action: Optional[str] = None, rule: Optional[str] = None) -> Optional[dict]:
+        """KPI 真值（审计库口径）：total/allow/route_local/block 单遍聚合。
+
+        block 判式与 main._entry_blocked 同构（stat_scope.is_blocked）：action 以
+        block 开头，或 rule=egress_denied（推断 403）。LIKE 的 % 必须写 %%——pymysql
+        对非空 args 做 query % args 格式化，单 % 会直接 ValueError。失败返回 None，
+        调用方回退热窗口径（fail-open，KPI 不 500）。
+        """
         if pymysql is None:
-            return -1
-        cutoff = datetime.utcnow() - timedelta(days=days)
+            return None
+        sql = ("SELECT COUNT(*) AS total,"
+               " SUM(action = 'allow') AS c_allow,"
+               " SUM(action = 'route_local') AS c_route,"
+               " SUM(action LIKE 'block%%' OR rule = 'egress_denied') AS c_block"
+               " FROM audit_logs WHERE 1=1")
+        args: list = []
+        if since:
+            sql += " AND ts >= %s"
+            args.append(since)
+        if until:
+            sql += " AND ts < %s"
+            args.append(until)
+        if action:
+            sql += " AND action = %s"
+            args.append(action)
+        if rule:
+            sql += " AND rule = %s"
+            args.append(rule)
         try:
             conn = pymysql.connect(
                 host=cfg["host"], port=cfg["port"],
                 user=cfg["user"], password=cfg["password"],
-                database=cfg["database"], connect_timeout=3,
+                database=cfg["database"], connect_timeout=3, read_timeout=5,
+                cursorclass=DictCursor,
             )
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM audit_logs WHERE ts < %s", (cutoff,))
-                deleted = cur.rowcount
-            conn.commit()
+                cur.execute(sql, args)
+                row = cur.fetchone()
             conn.close()
-            return deleted
         except Exception:
-            return -1
+            return None
+        return {k: int(v or 0) for k, v in row.items()}
 
 
 class AuditStore:
@@ -363,8 +414,15 @@ class AuditStore:
         self._r_disabled_since: Optional[float] = None
         self._mysql_writer: Optional[_MySQLWriter] = None
         self._mysql_cfg: Optional[dict] = None
+        self._mysql_want = False            # URL 有效（连接失败时值得重试）
+        self._mysql_init_error: Optional[str] = None
         self._try_connect_redis()
         self._try_connect_mysql()
+        if self._mysql_want and self._mysql_writer is None:
+            # 启动时 MySQL 不在线：旧代码 writer 整个进程生命周期缺失（静默到重启）。
+            # 后台 60s 一重试，DB 恢复后审计落库自动接上
+            threading.Thread(target=self._mysql_retry_loop,
+                             name="audit-mysql-retry", daemon=True).start()
         if self._r is not None:
             try:
                 self._backfill_from_redis()
@@ -397,6 +455,7 @@ class AuditStore:
         cfg = _parse_mysql_url(url)
         if not cfg or not cfg.get("database"):
             return
+        self._mysql_want = True
         try:
             conn = pymysql.connect(
                 host=cfg["host"], port=cfg["port"],
@@ -406,9 +465,22 @@ class AuditStore:
             conn.close()
             self._mysql_cfg = cfg
             self._mysql_writer = _MySQLWriter(cfg)
-        except Exception:
+            self._mysql_init_error = None
+        except Exception as e:
             self._mysql_cfg = None
             self._mysql_writer = None
+            self._mysql_init_error = repr(e)
+
+    def _mysql_retry_loop(self):
+        while True:
+            time.sleep(MYSQL_RETRY_INTERVAL)
+            if self._mysql_writer is not None:
+                return
+            self._try_connect_mysql()
+            if self._mysql_writer is not None:
+                print(f"[audit_store] mysql writer recovered: "
+                      f"{self._mysql_cfg['host']}:{self._mysql_cfg['port']}/{self._mysql_cfg['database']}")
+                return
 
     def _backfill_from_redis(self):
         try:
@@ -521,7 +593,9 @@ class AuditStore:
     def backend(self) -> str:
         parts = []
         if self._r is not None:
-            parts.append(f"redis ({self._r_url})")
+            _u = urlsplit(self._r_url or "")
+            _hp = (_u.hostname or "") + (f":{_u.port}" if _u.port else "")
+            parts.append(f"redis ({_u.scheme}://{_hp}{_u.path})")
         elif self._r_disabled:
             retry_in = 0
             if self._r_disabled_since is not None:
@@ -541,6 +615,10 @@ class AuditStore:
 
     def mysql_status(self) -> dict:
         if self._mysql_writer is None:
+            if self._mysql_want:
+                return {"enabled": False,
+                        "reason": f"connect failed, retrying every {int(MYSQL_RETRY_INTERVAL)}s: "
+                                  f"{self._mysql_init_error}"}
             return {"enabled": False, "reason": "AUDIT_MYSQL_URL not set or pymysql not installed"}
         return self._mysql_writer.status()
 
@@ -551,11 +629,12 @@ class AuditStore:
             return []
         return _MySQLWriter.query(self._mysql_cfg, since, until, action, rule, type_, limit)
 
-    def cleanup_old(self, days: int = 90) -> int:
+    def count_mysql(self, since: Optional[datetime] = None, until: Optional[datetime] = None,
+                    action: Optional[str] = None, rule: Optional[str] = None) -> Optional[dict]:
+        """审计库 KPI 聚合（未配 MySQL 或查询失败 → None，调用方回退热窗口径）。"""
         if self._mysql_cfg is None:
-            return -1
-        return _MySQLWriter.cleanup_old(self._mysql_cfg, days)
-
+            return None
+        return _MySQLWriter.count(self._mysql_cfg, since, until, action, rule)
 
 
 _store: Optional[AuditStore] = None

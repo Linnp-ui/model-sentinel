@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { AutoComplete, Input, InputNumber, Modal, Form, Select, message } from 'antd';
 import { api, errText } from '../api.js';
 

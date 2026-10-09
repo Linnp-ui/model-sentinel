@@ -6,10 +6,11 @@ var/
 .env
 .env.*
 !.env.example
-_backup/
 *.log
-*.log.*
 .pytest_cache/
+# logrotate 轮转产物（/etc/logrotate.d/gateway，copytruncate + compress）
+*.log.[0-9]*
+*.log.[0-9]*.gz
 __pycache__/
 *.pyc
 node_modules/

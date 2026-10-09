@@ -12,7 +12,7 @@ status 口径不变），仍然零真实出境。local provider 本就走 OLLAMA
 """
 import os
 
-os.environ.setdefault("AI_GATEWAY_DEV_API_KEY", "pk_live_dev_changeme,sk_test_dummy0123456789abcdef0123456789abcdef01")
+os.environ.setdefault("AI_GATEWAY_DEV_API_KEY", "pk_live_dev_changeme,sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o")
 os.environ.setdefault("OLLAMA_MOCK", "true")
 os.environ.setdefault("SMALL_MODEL_ENABLED", "false")
 os.environ.setdefault("AI_GATEWAY_ADMIN_IP_ALLOWLIST", "127.0.0.1,::1,testclient")
@@ -46,7 +46,7 @@ def _register_test_keys():
     from src.gateway.admin_store import get_admin_store
     store = get_admin_store()
     for key, name in [
-        ("sk_test_dummy0123456789abcdef0123456789abcdef01", "pytest"),
+        ("sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o", "pytest"),
         ("pk_live_dev_changeme", "pytest-dev"),
     ]:
         try:

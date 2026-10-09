@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from src.gateway.main import app
 
 client = TestClient(app)
-KEY = "sk_test_dummy0123456789abcdef0123456789abcdef01"
+KEY = "sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o"
 H = {"Authorization": f"Bearer {KEY}"}
 
 def test_chat_allow():
@@ -397,6 +397,69 @@ def test_window_thresholds_parse_and_pick(monkeypatch):
     m3 = ss._window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20)
     assert m3 == {"*": 20}
 
+def test_l2_gray_trigger_no_upper_bound_on_risk():
+    # 回归（2026-09-30）：灰区上界曾是 `risk_score < 60`，但 risk_score 混了关键词分，
+    # 而唯一按分值判的 policy 规则读的是 weighted_pii_score（不含关键词分）。
+    # => 「关键词堆叠到 >=60」既超灰区上界（L2 不触发）又匹配不上 priority 5（L1 放行），
+    #    两条路都漏，内容直出外网。实测「工资 薪资 奖金」kw=60 直出 deepseek，
+    #    而单词「机密」kw=30 转内网 —— 堆得越多越危险。
+    # 现在只保留下限，上界交给 policy 的 action != allow 承担。
+    from src.gateway.inspection import inspect_text
+    from src.gateway.main import _l2_gray_trigger
+
+    # 关键词堆叠到 >=60：必须仍进 L2（这是本测试的核心断言）
+    for t in ("工资 薪资 奖金", "机密 保密 绝密 不得外传", "预算 决算 合同 投标 中标 报价 单价"):
+        f = inspect_text(t)
+        assert f["weighted_pii_score"] == 0, f"{t}: 用例前提失效（竟有 PII）"
+        assert f["risk_score"] >= 60, f"{t}: 用例前提失效（risk 未过 60）"
+        assert _l2_gray_trigger(f) is True, f"{t}: 关键词堆叠未进 L2 门 —— 内容会出境"
+
+    # 低于下限的正常流量不进 L2（避免无谓开销）
+    for t in ("总结CAP定理", "今天天气如何", "报销流程怎么走"):
+        assert _l2_gray_trigger(inspect_text(t)) is False, f"{t}: 正常流量被误送 L2"
+
+    # 边界：恰好等于下限要进
+    assert _l2_gray_trigger({"risk_score": 20}) is True
+    assert _l2_gray_trigger({"risk_score": 19}) is False
+
+    # PII>=60 不依赖灰区：priority 5 已判 route_local，门的 action 条件会先拦下。
+    # 这条断言防止有人「顺手」把上界加回来（对 PII 是死代码，对关键词是漏洞）。
+    from src.gateway.policy import load_policy, decide
+    f = inspect_text("我的身份证110101199003072519")
+    assert f["weighted_pii_score"] >= 60
+    assert decide(load_policy(), {"text": "x", "file": {}, "findings": f,
+                                  "session": {}, "tainted_file": {}}).action == "route_local"
+
+def test_l1_rules_catch_obfuscated_negative_samples():
+    # 回归（2026-10-08）：160 条矩阵里 7 条机密样本 L1 risk=0，L2 压根不被调用，直接出境。
+    # 网关门逻辑不动，只补 L1 特征（RISK_RULES，各 20 档 = 恰好落灰区下界交 L2 判密）。
+    from src.gateway.inspection import RISK_RULES, inspect_text
+    from src.gateway.main import _l2_gray_trigger
+
+    negatives = [
+        "听说奚霞涨到38000了,真的假的",
+        "那个数你懂的,奚霞那个38后面加个k",
+        "上季度的那个数,11后面六个零,你懂的",
+        "图上那个数,C后面35,你懂的",
+        "会上定的那个月数,2加13,你懂的",
+        "我 g 资 daoshou 12k,惨",
+        "确认下:老板周三下午3点见红杉的人,行程没变吧",
+    ]
+    for t in negatives:
+        f = inspect_text(t)
+        assert f["risk_score"] >= 20, f"{t}: L1 仍零特征 —— 会直出外网"
+        assert _l2_gray_trigger(f) is True, f"{t}: 未进 L2 门"
+
+    # 规则各只计一次，不因重复出现放大
+    assert inspect_text(negatives[1])["keyword_hits"].count("implied_amount") == 1
+
+    # pass 侧不被误伤进直转本地；只与"行程"同现、无职务的不算高管行程
+    for t in ("行程单私发我,别发群里", "工资一般是每月几号发放,遇到节假日会提前吗",
+              "报价的事会上定,现在不说", "总结一下这段公开财报:营收同比增长,研发投入加大"):
+        assert inspect_text(t)["risk_score"] < 60, f"{t}: 被误判直转本地"
+    assert "exec_schedule" not in inspect_text("行程单私发我,别发群里")["keyword_hits"]
+    assert set(RISK_RULES) <= {"implied_amount", "raise_amount", "salary_pinyin", "exec_schedule"}
+
 def test_l2_config_suggest_window_roundtrip(tmp_path, monkeypatch):
     # /l2-config：两项阈值按窗口 {24/168/720} 存取；PUT 传 dict → env '24:20,168:100,720:500'
     import os
@@ -524,6 +587,54 @@ def test_audit_entries_show_key_name():
     assert d["entries"], "token=pytest 应按调用方名称命中"
     assert any(e.get("key_name") == "pytest" and e.get("token_masked") == mask_key(KEY) for e in d["entries"])
 
+def test_audit_entries_kpi_from_mysql(monkeypatch):
+    # 筛选可用 SQL 表达时，KPI 走审计库真值；顶层 total/pages 仍是热窗口径（分页不受影响）
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    monkeypatch.setattr(store, "count_mysql",
+                        lambda **kw: {"total": 4402, "c_allow": 4000, "c_route": 398, "c_block": 4})
+    d = client.get("/admin/audit/entries").json()
+    assert d["kpi"]["source"] == "mysql"
+    assert d["kpi"]["total"] == 4402 and d["kpi"]["c_allow"] == 4000 and d["kpi"]["c_block"] == 4
+    assert d["kpi"]["c_other"] == 4402 - 4000 - 398 - 4
+    assert d["total"] <= 5000 and d["pages"] <= 100
+
+def test_audit_entries_kpi_window_fallback(monkeypatch):
+    # q/ip/token/provider/shadow 筛选推不进 SQL → 回退热窗口径（审计库值可用也不用）
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    monkeypatch.setattr(store, "count_mysql",
+                        lambda **kw: {"total": 9999, "c_allow": 9999, "c_route": 0, "c_block": 0})
+    d = client.get("/admin/audit/entries", params={"q": "x"}).json()
+    assert d["kpi"]["source"] == "window"
+    assert d["kpi"]["total"] == d["total"]
+
+def test_audit_count_sql_and_failopen(monkeypatch):
+    # count SQL 形状（block 口径 = block% 或 egress_denied；LIKE 用 %%）+ 连接失败 fail-open 返 None
+    import datetime as dt
+    from src.gateway import audit_store
+    captured = {}
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args): captured["sql"], captured["args"] = sql, args
+        def fetchone(self): return {"total": 10, "c_allow": 8, "c_route": 1, "c_block": 1}
+    class _Conn:
+        def cursor(self): return _Cur()
+        def close(self): pass
+    class _PM:
+        @staticmethod
+        def connect(**kw):
+            if kw.get("database") == "boom": raise RuntimeError("down")
+            return _Conn()
+    monkeypatch.setattr(audit_store, "pymysql", _PM)
+    cfg = {"host": "h", "port": 3306, "user": "u", "password": "p", "database": "d"}
+    r = audit_store._MySQLWriter.count(cfg, since=dt.datetime(2026, 1, 1), action="allow")
+    assert r == {"total": 10, "c_allow": 8, "c_route": 1, "c_block": 1}
+    assert "FROM audit_logs" in captured["sql"] and "block%%" in captured["sql"]
+    assert captured["args"][0] == dt.datetime(2026, 1, 1) and captured["args"][-1] == "allow"
+    assert audit_store._MySQLWriter.count({**cfg, "database": "boom"}) is None
+
 def test_window_cache_dedupes_concurrent_fetches():
     # 统计页 7 端点同秒并发同窗口：应只打一次 DB（8→1），跨窗重取
     import threading
@@ -613,6 +724,38 @@ def test_stats_summary_equivalent_to_individual_funcs():
     assert _ss._price_billing(d["billing"], d["billing_daily"], 168) == \
         _ss._price_billing(store.stats_billing(s, u), store.stats_billing_daily(s, u), 168)
 
+def test_stats_timeseries_counts_overlapping_local_and_block_separately():
+    # 回归 2026-10-09：loc/blk 曾用 elif 互斥，而 stats_overview 的 SQL 侧是两条
+    # 独立 sum(case) —— 一行同时命中两种口径时趋势图少算一笔，与概览打架。
+    # 生产实测 route_local 行 status_code 恒 200（两套口径当前相等），
+    # 但口径必须同构，否则哪天出现 route_local+403 就静默少算。
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    seed = lambda **kw: store.insert_request_log({
+        "key_name": "pytest-overlap", "action": "allow", "model": "ov-model",
+        "provider": "ov-prov", "client_ip": "8.8.8.8", "status_code": 200,
+        "prompt_tokens": 0, "completion_tokens": 0, "duration_ms": 10, **kw})
+    ts = "2026-09-20 15:00:00"
+    seed(ts=ts, action="allow")                                  # 纯放行
+    seed(ts=ts, action="block", blocked_reason="l1:ov-rule")# 纯拦截
+    seed(ts=ts, action="route_local")                       # 纯本地路由
+    s, u = "2020-01-01 00:00:00", "2030-01-01 00:00:00"
+    # 同 session 共用 memory store，别的用例也会 seed route_local/block 行落进同一宽窗口，
+    # 所以断言「自己 4 条的相对差值」，不写绝对数（踩过：写死 2 结果读到别的用例的 3）
+    base_r = sum(store.stats_timeseries(s, u)["routes"])
+    base_b = sum(store.stats_timeseries(s, u)["blocks"])
+    base_c = sum(store.stats_timeseries(s, u)["counts"])
+    seed(ts=ts, action="route_local", status_code=403)            # 同时命中两种口径
+    for d in (store.stats_timeseries(s, u), store.stats_summary(s, u)["timeseries"]):
+        # 差值都是 1：这行必须同时进 routes 和 blocks。elif 口径下 blocks 差值会是 0
+        assert sum(d["routes"]) - base_r == 1, f"重叠行须计入本地路由：{d['routes']}"
+        assert sum(d["blocks"]) - base_b == 1, f"重叠行须计入拦截：{d['blocks']}"
+        assert sum(d["counts"]) - base_c == 1
+    ov = store.stats_overview(s, u)
+    ts_ = store.stats_timeseries(s, u)
+    assert (ov["local_routed"], ov["blocked"]) == (sum(ts_["routes"]), sum(ts_["blocks"])), \
+        "概览与趋势的本地路由/拦截口径必须一致"
+
 def test_stats_chart_series_buckets():
     # 总览折线图分桶：计数/QPS/分位同桶；gi=0 计次不计分位；空桶 qps=0/分位 None
     # 窗口取 2030（其他用例 seed 全在 2026，零碰撞）
@@ -686,13 +829,8 @@ def test_admin_metrics_timeseries_shape():
     assert "l2_up" in d["panel"] and "ring" in d["panel"]
 
 
-def test_l2_shadow_trend_and_divergences_shape():
-    # 测试环境无 audit MySQL（l2 列无落库数据）→ 验端点形状/桶数/导出 content-type
-    r = client.get("/admin/api/l2-shadow-trend", params={"hours": 24})
-    assert r.status_code == 200
-    d = r.json()
-    assert d["hours"] == 24 and len(d["buckets"]) == 25
-    assert {"t", "l2_total", "shadowed", "compared", "agree", "cc", "cn", "nc", "nn"} <= set(d["buckets"][0])
+def test_l2_divergences_shape():
+    # 测试环境无 audit MySQL（l2 列无落库数据）→ 验端点形状/导出 content-type
     r2 = client.get("/admin/api/l2-divergences", params={"hours": 24, "cell": "nc"})
     assert r2.status_code == 200
     assert {"hours", "total", "items"} <= set(r2.json())
@@ -1035,18 +1173,6 @@ def test_div_group_key_ignores_direction():
     assert _div_group_key(a) != _div_group_key(c)
 
 
-def test_l2_shadow_samples_shape():
-    """逐条明细：agree/cell 形状 + 窗口上限 24h（分桶端点保留但前端不用了）"""
-    r = client.get("/admin/api/l2-shadow-samples", params={"hours": 999})
-    assert r.status_code == 200
-    d = r.json()
-    assert d["hours"] == 24
-    for it in d["items"]:
-        assert it["main"] in ("CONFIDENTIAL", "NORMAL") and it["shadow"] in ("CONFIDENTIAL", "NORMAL")
-        assert it["agree"] == (it["main"] == it["shadow"])
-        assert it["cell"] == ("" if it["agree"] else ("nc" if it["main"] == "NORMAL" else "cn"))
-
-
 def test_l2_round_marker_and_since_window():
     """轮次标记 + since 窗口：since 起点优先于 hours（不然两轮灌数同窗 → dup×2）"""
     import src.gateway.admin_api as aa
@@ -1115,3 +1241,182 @@ def test_divergence_regression_dedup_and_want(monkeypatch):
     assert d["missed"][0]["want"] == 1 and d["missed"][0]["got"] == 0
     assert d["missed"][0]["dup"] == 2
     assert d["unmatched"] == 1
+
+
+def test_l1_match_types_new_ops():
+    """5.2 新增匹配类型：枚举 in/枚举皆非/布尔开关/时段区间 + 引擎 != 运算符。
+
+    回归点：(1) 新运算符在 _eval_cond 里真的生效（不是静默失效）；
+            (2) build_when 产出的 when 结构能被 decide() 直接消费。
+    """
+    from src.gateway.policy import _match_when
+    from src.gateway import policy_admin
+
+    ctx = {
+        "model": "ext-flash",
+        "client": {"key": "workbuddy"},
+        "time": {"hour": 23},
+        "session": {"confidential": False},
+        "findings": {"parse_failed": True},
+    }
+    # 枚举任一 / 枚举皆非（大小写与空格不敏感）
+    assert _match_when(policy_admin.build_when("model", "in", "ext-flash, qwen3"), ctx)
+    assert not _match_when(policy_admin.build_when("model", "not_in", "ext-flash, qwen3"), ctx)
+    assert _match_when(policy_admin.build_when("client", "not_in", "ccswitch, codex"), ctx)
+    # 布尔开关（文本别名 1/true/是 皆真，其余假）
+    assert _match_when(policy_admin.build_when("parse_failed", "bool", "是"), ctx)
+    assert not _match_when(policy_admin.build_when("session_confidential", "bool", "true"), ctx)
+    # 时段区间：22-6 跨午夜 -> any（23 点命中）；9-18 同日 -> all（23 点不命中）
+    assert _match_when(policy_admin.build_when("prompt", "hour_range", "22-6"), ctx)
+    assert not _match_when(policy_admin.build_when("prompt", "hour_range", "9-18"), ctx)
+    # 引擎 != （手写 when，UI 造的类型只有 not_in）
+    assert _match_when({"model !=": "ccswitch"}, ctx)
+    assert not _match_when({"model !=": "ext-flash"}, ctx)
+    # 老运算符不受影响（!= 插入不得抢 ==/>=/contains_any 的匹配）
+    assert _match_when({"model ==": "ext-flash"}, ctx)
+    assert _match_when({"time.hour >=": 22}, ctx)
+    assert _match_when({"model contains_any": ["flash"]}, ctx)
+    # 非法输入要报出来，不能静默产出永不命中的规则
+    import pytest as _pytest
+    for bad in [("model", "in", ""), ("prompt", "hour_range", "22"), ("prompt", "hour_range", "8-8"),
+                ("prompt", "hour_range", "9-99"), ("nope", "in", "x")]:
+        with _pytest.raises(ValueError):
+            policy_admin.build_when(*bad)
+    # 白名单必须跟着映射表走（BuildWhenReq 的 pattern 曾与映射表脱钩 ⇒ 新类型全被 422 挡掉）
+    for ct, mt, mv in [("model", "in", "a,b"), ("client", "not_in", "c"),
+                       ("parse_failed", "bool", "true"), ("prompt", "hour_range", "22-6")]:
+        r = client.post("/admin/api/policies/build-when",
+                        json={"content_type": ct, "match_type": mt, "match_value": mv})
+        assert r.status_code == 200, f"{ct}/{mt} 被 BuildWhenReq 挡掉: {r.text}"
+    assert client.post("/admin/api/policies/build-when",
+                       json={"content_type": "nope", "match_type": "in",
+                             "match_value": "x"}).status_code == 422
+    assert client.post("/admin/api/policies/build-when",
+                       json={"content_type": "model", "match_type": "nope",
+                             "match_value": "x"}).status_code == 422
+
+
+def test_match_choices_reject_never_matching_combos():
+    """构造器不再拼笛卡尔积：布尔字段配正则/包含会产出永不命中的 when。
+
+    实测 12 内容类型 × 7 匹配类型 = 66 种组合里 10 种是这种静默失效
+    （session.confidential matches_regex 之类，引擎恒 False，保存成功、
+    干跑通过、线上永不触发）。现在这类组合在 build_when 层就拒。
+    """
+    from src.gateway import policy_admin
+    import pytest
+
+    bool_fields = ("session_confidential", "tainted_file", "unparsed_binary",
+                   "parse_failed", "ocr_empty")
+    for ct in bool_fields:
+        for mt in ("regex", "contains", "in", "not_in"):
+            assert not policy_admin.match_pair_ok(ct, mt), f"{ct}/{mt} 会静默产出永不命中的规则"
+            with pytest.raises(ValueError):
+                policy_admin.build_when(ct, mt, "x")
+    # 合法组合不许被误伤（含 self-field 的 size / hour_range 不绑内容类型）
+    for ct, mt in policy_admin.MATCH_PAIRS:
+        assert policy_admin.match_pair_ok(ct, mt)
+    for mt in ("size", "hour_range"):
+        assert policy_admin.match_pair_ok("prompt", mt)
+    # 前端下拉的数据源与后端唯一真源一致：每个 choice 都能真的构造出 when
+    r = client.get("/admin/api/policies/match-choices")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["choices"] and d["self_field"]
+    for c in d["choices"] + d["self_field"]:
+        assert policy_admin.match_pair_ok(c["content_type"], c["match_type"]), c
+        assert c["key"] == f'{c["content_type"]}|{c["match_type"]}', c
+        assert c["label"]
+    # 前端拿到的组合走 build-when 必须 200（不会再有 422 的下拉项）
+    for c in d["choices"][:4] + d["self_field"]:
+        rr = client.post("/admin/api/policies/build-when",
+                         json={"content_type": c["content_type"], "match_type": c["match_type"],
+                               "match_value": "1" if c["match_type"] == "size" else
+                                              ("22-6" if c["match_type"] == "hour_range" else "x")})
+        assert rr.status_code == 200, f"{c['key']} 在下拉里但 build-when 报 {rr.status_code}: {rr.text}"
+
+
+def test_parse_when_roundtrip_and_switch_rules():
+    """parse_when 是 build_when 的逆：编辑已有规则时把 when 预填回构造器。
+
+    回归点：(1) build_when 产物能逆解析回等价构造器控件值；
+            (2) policy.yaml 里值嵌 key 的开关规则（"session.confidential == true": true）能识别；
+            (3) 认不出的形状（多条件 / != / 非开关 == / 裸 client 字段）返回 None，
+                调用方保持构造器空白——绝不拿默认值去覆盖用户已写好的 when。
+    """
+    from src.gateway import policy_admin
+
+    # build_when -> parse_when 往返
+    for args in [("model", "in", "a, b"), ("prompt", "regex", "AKIA"),
+                 ("prompt", "contains", "x,y"), ("client", "not_in", "ccswitch, codex"),
+                 ("session_confidential", "bool", "是"), ("parse_failed", "bool", "false")]:
+        w = policy_admin.build_when(*args)
+        p = policy_admin.parse_when(w)
+        assert p, f"build_when 产物无法逆解析: {w}"
+        assert p["content_type"] == args[0] and p["match_type"] == args[1], (args, p)
+    # 列表值回成逗号分隔串
+    assert policy_admin.parse_when({"model in": ["a", "b"]})["match_value"] == "a, b"
+    # policy.yaml 值嵌 key 的开关规则（引擎只取 dict value）
+    p = policy_admin.parse_when({"any": [{"session.confidential == true": True}]})
+    assert p == {"content_type": "session_confidential", "match_type": "bool", "match_value": "true"}
+    assert policy_admin.parse_when({"tainted_file.hit == true": True})["content_type"] == "tainted_file"
+    assert policy_admin.parse_when({"findings.parse_failed == false": False})["match_value"] == "false"
+    # self-field：文件大小
+    assert policy_admin.parse_when({"file.size >=": 100})["match_type"] == "size"
+    # 认不出 -> None（保持空白，不覆盖）
+    for w in (
+        {"any": [{"session.confidential == true": True}, {"tainted_file.hit == true": True}]},  # 多条件
+        {"model !=": "x"},        # 无构造器等价物
+        {"model ==": "x"},        # 非开关字段的 ==
+        {"client not_in": ["x"]},  # 裸 client（构造器写的是 client.key）
+        "always", None, {"when": 1},
+    ):
+        assert policy_admin.parse_when(w) is None, w
+    # 端点
+    r = client.post("/admin/api/policies/parse-when",
+                    json={"when": {"any": [{"tainted_file.hit == true": True}]}})
+    assert r.status_code == 200 and r.json()["parsed"]["content_type"] == "tainted_file"
+    assert client.post("/admin/api/policies/parse-when", json={"when": "always"}).json()["parsed"] is None
+
+
+def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
+    """规则测试区（干跑）不再对 model/client.key/time.hour 假阴性。
+
+    这三个字段 2026-10-08 进 ctx 与 build_when，但 test_rule 曾恒填空 ⇒
+    按模型/客户端/时段写的规则在干跑里永远不命中，看着像「规则没生效」。
+    """
+    from src.gateway import policy_admin
+    from src.gateway.policy import invalidate_policy_cache
+
+    pol = tmp_path / "policy_test_dryrun.yaml"
+    pol.write_text(
+        "policies:\n"
+        "  - name: dryrun-model\n    priority: 5\n    action: block\n"
+        "    when:\n      any:\n      - model in: [ext-flash]\n"
+        "  - name: dryrun-hour\n    priority: 6\n    action: block\n"
+        # 注意必须写 ">=: 22"：裸的 "- time.hour >= 22" 会被 YAML 解析成字符串
+        # 列表元素，_eval_cond 拿到 str 会 AttributeError（生产 policy.yaml 同理）
+        "    when:\n      any:\n      - time.hour >=: 22\n"
+        "  - name: base-allow\n    priority: 100\n    action: allow\n    when: always\n",
+        encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(pol))
+    invalidate_policy_cache()
+
+    r = client.post("/admin/api/policies/test",
+                    json={"text": "无关内容", "model": "ext-flash"})
+    assert r.status_code == 200, r.text
+    assert r.json()["rule"] == "dryrun-model", r.text
+
+    r = client.post("/admin/api/policies/test",
+                    json={"text": "无关内容", "model": "qwen3", "hour": 23})
+    assert r.json()["rule"] == "dryrun-hour", r.text
+
+    r = client.post("/admin/api/policies/test",
+                    json={"text": "无关内容", "model": "qwen3", "hour": 10})
+    assert r.json()["rule"] == "base-allow", r.text
+
+    # hour 越界要 422，别默默当 0 点用
+    assert client.post("/admin/api/policies/test",
+                       json={"text": "x", "hour": 24}).status_code == 422
+    # hour 缺省 = 当前小时（服务端回落，不是 0）
+    assert client.post("/admin/api/policies/test", json={"text": "x"}).status_code == 200

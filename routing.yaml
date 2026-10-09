@@ -1,3 +1,15 @@
+# 路由声明：审查通过后请求发到哪个上游。mtime 热重载，改完不用重启；
+# 改完建议先在管理台诊断页 route-inspect 干跑验证。
+# routing 段：
+#   default_external   放行请求的默认外网目标（须为 providers 段里 local: false 的名字）
+#   default_local      判密降级目标（route_local / block 后 fallback 都走它）
+#   default_embedding  /v1/embeddings 目标
+#   on_block           命中 block 规则后：fallback_local=降级本地继续（默认）| reject=直接 403
+#   on_missing_key     上游 provider 没配 key 时：mock=返回假答案（仅开发）| reject=503（生产）
+# providers 段：每个上游一条
+#   base_url     支持 ${ENV} / ${ENV:默认值} 占位符，从 .env 解析
+#   api_key_env  密钥所在环境变量名（本文件不存 key 明文）
+#   local: true  标记内网模型（内容不出境）
 routing:
   default_external: deepseek
   default_local: vllm_local

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 from src.gateway.main import app
 
 client = TestClient(app)
-KEY = "sk_test_dummy0123456789abcdef0123456789abcdef01"
+KEY = "sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o"
 H = {"Authorization": f"Bearer {KEY}"}
 H_X = {"x-api-key": KEY}
 
@@ -445,6 +445,23 @@ def test_responses_audit_preview_codex_slim():
     assert _audit_preview_responses({"input": [{"role": "user", "content": title}]}, "") == "把这段代码改成 Rust"
     assert _audit_preview_responses({"input": "总结一下 CAP 定理"}, "") == "总结一下 CAP 定理"
 
+def test_chat_audit_preview_strips_client_envelope():
+    """workbuddy/codex 客户端样板信封不进摘要：留真问题，不留 OS 版本/工作区路径"""
+    from src.gateway.main import _extract_chat_bundle
+    env = ("<system-reminder data-role=\"user-context\">\n<user_info>\nOS Version: win32\n"
+           "Workspace Folder: C:\\Users\\jiang\\WorkBuddy\\x\n</user_info>\n</system-reminder>\n\n"
+           "帮我核对 9 月工资表.xlsx 的实发合计")
+    b = _extract_chat_bundle([{"role": "user", "content": env}])
+    assert b["audit_preview"] == "帮我核对 9 月工资表.xlsx 的实发合计"
+    q = _extract_chat_bundle([{"role": "user", "content":
+        "<user_query>文件路径：E:\\task1\\追踪表.xlsx\n用户输入：问题归属最多的是哪个机器\n"
+        "当前时间：2026-09-20 11:20:26 GMT+8\n期望返回：按产品名称统计</user_query>"}])
+    assert q["audit_preview"] == "问题归属最多的是哪个机器"
+    assert _extract_chat_bundle([{"role": "user", "content": "<session>\nA\nB\n</session>"}])["audit_preview"] == "A\nB"
+    # 无信封的普通文本原样（认不出不丢内容）
+    assert _extract_chat_bundle([{"role": "user", "content": "帮我看看 2026年3月工资表.xlsx"}])["audit_preview"] \
+        == "帮我看看 2026年3月工资表.xlsx"
+
 def test_file_docx_financial():
     """docx 薪资表（含有效身份证→ pii 先命中，生产顺序 pii_weighted 在前；_sniff_ooxml 分流，PK 头不误判 xlsx）"""
     from docx import Document
@@ -693,29 +710,18 @@ def test_bridge_unique_response_id(monkeypatch):
 
 # ---------- 17. 审计时间展示 +8h 对齐北京时间 ----------
 def test_to_beijing():
-    from src.gateway import main as _main
+    from src.gateway.stat_scope import to_beijing
     # UTC 字符串 -> +8h
-    assert _main._to_beijing("2026-09-20 05:36:48") == "2026-09-20 13:36:48"
+    assert to_beijing("2026-09-20 05:36:48") == "2026-09-20 13:36:48"
     # 跨天
-    assert _main._to_beijing("2026-09-20 20:00:00") == "2026-09-21 04:00:00"
+    assert to_beijing("2026-09-20 20:00:00") == "2026-09-21 04:00:00"
     # datetime 对象
     import datetime as _dt
-    assert _main._to_beijing(_dt.datetime(2026, 9, 20, 16, 0, 0)) == "2026-09-21 00:00:00"
+    assert to_beijing(_dt.datetime(2026, 9, 20, 16, 0, 0)) == "2026-09-21 00:00:00"
     # 空/非法原样返回
-    assert _main._to_beijing("") == ""
-    assert _main._to_beijing(None) is None
-    assert _main._to_beijing("not-a-time") == "not-a-time"
-
-def test_ts_beijing_request_log():
-    from src.gateway import admin_store as _st
-    # UTC 字符串 -> +8h
-    assert _st._ts_beijing("2026-09-20 05:36:48") == "2026-09-20 13:36:48"
-    # datetime 对象
-    import datetime as _dt
-    assert _st._ts_beijing(_dt.datetime(2026, 9, 20, 20, 0, 0)) == "2026-09-21 04:00:00"
-    # 空/非法原样
-    assert _st._ts_beijing("") == ""
-    assert _st._ts_beijing("bad") == "bad"
+    assert to_beijing("") == ""
+    assert to_beijing(None) is None
+    assert to_beijing("bad") == "bad"
 
 # ---------- 18. KEY 身份按 kid 而非 name（改名不重写历史，读时 join 当前名） ----------
 def test_key_identity_by_kid_not_name():

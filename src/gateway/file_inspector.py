@@ -31,6 +31,19 @@ _MAGIC = (
 )
 
 
+_ZIP_BOMB_CAP = int(os.getenv("AI_GATEWAY_ZIP_BOMB_CAP", str(300 * 1024 * 1024)))
+
+
+def _zip_uncompressed_ok(data: bytes) -> bool:
+    """docx/xlsx 是 zip：展开后总量超 cap 视为炸弹，拒绝解析。"""
+    try:
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return sum(i.file_size for i in z.infolist()) <= _ZIP_BOMB_CAP
+    except Exception:
+        return True
+
+
 def _sniff_ooxml(data: bytes) -> str:
     """PK 头 → ooxml 子类型。认不出 / 坏 zip 时回 'xlsx'（保持旧语义，交给解析失败兜底）。"""
     try:
@@ -449,6 +462,8 @@ def inspect_excel(data: bytes, filename: str) -> Dict[str, Any]:
     tables: List[Dict] = []
     try:
         import openpyxl
+        if not _zip_uncompressed_ok(data):
+            return {"text": "[xlsx_rejected: uncompressed size exceeds cap]", "markdown": "", "findings": {"text_preview": "", "has_drawing_keyword": False, "char_count": 0}, "sheet_names": [], "headers": [], "chunks": []}
         wb = openpyxl.load_workbook(io.BytesIO(data), read_only=False, data_only=True)
         sheet_names = wb.sheetnames
         for ws in wb.worksheets:
@@ -562,6 +577,8 @@ def inspect_docx(data: bytes, filename: str) -> Dict[str, Any]:
     text = ""
     try:
         import docx
+        if not _zip_uncompressed_ok(data):
+            return {"text": "[docx_rejected: uncompressed size exceeds cap]", "markdown": "", "findings": {"text_preview": "", "has_drawing_keyword": False, "char_count": 0}, "chunks": []}
         doc = docx.Document(io.BytesIO(data))
         for p in doc.paragraphs[:200]:
             text += p.text + "\n"

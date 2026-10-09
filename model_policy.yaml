@@ -1,3 +1,8 @@
+# 模型策略：mtime 热重载，改完不用重启。
+# external_candidates  外网候选池：按 (rank, 价格) 升序切换，rank 小者优先
+# internal_models      内网模型登记（展示 + route_local 降级目标）
+# model_limits         模型级限流（RPM）；load_balance_mode 当前只支持 none
+# review_model         L2 审查模型：threshold=判密阈值（运行时可调），scopes=送审文本范围
 model_policy:
   external_candidates:
   - provider: deepseek

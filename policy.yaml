@@ -1,3 +1,11 @@
+# L1 规则集：按 priority 升序匹配，命中即停（数字小者优先，default_allow 恒垫底）。
+# 热重载（按文件 mtime 自动重读，不用重启）；但写错 action/priority 越界/缺 name 时
+# Pydantic 强校验会让每个请求都报 ValidationError，改对前网关不可用。
+# action: allow=放行外网 | route_local=降级内网模型 | block=拦截（实际行为看 routing.yaml 的 on_block）
+# target: 仅 route_local 用，省略时走 routing.yaml 的 default_local。
+# when 支持 ==/!=/in/contains_any/matches_regex/>=/<=，any/all 可嵌套；
+# 数值比较必须写成 "- 字段 >=: 值"（裸 "- 字段 >= 值" 会被 YAML 解析成字符串）。
+# 完整规则语义见 README「策略说明」；管理台规则页可增删改并干跑测试。
 policies:
 - name: pii_weighted_route_local
   priority: 5

@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from urllib.parse import urlsplit
+
 try:
     import redis
 except ImportError:
@@ -218,7 +220,9 @@ class SessionStore:
 
     def backend(self) -> str:
         if self._r is not None:
-            return f"redis ({self._r_url})"
+            _u = urlsplit(self._r_url or "")
+            _hp = (_u.hostname or "") + (f":{_u.port}" if _u.port else "")
+            return f"redis ({_u.scheme}://{_hp}{_u.path})"
         if self._r_disabled:
             return "memory (redis disabled)"
         return "memory (no REDIS_URL)"

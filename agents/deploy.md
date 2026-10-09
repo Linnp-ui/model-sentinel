@@ -16,3 +16,9 @@ ssh <user>@<gateway-host> "sudo systemctl restart gateway.service && sleep 2 && 
 > 推 `main.py` 前必须先全量对 md5，把它 import 的新符号所属文件一起推；
 > 推后**先远端 import 再 restart**，不要依赖 systemd 重试。
 > （2026-09-08 部署漂移事故见 `gotchas.md`）
+
+> **SSE 长连接拖住 stop 阶段（2026-10-08 实测）**：管理台状态条 SSE
+> （`/admin/api/status/stream`）挂着浏览器连接时，uvicorn 优雅退出不完成，systemd
+> 等满 `TimeoutStopSec=90s` 才 SIGKILL，restart 总耗时 ~95s。重启前关管理台标签页；
+> 关不了就给 restart 命令留 120s+ 超时，`deactivating` 是正常等待**不是重启失败**，
+> 别中途再 restart / 杀 PID。

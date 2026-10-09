@@ -104,8 +104,8 @@ provider key 为 write-only 配置，只写不回显，ops 日志只记长度。
 
 | 端口 | 服务 | 说明 |
 |---|---|---|
-| 8000 | `vllm-qwen3-8b.service` | 主力本地模型（`vllm_local`） |
-| 8001 | embedding | `bge_m3` |
+| 8000 | `vllm.service` | 主力本地模型（`vllm_local`） |
+| 8001 | `vllm-bge-m3.service` | embedding |
 | 8002 | `vllm-qwen3-4b.service` | L2 qwen（`vllm_l2`） |
 | 8003 | `laya-l2.service` | L2 laya（**不是 vLLM**，禁通配操作，见下） |
 

@@ -25,7 +25,8 @@ M2：
   POST   /admin/api/policies                 新增规则
   PUT    /admin/api/policies/{name}          更新规则（可重命名：body 里带 new_name）
   DELETE /admin/api/policies/{name}
-  POST   /admin/api/policies/test            L1 规则测试（text/filename/size -> 命中详情）
+  POST   /admin/api/policies/test            L1 规则测试（text/filename/size/model/client_key/hour -> 命中详情）
+  GET    /admin/api/policies/match-choices  5.2 构造器可选项（前端下拉数据源）
   POST   /admin/api/policies/build-when      5.2 表单语义 -> when 条件（前端预览用）
   POST   /admin/api/l2/generate-rule         5.2 匹配项 AI 生成（只建议不落库）
   POST   /admin/api/l2/test                  5.3 L2 规则测试（待识别内容 -> 审查判定）
@@ -35,6 +36,9 @@ M5（别名候选选择）：
   GET    /admin/api/providers/{name}/models  代理拉取供应商 /models（管理员选模型用）
 
 M6（运维留痕）：
+
+状态条：
+  GET    /admin/api/status/stream            SSE，每 60s 推 health/circuit/l2/audit 聚合
 """
 from __future__ import annotations
 
@@ -50,6 +54,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from src.gateway.admin_store import get_admin_store, mask_key
 from src.gateway import l2_overrides as _l2ov
+from src.gateway import policy_admin
 
 router = APIRouter(prefix="/admin/api")
 
@@ -287,33 +292,11 @@ def stats_overview_api(hours: float = 168.0):
     return store.stats_overview(since, until)
 
 
-@router.get("/stats/group")
-def stats_group_api(dim: str = "model", hours: float = 168.0):
-    """按维度分组（model|key_name|client_ip|provider|action|rule）。
-
-    rule = request_log.blocked_reason（命中规则名；空=放行无规则）。
-    """
-    if dim not in ("model", "key_name", "client_ip", "provider", "action", "rule"):
-        raise HTTPException(422, "dim must be one of model/key_name/client_ip/provider/action/rule")
-    store = get_admin_store()
-    since, until = _win(hours)
-    col = "blocked_reason" if dim == "rule" else dim
-    return {"dim": dim, "hours": hours, "items": store.stats_group(since, until, col)}
-
-
 @router.get("/stats/billing")
 def stats_billing_api(hours: float = 168.0):
     """Token 计费：KEY × 实际模型 × 单价 → ¥（内部成本分摊口径，不等于上游账单）。"""
     store = get_admin_store()
     return _stats.build_billing(store, hours)
-
-
-@router.get("/stats/timeseries")
-def stats_timeseries_api(hours: float = 168.0):
-    """60 桶趋势（统计页时间趋势；request_log 源，与同页 KPI 卡同口径）。"""
-    store = get_admin_store()
-    since, until = _win(hours)
-    return store.stats_timeseries(since, until)
 
 
 @router.get("/stats/chart")
@@ -324,14 +307,6 @@ def stats_chart_api(hours: float = 24.0):
     return store.stats_chart_series(since, until)
 
 
-
-
-@router.get("/stats/key-model")
-def stats_key_model_api(hours: float = 168.0, top: int = 20):
-    """按 KEY(人员) × 模型聚合 token（统计可视化页 KEY×模型占比环图用）。"""
-    store = get_admin_store()
-    since, until = _win(hours)
-    return {"hours": hours, "items": store.stats_key_model(since, until, top)}
 
 
 @router.get("/stats/summary")
@@ -559,11 +534,21 @@ class PolicyTestReq(BaseModel):
     text: str = ""
     filename: str = ""
     size: int = 0
+    # 与 main._review_text ctx 的 model / client.key / time.hour 对齐（干跑可匹配）
+    model: str = ""
+    client_key: str = ""
+    hour: Optional[int] = Field(default=None, ge=0, le=23)
+
+
+class ParseWhenReq(BaseModel):
+    when: object
 
 
 class BuildWhenReq(BaseModel):
-    content_type: str = Field(pattern="^(prompt|filename|file|ocr|size)$")
-    match_type: str = Field(pattern="^(regex|contains|size)$")
+    # 白名单从 policy_admin 的映射表派生，不另抄一份：新增匹配类型只改那一处
+    # （size / hour_range 是自带字段的特例，不在映射表里）
+    content_type: str = Field(pattern="^(" + "|".join(sorted(policy_admin.CONTENT_TYPE_FIELD) + ["size"]) + ")$")
+    match_type: str = Field(pattern="^(" + "|".join(sorted(policy_admin.MATCH_TYPE_OP) + ["size", "hour_range"]) + ")$")
     match_value: object
 
 
@@ -1017,8 +1002,38 @@ def policy_version_rollback_api(vid: int, request: Request):
 
 @router.post("/policies/test")
 def test_policy_api(body: PolicyTestReq):
+    return policy_admin.test_rule(body.text, body.filename, body.size,
+                                  body.model, body.client_key, body.hour)
+
+
+@router.get("/policies/match-choices")
+def match_choices_api():
+    """5.2 构造器可选项（前端下拉的数据源）。
+
+    与 build-when 共用 policy_admin.MATCH_CHOICES 一张表，不在前端另抄一份：
+    后端加了匹配类型而前端没跟上，表现为下拉里选不到，不是静默错配。"""
     from src.gateway import policy_admin
-    return policy_admin.test_rule(body.text, body.filename, body.size)
+    return {
+        "choices": [
+            {"key": f"{ct}|{mt}", "content_type": ct, "match_type": mt, "label": label}
+            for ct, mt, label in policy_admin.MATCH_CHOICES
+        ],
+        # 自带字段的匹配类型不绑内容类型，单列出来让 UI 也能选。
+        # hour_range 不在下拉里：时段规则只能手写 when_json（引擎 time.hour 运算符保留）
+        "self_field": [
+            {"key": f"size|size", "content_type": "size", "match_type": "size", "label": "文件大小 ≥"},
+        ],
+    }
+
+
+@router.post("/policies/parse-when")
+def parse_when_api(body: ParseWhenReq):
+    """build-when 的逆：把已有规则的 when 还原成构造器控件值，供编辑时预填。
+
+    认不出的形状返回 parsed=null——前端保持构造器空白，不拿默认值覆盖
+    用户已写好的 when（多条件 / 无构造器等价物的手写 when 走 JSON 编辑）。"""
+    from src.gateway import policy_admin
+    return {"parsed": policy_admin.parse_when(body.when)}
 
 
 @router.post("/policies/build-when")
@@ -1482,70 +1497,6 @@ def _l2_divergence_rows(hours: int, since: str = ""):
             "filename": r.get("filename") or "",
         })
     return out
-
-
-@router.get("/l2-shadow-samples")
-def l2_shadow_samples(hours: int = 1, limit: int = 3000, since: str = ""):
-    """每次 L2 判定的主/影对照明细（逐条，不分桶）：{ts, main, shadow, agree, cell}。
-
-    影子页画「每次一致率」用：一条点=一次判定，绿=一致、红=分歧，比小时桶直观
-    （桶会把 5 分钟里的 3 条分歧平均掉）。窗口上限 24h / 3000 条（逐条数据量比桶大一个量级）。
-    """
-    try:
-        hours = max(1, min(int(hours), 24))
-    except (TypeError, ValueError):
-        hours = 1
-    limit = max(1, min(int(limit or 3000), 3000))
-    out = []
-    for r, l2 in _l2_window_rows(hours, since):
-        ml, sl = l2.get("label"), l2.get("shadow_label")
-        if sl not in ("CONFIDENTIAL", "NORMAL") or l2.get("degraded") or ml not in ("CONFIDENTIAL", "NORMAL"):
-            continue
-        out.append({"ts": str(r.get("ts") or ""), "main": ml, "shadow": sl,
-                    "agree": ml == sl, "cell": "" if ml == sl else ("nc" if ml == "NORMAL" else "cn")})
-    out.sort(key=lambda x: x["ts"])
-    total = len(out)
-    return {"hours": hours, "total": total, "items": out[-limit:]}
-
-
-@router.get("/l2-shadow-trend")
-def l2_shadow_trend(hours: int = 168):
-    """主/影对照小时桶趋势（一致率 + L2 量 + cells），供 L2 影子页折线。"""
-    import datetime as _dt
-
-    try:
-        hours = max(1, min(int(hours), 720))
-    except (TypeError, ValueError):
-        hours = 168
-    start = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).replace(
-        minute=0, second=0, microsecond=0)
-    buckets: dict[str, dict] = {}
-    for i in range(hours + 1):
-        b = (start + _dt.timedelta(hours=i)).strftime("%Y-%m-%d %H:00")
-        buckets[b] = {"t": b, "l2_total": 0, "shadowed": 0, "compared": 0, "agree": 0,
-                      "cc": 0, "cn": 0, "nc": 0, "nn": 0}
-    for r, l2 in _l2_window_rows(hours):
-        try:
-            ts = _dt.datetime.strptime(str(r.get("ts") or "")[:16], "%Y-%m-%d %H:%M")
-        except Exception:
-            continue
-        b = buckets.get(ts.strftime("%Y-%m-%d %H:00"))
-        if b is None:
-            continue
-        b["l2_total"] += 1
-        ml, sl = l2.get("label"), l2.get("shadow_label")
-        if sl not in ("CONFIDENTIAL", "NORMAL"):
-            continue
-        b["shadowed"] += 1
-        if l2.get("degraded") or ml not in ("CONFIDENTIAL", "NORMAL"):
-            continue
-        b["compared"] += 1
-        if ml == sl:
-            b["agree"] += 1
-            b["cc" if ml == "CONFIDENTIAL" else "nn"] += 1
-        else:
-            b["cn" if ml == "CONFIDENTIAL" else "nc"] += 1
-    return {"hours": hours, "buckets": list(buckets.values())}
 
 
 @router.get("/l2-divergences")
@@ -2248,3 +2199,59 @@ def circuit_set_api(request: Request, name: str, body: CircuitSetReq):
         raise HTTPException(422, str(e))
     get_admin_store().log_ops("circuit_set", f"{name} -> {body.state}", _operator(request))
     return {"ok": True, "provider": name, "state": body.state, "snapshot": snap}
+
+
+# ---------------- 状态条 SSE ----------------
+# 本文件其余端点都是 sync def（FastAPI 自动进线程池）。SSE 必须是 async 生成器，
+# 所以聚合本身仍走 sync 路径，再 run_in_threadpool 挪出事件循环。
+def _status_snapshot() -> dict:
+    """状态条要的四份原始数据，逐个复用现成端点逻辑（不复制计算）。"""
+    from src.gateway import small_model as _sm
+    from src.gateway.audit_store import get_audit_store
+    from src.gateway.main import _health_payload
+
+    _redact = lambda u: re.sub(r"://[^@/]*@", "://***@", str(u or ""))
+    store = get_audit_store()
+    return {
+        "health": _health_payload(),
+        "circuit": circuit_api(),
+        # l2-config 端点还返回阈值/落盘配置，状态条用不到，这里只回三个开关
+        "l2": {
+            "SMALL_MODEL_ENABLED": _sm.l2_enabled(),
+            "AI_GATEWAY_L2_BACKEND": _sm.l2_backend() or "qwen",
+            "AI_GATEWAY_L2_SHADOW": (os.getenv("AI_GATEWAY_L2_SHADOW") or "").strip().lower() == "true",
+        },
+        "audit": {
+            "backend": _redact(store.backend()),
+            "redis": {"connected": store._r is not None, "url": _redact(store._r_url)},
+            "mysql": store.mysql_status(),
+        },
+    }
+
+
+@router.get("/status/stream")
+async def status_stream():
+    """管理台顶部状态条 SSE：每 60s 推一份 /health + 熔断 + L2 + 审计聚合。
+
+    取代前端 4 个 fetch 的轮询；派生（五灯/覆盖率/异常判定）仍在前端算，
+    与聚合口径同源。手动刷新 = 断开重连（EventSource 断线自带重连）。
+    """
+    import asyncio
+
+    from fastapi.responses import StreamingResponse
+    from starlette.concurrency import run_in_threadpool
+
+    async def gen():
+        while True:
+            try:
+                payload = await run_in_threadpool(_status_snapshot)
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            except Exception as e:  # 单次聚合失败不掐流，下一拍重试
+                yield f"data: {json.dumps({'error': repr(e)[:200]}, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(60)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )

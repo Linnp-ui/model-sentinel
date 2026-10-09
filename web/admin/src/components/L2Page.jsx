@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert, Button, Card, Input, Modal, Popconfirm, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
@@ -341,6 +341,8 @@ export default function L2Page() {
 
   return (
     <div>
+      <Alert type="info" showIcon style={{ marginBottom: 12 }}
+        message="权威判定 = qwen（真正决定请求是否出境）；本页的 laya 只是影子，并行打标、不改路由 —— 影子调优 ≠ 已切权威" />
       <Card title={`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`} style={{ marginBottom: 12 }}
         extra={<Text type="secondary" style={{ fontSize: 12 }}>
           {round.since

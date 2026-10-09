@@ -1,8 +1,42 @@
 # Gotchas（坑位记录）
 
 > 上级：`AGENTS.md`。2026-09-29 精简：删 v1–v9 训练迭代流水（已被 v30 定版取代，
-> 完整版在 git 历史 `2f07156` 之前），压事故叙事留结论，规则一条未删。
+> 完整版在 git 历史里），压事故叙事留结论，规则一条未删。
 > 按时间倒序读也行，按主题扫也行。
+
+- **2026-10-08 — 审计数据谱系**（「一共多少条 / 为什么数字对不上」类问题查这条，别重新考古）：
+  `audit_logs`（90 天留存）是唯一持久审计库；Redis 热窗 ltrim 封顶 5000（进新出旧，窗口滑动，
+  被裁的行只存在于 audit_logs）。**09-01~09-11 静默丢失时代**：writer 启动无重试（MySQL 离线
+  则整个进程生命周期静默缺失）+ 熔断期丢行且无计数无日志，598 条只进 Redis；09-30 修复（启动 60s 重试 + 五类丢行计数 + 多行 VALUES），2026-10-08 用
+  `scripts/backfill_audit_redis.py`（幂等）回填完毕，此后热窗与审计库逐日 diff=0。
+  最老可恢复记录 = **2026-09-01 07:18:41**；08-18（服务首启）~09-01 是**证据盲区**
+  （request_log 09-10 才开始、journal 不记网关请求），5000 是历史总量**下界**。
+  `req_id` **非唯一**，对账/回填必须先 SELECT 已有再插缺的，INSERT IGNORE 不行。
+- **灰区上界曾用 `risk_score < 60`，只对纯 PII 成立（2026-09-30 已修）**：
+  `risk_score = weighted_pii_score + keyword_score`，而唯一按分值判的 policy 规则
+  （priority 5）读的是 **weighted_pii_score，不含关键词分** ⇒ 「关键词堆叠到 >=60」
+  既超灰区上界（L2 不触发）又匹配不上 priority 5（L1 放行），**两条路都漏，内容直出外网**。
+  实测「工资 薪资 奖金」kw=60 → `allow`/deepseek；而单词「机密」kw=30 → `route_local`
+  ——**堆得越多越危险**（设计意图是"30 档两命中=60 转本地"，实现读错了字段）。
+  **修**：`main._l2_gray_trigger` 去掉上界，只保留下限（`main.py:807`）。
+  **上界对 PII 本就是死代码**——PII>=60 时 priority 5 已判 route_local，
+  门的第一条件 `action == "allow"` 就是 False。回归见
+  `test_l2_gray_trigger_no_upper_bound_on_risk`（已验证：回退修复该测试转红）。
+  代价（2026-09-30 实测）：160 条测试集 L2 调用 79→103；**生产近 7 天审计 1095 条里
+  risk>=60 占 23 条（2.1%）** ⇒ L2 量 +2.1%，可接受。
+  ⚠️ **剩下的敞口不在这条**：测试集 7 条漏网全是 `risk=0 l2p=noL2`
+  ——L1 零特征命中时 L2 根本不被调用（"38 后面加个 k"这类纯语义转写）。
+  要堵它得**对全流量跑 L2**，是成本/口径决策，**没做**。
+
+- **L2 判定缓存不含 prompt 版本（改 prompt 必须重启）**：`_CACHE`（`small_model.py:86`）
+  键是 md5(`text[:800]`|filename|headers|sheet_names)，**不含 prompt_sha1**——
+  键要跨进程稳定，塞易变 hash 会让重启前后命中率归零。
+  ⇒ `PUT /l2-prompts` 应用新 prompt 后，**同一文本在 TTL 600s 内仍返回旧结论**。
+  症状：`prompt-test` 打分通过、干跑同一 battery 却仍报 NORMAL（2026-09-28 v3 落地时踩的）。
+  解法：重启 gateway（`apply_overrides()` 在 startup 回灌）或手动清 `_CACHE`；
+  **无自动失效机制，别指望热加载能覆盖它**。
+  同族：`l2_retrain` 里的 prompt 打分是**直调 `_call_qwen(system=)` bypass 缓存**的，
+  就是为了让候选 prompt 的分数不受旧条目污染——写新测试/改 prompt 时照这个思路。
 
 - **2026-09-28 — 测试洗掉线上 v1 prompt（`l2_overrides.yaml` 是生产共用真文件）**：
   conftest 的隔离只盖 DB/HTTP，**碰仓库真文件的后端（`_l2ov`）测试必须打 fake**

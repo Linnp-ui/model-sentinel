@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Tooltip, Row, Col } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';

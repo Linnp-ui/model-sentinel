@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Table, Button, Input, Modal, Form, Tag, Space, message, Popconfirm, Typography, Alert } from 'antd';
 import { ImportOutlined, KeyOutlined, ReloadOutlined, CopyOutlined } from '@ant-design/icons';
 import { api, errText, copyText } from '../api.js';
@@ -113,6 +113,10 @@ export default function KeysPage() {
         <Button data-testid="keys-reload" icon={<ReloadOutlined />} onClick={load}>刷新</Button>
         {meta && <Text data-testid="keys-meta-registered" style={{ marginLeft: 16, fontSize: 16 }}>已登记 <Text strong style={{ fontSize: 18 }}>{meta.api_keys}</Text></Text>}
       </Space>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        用法：客户端带 <Text code>Authorization: Bearer &lt;key&gt;</Text>（或 <Text code>x-api-key</Text> 头）调
+        <Text code>/v1/chat/completions</Text> 等端点；未登记的 key 直接 401。KEY 明文只在登记 / 生成时显示一次。
+      </Text>
       <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small"
         locale={{ emptyText: '暂无已登记 KEY，点上方「登记 KEY」添加' }}
         pagination={{ pageSize: 50, showSizeChanger: false }} />

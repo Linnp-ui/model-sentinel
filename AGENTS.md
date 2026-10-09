@@ -95,15 +95,34 @@ docker compose up -d gateway redis
 
 ## L1/L2 门（`main._review_text`，三条件与）
 
-L1 allow **且** `risk_score ∈ [20,60)` 灰区 **且**
-（机密会话 **或** 非白名单豁免）→ L2（2026-09-23 起取消字数触发，只看灰区）；
+L1 allow **且** `risk_score >= 20`（下限 env `AI_GATEWAY_L2_GRAY_FLOOR`，**无上界**）**且**
+（机密会话 **或** 非白名单豁免）→ L2（2026-09-23 起取消字数触发，只看风险分）；
 白名单 key 95% 跳 L2（5% 抽样）；
-`/v1/embeddings` 永不 L2；灰区下限 env `AI_GATEWAY_L2_GRAY_FLOOR`（默认 20）。
+`/v1/embeddings` 永不 L2。
 **全本地别名组**（启用候选 provider 全内网，如 `local-model`，`main._all_local_alias`）
 跳过 L1/L2 直接 allow：内容不可能出境（所有故障切换路径跳过 local 候选，全组失败 fail-loud）。
 
-risk 档（`inspection.py`）：≥150 block；≥60 route_local；
-[20,60) 强制 L2；<20 直放。关键词三档 30/25/20，单命中 20 即进灰区。
+`risk_score` 全仓库只有**两个**消费方，别按"分档表"理解它：
+① `policy.yaml` 里唯一按分值的规则判 `findings.weighted_pii_score >= 60`（**不含关键词分**）；
+② 灰区 `_L2_GRAY_FLOOR(20) <= risk_score < 60` 强制 L2（`main._l2_gray_trigger`）。
+
+**关键词命中会转内网，有三条路（别只记"关键词不管用"）**：
+- **A. `financial_local_only`（priority 10）直接命中**：`policy.yaml` 里
+  `text contains_any: [财务报表, 资产负债, 利润表]`，纯关键词、与风险分无关。
+- **B. 灰区 → L2 判密（主力路径）**：单个 20 档词 kw=20 恰在灰区下界，L2 触发判
+  CONFIDENTIAL 即转本地。实测「工资表里的数据」kw=20、「机密」kw=30 都走这条路。
+- **C. `weighted_pii_score>=60`（priority 5）**：只算 PII 权重，**不含关键词分**。
+
+**当前态**：灰区**无上限**（`main._l2_gray_trigger` 只留下限）⇒ 关键词堆到
+`risk_score>=60` 且 `weighted_pii_score=0` 也转内网、不再出境；回归
+`test_l2_gray_trigger_no_upper_bound_on_risk`。暗语/零特征四条正则
+（`implied_amount`/`raise_amount`/`salary_pinyin`/`exec_schedule`，各 20 档、归一化副本抗零宽，
+**门逻辑没动**——20 档恰落灰区下界、判密仍归 L2）；回归
+`test_l1_rules_catch_obfuscated_negative_samples`。历史（原缺口实测 / 版本矩阵 / 漏网数）见 `agents/gotchas.md`。
+
+block 只由 priority 20/25 两条正则规则决定，与分值无关
+（`severity` / `RISK_THRESHOLD_BLOCK` 曾是死字段，2026-09-29 从未读过，
+2026-10-09 已从 `inspection.py` 删除 —— 别再加回来）。
 **灰区探针/压测只许 `vllm_local/qwen2.5:7b` 斜杠写法**：`local-model` 别名走
 `local_alias_bypass` 跳过 L1/L2（测不到 L2）；`qwen2.5:7b` 裸名落 `default_external`
 **出境**。
@@ -119,9 +138,12 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
   decide 0.05ms；session/taint 各一次 Redis GET 0.07–0.12ms）。可并行的只有那两次 GET，
   `asyncio.gather`+threadpool 跳转成本 ≈ 0.3–0.5ms > 收益，且 decide 依赖 inspect 的 findings
   （拆开改语义）⇒ **L1 并行化上限 0.2ms，不做**。真要省那 0.19ms 用一个 Redis pipeline。
-- 审计列表**不查 MySQL**：走 `audit_store.tail(5000)`（Redis `LRANGE`）+ 版本签名
+- 审计**列表**不查 MySQL：走 `audit_store.tail(5000)`（Redis `LRANGE`）+ 版本签名
   （`LLEN`+最新一条）解析缓存，冷 59ms / 热 9–15ms，翻页深度无差异（分页在最后切片）。
   **别去加 MySQL keyset 分页/索引**。硬上限 = 100 页 × 50 = 5000 条（可见性问题，非性能问题）。
+  头部 **KPI 查审计库**：`count_mysql()` 单遍聚合（时间/动作/规则筛选），全文/调用方/IP/影子
+  筛选回退热窗口径，`kpi.source` 区分；顶层 `total/c_*` 保持窗口口径供分页（2026-10-08 修
+  KPI 曾是热窗截断下限、与审计库对不上的问题）。
 - 审计 `append()` 在事件循环里同步打 Redis（pipeline 2 命令，中位 0.28ms），但
   `socket_timeout=2` ⇒ Redis 卡住时单请求最多阻塞 2s。**观察项**，见到抖动再上 threadpool。
 
@@ -137,8 +159,10 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
 | `src/gateway/provider_keys.py` | `gateway_only` 凭据池（P1 只读 env）：per-provider 取 key，未登记身份 / 无凭据一律空串 fail-closed，**不抛错**（让 `validate_environment` 统一 503） |
 | `src/gateway/llms/` | provider 线协议适配层（仿 LiteLLM llms/）：`base.py` BaseLLM 抽象；`openai_compat.py` / `anthropic_llm.py` 各实现一种 api_mode；`registry.py` 登记 api_mode→handler；`bridges.py` 承接入站协议桥（Anthropic Messages / OpenAI Responses ↔ 标准 chat）。**新增上游协议 = 加一个 BaseLLM 子类 + registry 登记一行，routing.py 零改动** |
 | `src/gateway/routing.py` | `resolve()` 三级覆盖 + chat/embeddings/stream 转发 + Anthropic/Responses 协议转换；**单例 `httpx.AsyncClient`**（新代码别再 `httpx.AsyncClient()` 每请求）；`upstream_key()` per-provider 取凭据（**候选循环一律 `_request_credential`（客户端那半，每请求一次）+ `_cand_key`（网关那半，每候选一次）**——在循环里调 `upstream_key()` 会把上一候选的 key 打到下一家，且重复计入 `upstream_key_passthrough_total`）|
+| `src/gateway/l2_retrain.py` | L2 影子一键优化管道：标注→数据集→GPU 微调→候选 8004 评测（battery+标注回归+历史分歧回归）→promote 写 `var/laya-l2.env`+重启 laya-l2；全局单 job，并发 409；**权威 backend 切换不走这里** |
+| `src/gateway/env_file.py` | env 文件读改写（systemd EnvironmentFile 格式）：provider key 配置两层生效（os.environ 即时 + .env 行级持久化）；密钥明文永不回显 |
 | `src/gateway/alias_router.py` | 别名组：`/v1/models` 暴露名 → (provider, model) 候选表（大小写不敏感，5s TTL 缓存，per-candidate 熔断）。`/v1/models` 单一真源 = `admin_api.build_public_models()`（别名组 + `internal_models` + 用户自注册，与 `/admin/api/models/public` 共用）；`internal_models` 只管暴露/展示/引用保护，**不参与路由**。改名走 `admin_store.update_alias_group(new_name=)`（组行+成员同事务搬移，撞名 422） |
-| `src/gateway/inspection.py` | 文本层：Regex(身份证/手机/AKIA/私钥) + 熵 + Luhn(银行卡) + 关键词三档 + PII 加权评分（≥60 route_local，[20,60) 强制 L2）。pattern 跑 NFKC + 去分隔符 copy，**关键词跑原文**（英文词只写小写形态——子串匹配不 lower） |
+| `src/gateway/inspection.py` | 文本层：Regex(身份证/手机/AKIA/私钥) + 熵 + Luhn(银行卡) + 关键词三档 + PII 加权评分（PII≥60 → route_local；risk≥20 灰区强制 L2，**无上界**）。pattern 跑 NFKC + 去分隔符 copy，**关键词跑原文**（英文词只写小写形态——子串匹配不 lower） |
 | `src/gateway/file_inspector.py` | 文件层：PDF/Excel/Word/**图片（含 heic/avif）** + pymupdf 兜底 + 扫描件 OCR（paddleocr→pytesseract chi_sim+eng，5页/150DPI/8000字）；图片走 `_ocr_pixmap`（PDF/图片共享） + 20MB size cap；**解析在 `run_in_threadpool`**（不要直接 `await`）；扩展名不可信，以 magic 嗅探为准 |
 | `src/gateway/small_model.py` | L2 `Qwen3-4B-Instruct-2507`；`CONFIDENTIAL_THRESHOLD=0.7`；LRU 500/TTL600；5 块并发；客户端必须复用；`latency_ms==0` 一律视为无真实调用（disabled / 缓存 / 空输入），不入直方图。**双后端** `AI_GATEWAY_L2_BACKEND=qwen\|laya`（laya = `laya-l2.service`:8003 `/classify`，noul 英文题规格）；影子双跑 `AI_GATEWAY_L2_SHADOW=true`（qwen 权威 + laya 并行打标，`shadow_*` 随审计 l2 JSON 自动落库，2s 短超时不拖主链） |
 | `src/gateway/l2_overrides.py` | `/l2-config` 白名单键持久化：PUT 原子写 `l2_overrides.yaml`（`AI_GATEWAY_L2_OVERRIDES_PATH` 可覆盖），启动时 `apply_overrides()` 回灌 os.environ ⇒ 保存后重启仍生效。键必须是 `L2ConfigPutReq` 白名单（二次防线，禁任意 env 注入） |
@@ -153,9 +177,9 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
 | `src/gateway/metrics.py` | `/admin/metrics` Prometheus；**双指标**：`requests_total`（legacy 5 轴，dashboard 不破） + `requests_v2_total`（P2 7 轴 `{type,action,rule,provider,model,local,status_code}`，status 由中间件写 ContextVar 供） + override_denied_total / fallback_total / tokens_total / l2_latency_ms / circuit_* / ocr_* |
 | `src/gateway/metrics_ring.py` | 运行指标环：10s tick 差分 → 24h 内存环 + JSONL 落盘（`var/metrics_ring.jsonl`，kill -9 不丢）；P99 取近 5 分钟 `request_log`（`AI_GATEWAY_PCT_WINDOW_S`） |
 | `src/gateway/audit_store.py` | 审计双写：Redis 热缓存 `key=gateway:audit` `lpush+ltrim(0,4999)`（影子统计只读这里）+ MySQL 持久化（后台线程批量写，fail-open，90 天清理；`l2` 列存主判+影子 JSON，缺列启动自检自动 ALTER）。`tail()` 按 `(LLEN, 最新一条)` 版本签名缓存解析结果（≈10MB/进程），**返回的是共享 dict 的浅拷贝——调用方只可幂等补字段**（现只有 key_name 兜底） |
-| `src/gateway/admin_api.py` | 管理面：45+ `/admin/api/*`（Basic/`/admin/login` cookie，会话 7 天）+ 运维三件套（`route-inspect` 干跑——文本外还支持 `channel=check/chat/responses` 文件干跑，codex∪workbuddy 并集、`providers/check` 健康、`circuit` 手动）+ provider 注册表 CRUD + provider key 配置（write-only，`env_file.py` 写 os.environ 即时生效 + 行级落盘）+ `stats/chart`（request_log 分桶，统计/总览折线图跟时间窗，桶内峰值 qps_max/lat_min-max）+ `l2-shadow-stats`（主影一致率/覆盖率，扫 Redis 热缓存）+ L2 影子看板（`l2-shadow-trend`/`l2-divergences`+标注/`export` JSONL，MySQL l2 列）+ `events` 降级事件流 + `rule-hits` 规则命中 + `policy/versions` 版本历史/回滚。**key 值永不回显**，ops-log 只记长度 |
+| `src/gateway/admin_api.py` | 管理面：45+ `/admin/api/*`（Basic/`/admin/login` cookie，会话 TTL 见 `AI_GATEWAY_SESSION_TTL`）+ 运维三件套（`route-inspect` 干跑——文本外还支持 `channel=check/chat/responses` 文件干跑，codex∪workbuddy 并集、`providers/check` 健康、`circuit` 手动）+ provider 注册表 CRUD + provider key 配置（write-only，`env_file.py` 写 os.environ 即时生效 + 行级落盘）+ `stats/chart`（request_log 分桶，统计/总览折线图跟时间窗，桶内峰值 qps_max/lat_min-max）+ `l2-shadow-stats`（主影一致率/覆盖率，扫 Redis 热缓存）+ L2 影子看板（`l2-shadow-trend`/`l2-divergences`+标注/`export` JSONL，MySQL l2 列）+ `events` 降级事件流 + `rule-hits` 规则命中 + `policy/versions` 版本历史/回滚。**key 值永不回显**，ops-log 只记长度 |
 | `src/gateway/rate_limit.py` | 令牌桶限流（in-memory）；`extract_client_key` 按 token > X-Forwarded-For > IP（XFF 仅 `AI_GATEWAY_TRUST_XFF=true` 时采用，默认 socket IP 优先）；`check_model` 模型级全局 RPM（配置在 `model_policy.model_limits`，卡口在 `routing.resolve` 出口，ContextVar 按请求去重） |
-| `src/gateway/session_store.py` | 会话级机密标记：`X-Session-ID` 下 files/check 文件命中、chat/messages 内联图或提及数据文件名命中（route_local/block）后同会话强制 route_local（TTL 见 .env，生产 7 天）；Redis + 内存兜底。另有**文件名污染**（客户端无感会话替代）：同 key 下曾判机密的文件名被正文提及即 `tainted_file_ref`（priority 12）走本地，按 key 隔离、后缀匹配 |
+| `src/gateway/session_store.py` | 会话级机密标记：`X-Session-ID` 下 files/check 文件命中、chat/messages 内联图或提及数据文件名命中（route_local/block）后同会话强制 route_local（TTL 见 `AI_GATEWAY_SESSION_TTL`）；Redis + 内存兜底。另有**文件名污染**（客户端无感会话替代）：同 key 下曾判机密的文件名被正文提及即 `tainted_file_ref`（priority 12）走本地，按 key 隔离、后缀匹配 |
 | `src/gateway/user_models.py` | `/v1/models/register` 自助注册；`AI_GATEWAY_EGRESS_DOMAINS` 白名单；Redis `gateway:user_models` |
 
 路由：`/v1/chat/completions`、`/v1/embeddings`、`/v1/messages`、`/v1/messages/count_tokens`、
@@ -170,7 +194,7 @@ codex = `/v1/responses` `input_file` 块（见 `responses_filectx.py`）。
 - 服务：`laya_l2_server.py`（`POST /classify`）+ `laya-l2.service`（8003/GPU5，`LAYA_MODEL_PATH` 切 checkpoint，回退链只改这一行）。
 - **权威 = qwen，laya 只是影子**（`AI_GATEWAY_L2_BACKEND=qwen` + `AI_GATEWAY_L2_SHADOW=true`，`var/laya-l2.env` 指当前影子权重）。**laya 判错不会让请求走本地路由**——真出境的是主判 qwen 和规则。别把"影子调优"读成"已切权威"（2026-09-29 就误报过一次）。`var/` 全在 `.gitignore` 里 ⇒ **现役权重指针不在 git**，换机器/重建容器时 `var/laya-l2.env` 会丢，必须先从 `~/models` 补回。
 - 训练：`build_laya_dataset.py`（审计去重 + **人工标注 `l2_labels` 覆盖 rule 推导**（ground truth 最高优先级，人标 0 也盖掉规则 1）+ 模板合成）→ `~/models/laya-dataset/`；`laya_finetune_local.py <base> <data> <out>`（单卡 4090，**`CUDA_VISIBLE_DEVICES=5`**，与推理服务同卡，~10min @6.7k 条 4ep）→ `~/models/laya-finetuned-*`。**含真实审计内容的数据集/checkpoint 留 `~/models`，永不入库**；QUESTIONS 题规格在 server/train/eval 三处必须逐字一致。
-- **挖数据/看数据**：`mine_audit_labels.py`（`--apply` 落标）把**规则推导覆盖不到的**审计行按"PII pattern→1、risk<20 且影子 p≤0.3→0、其余入 `var/label_queue.jsonl`"批量收进 `l2_labels`，队列由人工逐条裁决（标完删文件，下版 build 自动入集）；`shadow_pulse.py [hours] [--since]` 是轮统计唯一入口（裸 `--since` 读 `var/l2-round.json`，与 `l2_shadow_stats`/`l2-divergences` 的 `since` 同口径）——**别再手拼 `?since=` URL**。
+- **挖数据/看数据**：`mine_audit_labels.py`（`--apply` 落标）把**规则推导覆盖不到的**（`rule` 不在 `POS_RULES|NEG_RULES`）审计行按"PII pattern→1、risk<20 且影子 p≤0.3→0、其余入 `var/label_queue.jsonl`"批量收进 `l2_labels`，队列由人工逐条裁决（标完删文件，下版 build 自动入集）。⚠️ **2026-09-30 实跑：492 行 → 去重仅 1 条可用文本、队列 0 条、477 条已人标跳过 ⇒ 池子见底，队列是兜底分支不是主路径**。主力仍是 `build_laya_dataset.py` 按审计 `rule` 字段弱监督批量构建。自动标 1 只认客观 pattern（"regex 不撒谎；keyword 只是词表不算证据"）；影子不可用（`p is None`）宁可不标。`shadow_pulse.py [hours] [--since]` 是轮统计唯一入口（裸 `--since` 读 `var/l2-rounds.jsonl`，与 `l2_shadow_stats`/`l2-divergences` 的 `since` 同口径）——**别再手拼 `?since=` URL**。
 - **灌数分歧 ≠ 调参理由**：v30 上线首轮灌数出 1 条分歧（`分红明细：研发部 42%，市场部 23%，其他 35%` → L1 判密、影子 p=0.000 判放行），但三门全绿 + OOD 219/220 ⇒ **保留 v30 不回滚**（v28 三轮灌数全 0 分歧，但 OOD 216 / 标注回归 204/206，用结构性的抗注入能力换单点分歧是亏的）。灌数单轮只有 ~49 条可比，**样本量撑不起"为一条分歧训一版"**；真要动必须三门 + OOD + 灌数三样全跑，任一退步就留原版。L1 已判密的窄带里影子判错不构成上线阻塞（内容没出境，真出境的是主判 L2/规则）。
 - **一键优化管道**（`src/gateway/l2_retrain.py` + 管理台 L2 影子页）：标注≥10 条 → `POST /admin/api/l2/retrain`（后台：数据集→GPU5 微调（`AI_GATEWAY_L2_TRAIN_GPU`，默认 5，与推理服务同卡）→候选 8004 临时服务跑 battery+标注回归+**历史分歧回归**（审计里 `label!=shadow` 的文本、sha1 去重、want 取自 `gray_flood.CANDIDATES` 前缀匹配，`text_preview` 截断的计 unmatched））→ `POST /admin/api/l2/retrain/promote`（写 `var/laya-l2.env` + 无密重启 laya-l2 + `/health` model 身份核对，见 `agents/vllm-hosts.md`；**终端跑一轮的登录/轮询/核对配方见 `agents/gotchas.md` 2026-09-29 条**）。**权威 backend 切换（qwen→laya）不在此管道，仍人工拍板**。qwen 提示词也在管道里：`POST /l2/retrain/prompt-test` 拿同 battery 给候选 prompt 打分（不落地，直调 `_call_qwen(system=)`，bypass 缓存/熔断/影子），通过再 `PUT /l2-prompts` 应用（即时生效 + 落盘）；训练报告 stamp 当时 `prompt_sha1`。
 - **测试要审计落地**：进影子基线的 eval 流量必须经网关（`dev-key` + `vllm_local/qwen2.5:7b` 斜杠写法，主影双落审计）；直打 8003 `/classify` 只算模型 QA，不进 request_log/audit/影子统计窗（灌数范式 `scripts/gray_flood.py`：`inspect_text` 预筛 [20,60) → 网关 → 审计对账）。

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Button, Space, message, Card, Statistic, Select, Popconfirm, Alert, Tooltip, Typography, Row, Col, Spin } from 'antd';
 import { ReloadOutlined, DeleteOutlined } from '@ant-design/icons';
@@ -8,11 +8,14 @@ import { api, errText, RANGES } from './api.js';
 
 const { Text } = Typography;
 
-// 规则展示名：request_log.blocked_reason 带 l1:/l2:[scope:] 前缀，ruleZh 表无前缀键
+// 规则展示名：request_log.blocked_reason 带 l1:/l2:[scope:] 前缀，ruleZh 表无前缀键。
+// scope 必须留在 key 里：同一原因可来自不同 scope（实测 l2:last_user:含报价单和单价 5 条
+// 与 l2:tool:含报价单和单价 3 条同落一个窗口），丢掉 scope 会让两段撞 React key、
+// 环图丢段，且与审计页显示的完整 rule 对不上。
 const ruleLabel = (r) => {
   if (!r || r === '(unknown)') return '放行（无规则命中）';
-  const m2 = String(r).match(/^l2:[^:]+:(.+)$/);
-  if (m2) return `L2 判定：${m2[1]}`;
+  const m2 = String(r).match(/^l2:([^:]+):(.+)$/);
+  if (m2) return `L2 判定[${m2[1]}]：${m2[2]}`;
   return ruleZh(String(r).replace(/^l1:/, '').replace(/^l2:/, ''));
 };
 
@@ -108,13 +111,15 @@ function BillDailyBars({ daily }) {
   );
 }
 
-// 60桶趋势（蓝=放行 橙=本地路由 红=拦截；蓝条 = 调用 - 本地路由 - 拦截下限0）
+// 60桶趋势堆叠柱（蓝=放行 橙=本地路由 红=拦截；蓝条 = 调用 - 本地路由 - 拦截下限0）
+// 堆叠而非同基线重叠：同 x 同底画三根 rect 时，后画的会盖住先画的
+// （实测「放行 2 / 本地路由 10」的桶蓝条被橙条完全遮住 = 看起来没有放行）
 function TrendBars({ slots, counts, routes, blocks }) {
   if (!slots || !slots.length) return <Alert type="info" showIcon message="暂无趋势数据" />;
   const W = 900, H = 360, pad = 40; // H 加大：整图更高，柱子纵向空间更足
   const allows = slots.map((_, i) => Math.max(0, (counts[i] || 0) - (routes[i] || 0) - (blocks[i] || 0)));
-  // 自适应：最高的柱占绘图区 90%（留 10% 顶空）；网格线按同一比例对齐
-  const maxV = Math.max(1, ...slots.map((_, i) => Math.max(allows[i], routes[i] || 0, blocks[i] || 0)));
+  // 自适应：最高的柱（= 三段之和 = 该桶总调用）占绘图区 90%（留 10% 顶空）；网格线按同一比例对齐
+  const maxV = Math.max(1, ...slots.map((_, i) => allows[i] + (routes[i] || 0) + (blocks[i] || 0)));
   const plotH = H - pad * 2;
   const HEAD = 0.9;
   const bw = Math.max(3, Math.min(22, (W - pad * 2) / slots.length - 2));
@@ -142,8 +147,8 @@ function TrendBars({ slots, counts, routes, blocks }) {
         <g key={s + i}>
           <title>{`${s}: 放行 ${allows[i]}，本地路由 ${routes[i] || 0}，拦截 ${blocks[i] || 0}（含 403）`}</title>
           <rect x={x(i)} y={H - pad - scale(allows[i])} width={bw} height={scale(allows[i])} fill="#1677ff" rx="1" />
-          {(routes[i] || 0) > 0 && <rect x={x(i)} y={H - pad - scale(routes[i])} width={bw} height={scale(routes[i])} fill="#faad14" rx="1" />}
-          {(blocks[i] || 0) > 0 && <rect x={x(i)} y={H - pad - scale(blocks[i])} width={bw} height={scale(blocks[i])} fill="#ff4d4f" rx="1" />}
+          {(routes[i] || 0) > 0 && <rect x={x(i)} y={H - pad - scale(allows[i] + (routes[i] || 0))} width={bw} height={scale(routes[i] || 0)} fill="#faad14" />}
+          {(blocks[i] || 0) > 0 && <rect x={x(i)} y={H - pad - scale(allows[i] + (routes[i] || 0) + (blocks[i] || 0))} width={bw} height={scale(blocks[i] || 0)} fill="#ff4d4f" />}
           {i % 10 === 0 && <text x={x(i) + bw / 2} y={H - pad + 12} fontSize="9" fill="#666" textAnchor="middle">{s}</text>}
         </g>
       ))}
@@ -154,7 +159,7 @@ function TrendBars({ slots, counts, routes, blocks }) {
 // 建议卡片标题：明示「规则 1/2/3 用面板窗口、KEY 分级另用独立窗口」这个双窗口事实
 // （2026-09-16 B 案：触发口径改为「异常处置 = 拦截 ∪ 本地路由」）。
 // KEY×调用量占比：KEY 下拉（按调用量排序）+ 该 KEY 下放行/本地路由/拦截环图
-// 数据源 stats/group?dim=key_name（request_log，与 Token 占比同源；全量聚合不限 5000 条）
+// 数据源 /stats/summary 的 group_key_name（request_log，与 Token 占比同源；全量聚合不限 5000 条）
 function KeyActionDonut({ rows }) {
   const byKey = {};
   (rows || []).forEach((r) => {
@@ -206,7 +211,8 @@ function KeyModelDonut({ rows }) {
 export default function StatsPage() {
   const [hours, setHours] = useState(168);
   const [ov, setOv] = useState(null);
-  const [ts, setTs] = useState(null);
+  // 空壳初值：tsTotals 首帧就跑（loadAll 未返回时 ts 仍是初值），null 会炸
+  const [ts, setTs] = useState({ slots: [], counts: [], routes: [], blocks: [] });
   const [provTop, setProvTop] = useState([]);
   const [ruleTop, setRuleTop] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -239,6 +245,15 @@ export default function StatsPage() {
   }, [hours]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
+
+  // 趋势图头部合计：只认柱子这三段（同一份 timeseries 数据），不用 overview 的 total。
+  // 两者走不同 SQL（stats_overview vs stats_timeseries），边界 bucket 有差，
+  // 头部数字与柱高对不上会被当成图错了
+  const tsTotals = (() => {
+    const sum = (a) => (a || []).reduce((s, v) => s + (v || 0), 0);
+    const allow = ts.slots.reduce((s, _, i) => s + Math.max(0, (ts.counts[i] || 0) - (ts.routes[i] || 0) - (ts.blocks[i] || 0)), 0);
+    return { allow, route: sum(ts.routes), block: sum(ts.blocks) };
+  })();
 
   // KEY × 金额占比环图数据（仅已定价金额>0 的 KEY，降序）
   const billKeyCosts = (() => {
@@ -322,7 +337,7 @@ export default function StatsPage() {
         <>
           <Card title="时间趋势" style={{ marginTop: 12 }}
             extra={<Text type="secondary" style={{ fontSize: 12 }}>
-              本窗口 {ov.total - ov.blocked - ov.local_routed} 放行 / {ov.local_routed} 本地路由 / {ov.blocked} 拦截
+              本窗口 {tsTotals.allow} 放行 / {tsTotals.route} 本地路由 / {tsTotals.block} 拦截
             </Text>}>
             <TrendBars slots={ts.slots} counts={ts.counts} routes={ts.routes} blocks={ts.blocks} />
           </Card>

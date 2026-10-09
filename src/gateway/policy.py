@@ -160,9 +160,16 @@ def _get_field(ctx: Mapping[str, Any], field: str) -> Any:
 
 
 def _eval_cond(cond: Mapping[str, Any], ctx: Mapping[str, Any]) -> bool:
-    """支持 == / in / contains_any / matches_regex / 比较运算符, 字段名嵌入 key."""
+    """支持 == / != / in / not_in / contains_any / matches_regex / 比较运算符, 字段名嵌入 key."""
     for k, v in cond.items():
         k = k.strip()
+        if "!=" in k:
+            return _get_field(ctx, k.split("!=")[0].strip()) != v
+        if " not_in" in k:
+            field = k.split(" not_in")[0].strip()
+            val = _get_field(ctx, field)
+            items = v if isinstance(v, list) else [x.strip() for x in str(v).split(",") if x.strip()]
+            return not any(str(val).strip().lower() == str(x).strip().lower() for x in items)
         if "==" in k:
             return _get_field(ctx, k.split("==")[0].strip()) == v
         if " in" in k:

@@ -45,7 +45,7 @@ def set_env_value(name: str, value: str) -> dict:
     os.environ[name] = value
     p = env_file_path()
     lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
-    quoted = f'"{value}"' if _QUOTE_RE.search(value) else value
+    quoted = f'"{value.replace("\\", "\\\\").replace(chr(34), chr(92)+chr(34))}"' if _QUOTE_RE.search(value) else value
     out, replaced = [], False
     for ln in lines:
         if ln.strip().startswith(name + "="):

@@ -43,7 +43,7 @@ from sqlalchemy import (
     delete as sa_delete,
 )
 
-from .stat_scope import is_abnormal, is_blocked, is_local_route
+from .stat_scope import is_abnormal, is_blocked, is_local_route, to_beijing
 
 _IP_CACHE_TTL_S = 5.0
 _ENTRY_TTL_S = 30.0  # P1: 注册表 entry 缓存（精确+模糊+负缓存），写操作 bump 版本即时失效
@@ -233,21 +233,6 @@ def _ts_str(ts) -> str:
     except Exception:
         return ""
 
-
-def _ts_beijing(ts) -> str:
-    """UTC ts -> 北京时间字符串（仅展示用）。落库与 since/until 窗口过滤仍是 UTC。
-
-    与 main._to_beijing 同口径；admin_store 不 import main（避免循环），故本地实现。
-    解析失败原样返回。
-    """
-    s = _ts_str(ts)
-    if not s:
-        return s
-    try:
-        dt = datetime.datetime.strptime(s[:19], _TS_FMT)
-        return (dt + datetime.timedelta(hours=8)).strftime(_TS_FMT)
-    except Exception:
-        return s
 
 
 def _real_model_label(routes: dict, provider: str, model: str) -> str:
@@ -686,21 +671,6 @@ class AdminStore:
             self._ops_logs.append(dict(row, id=self._ops_seq))
             if len(self._ops_logs) > 500:  # 内存后端只留最近 500 条
                 del self._ops_logs[:-500]
-
-    def list_ops_log(self, limit: int = 50) -> list[dict]:
-        """运维留痕，最新在前。"""
-        limit = max(1, min(int(limit or 50), 200))
-        if self._backend != "memory":
-            try:
-                with self._engine.connect() as conn:
-                    rows = conn.execute(
-                        select(ops_log).order_by(ops_log.c.id.desc()).limit(limit)
-                    ).mappings().all()
-                    return [dict(r) for r in rows]
-            except Exception as e:
-                print(f"[admin_store] ops_log select failed, fallback memory: {e!r}")
-        with self._mem_lock:
-            return [dict(r) for r in list(reversed(self._ops_logs))[:limit]]
 
     # ---------- L2 影子分歧标注（v10 训练原料；内存/MySQL 双后端） ----------
 
@@ -1224,7 +1194,7 @@ class AdminStore:
         """按天计费聚合：北京时间日 × 实际模型。
 
         返回 [{day, model, prompt, completion, cached, creation, calls}]，按天升序。
-        与 stats_billing 同源（_log_rows + _real_model_label），分日用 _ts_beijing（+8h）。
+        与 stats_billing 同源（_log_rows + _real_model_label），分日用 to_beijing（+8h）。
         """
         rows = self._log_rows(since, until)
         try:
@@ -1233,7 +1203,7 @@ class AdminStore:
             _routes = {}
         agg: dict = {}
         for r in rows:
-            day = (_ts_beijing(r.get("ts")) or "")[:10]
+            day = (to_beijing(r.get("ts")) or "")[:10]
             if not day:
                 continue
             label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
@@ -1511,9 +1481,13 @@ class AdminStore:
             idx = int((t - start).total_seconds() // width)
             if 0 <= idx < n:
                 counts[idx] += 1
+                # 两个口径独立判定（不用 elif）：stats_overview 的 SQL 侧是两条
+                # 独立 sum(case)，这里用 elif 会让「同时命中两种口径」的行只算一次，
+                # 趋势图比概览少算 —— 实测 route_local 行 status_code 恒为 200，
+                # 当前两套口径相等，但口径必须同构，否则数据一变就打架
                 if is_local_route(r.get("action")):
                     routes[idx] += 1
-                elif is_blocked(r.get("action"), r.get("status_code")):
+                if is_blocked(r.get("action"), r.get("status_code")):
                     blocks[idx] += 1
         fmt = "%H:%M" if span <= 26 * 3600 else "%m-%d %H:%M"
         slots = [(start + datetime.timedelta(hours=8, seconds=i * width)).strftime(fmt)
@@ -1678,7 +1652,7 @@ class AdminStore:
             g["cached"] += min(int(r.get("cached_tokens") or 0), p)
             g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
             g["calls"] += 1
-            day = (_ts_beijing(r.get("ts")) or "")[:10]
+            day = (to_beijing(r.get("ts")) or "")[:10]
             if day:
                 g = bill_day.setdefault((day, label_m), {"day": day, "model": label_m, "prompt": 0,
                                                           "completion": 0, "cached": 0,
@@ -1698,9 +1672,10 @@ class AdminStore:
                     idx = int((t - start).total_seconds() // width)
                     if 0 <= idx < n:
                         counts[idx] += 1
+                        # 同 stats_timeseries：loc/blk 独立判定，不互斥（口径与 SQL 侧同构）
                         if loc:
                             routes[idx] += 1
-                        elif blk:
+                        if blk:
                             blocks[idx] += 1
 
         avg_ms = int(dur_sum / dur_n) if dur_n else 0
@@ -1767,7 +1742,7 @@ class AdminStore:
         total = len(rows)
         items = rows[offset: offset + max(1, min(int(limit), 1000))]
         for r in items:
-            r["ts"] = _ts_beijing(r.get("ts"))  # 展示 +8h（排序已按 UTC，顺序不变）
+            r["ts"] = to_beijing(r.get("ts"))  # 展示 +8h（排序已按 UTC，顺序不变）
         return {"items": items, "total": total}
 
     def purge_request_logs(self, before: str) -> int:

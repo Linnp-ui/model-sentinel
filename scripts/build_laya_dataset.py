@@ -22,7 +22,7 @@ from collections import Counter
 import pymysql
 
 OUT_DIR = os.path.expanduser("~/models/laya-dataset")
-AUDIT_URL = dict(host="127.0.0.1", user="root", password="changeme",
+AUDIT_URL = dict(host="127.0.0.1", user="root", password="infini_rag_flow",
                  database="gateway_audit", charset="utf8mb4")
 MIN_LABEL_CHARS = 10  # 人工标注样本长度下限（比 MIN_CHARS 松：分歧样本可短，排除极短噪声）
 POS_RULES = {"l2_confidential", "pii_weighted_route_local", "financial_local_only",
@@ -95,20 +95,30 @@ def extract_labeled():
 def apply_labeled(real_train, real_eval, labeled):
     """人工标注纯覆盖 rule 推导（人标 0 也盖掉规则 1，标错即投毒——2026-09-28 实测:
     涨薪结果+姓名薪资被标 0 进训练集）；标注样本不在真实集的直接进训练。
+    留出侧同步移出已进训练的标注样本（`label != shadow` 那批分歧回归就是拿留出当测试集的，
+    标注混进去会让"微调增益"虚高——2026-09-30 实测 3/28 泄漏）。
     返回 (real_train, real_eval, n_override, n_added)。"""
     n_over = 0
+    leaked = set()
     for bucket in (real_train, real_eval):
         for v in bucket:
             h = hashlib.sha1(v["text"].encode()).hexdigest()
             if h in labeled and v["source"] != labeled[h]["source"]:
                 v["label"], v["source"] = labeled[h]["label"], labeled[h]["source"]
                 n_over += 1
+                leaked.add(h)  # 人标是 ground truth，该样本已在留出侧，必须移出（否则模型训过又考它）
     have = {hashlib.sha1(v["text"].encode()).hexdigest() for v in real_train + real_eval}
     n_add = 0
     for h in sorted(labeled):
         if h not in have:
             real_train.append(labeled[h])
+            leaked.add(h)
             n_add += 1
+    if leaked:
+        before = len(real_eval)
+        real_eval[:] = [v for v in real_eval
+                        if hashlib.sha1(v["text"].encode()).hexdigest() not in leaked]
+        print(f"[build_laya_dataset] 防泄漏：{before - len(real_eval)} 条已进训练的标注样本移出留出")
     return real_train, real_eval, n_over, n_add
 
 

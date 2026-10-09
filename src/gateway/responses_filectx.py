@@ -9,22 +9,15 @@ decide() \u7684 ctx \u91cc file \u5b57\u6bb5\u6052\u4e3a\u7a7a\uff0c\u5bfc\u81f4
 """
 from __future__ import annotations
 
-import base64
 import csv
 import io
 from typing import Any
 
+from .file_inspector import decode_inline_data_url
+
 _CSV_EXTS = (".csv", ".txt", ".tsv")
 _MAX_HDR_COLS = 20
 _MAX_CELL = 200
-
-
-def _decode_data_url(url: str) -> bytes | None:
-    try:
-        _, _, data = url.partition(",")
-        return base64.b64decode(data.strip())
-    except Exception:
-        return None
 
 
 def _csv_headers(raw: bytes) -> list:
@@ -112,7 +105,7 @@ def extract_responses_filectx(body: Any, text: str = "") -> dict:
                         break
             fd = b.get("file_data")
             if isinstance(fd, str) and fd.startswith("data:") and low.endswith(_CSV_EXTS):
-                raw = _decode_data_url(fd)
+                raw = decode_inline_data_url(fd)
                 if raw and len(raw) <= 1_000_000:
                     for h in _csv_headers(raw):
                         if h not in headers:

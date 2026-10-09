@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Button, Input, Select, Tag, Space, message, Typography, Alert, Card } from 'antd';
 import { api, errText } from '../api.js';
 

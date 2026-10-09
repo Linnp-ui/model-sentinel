@@ -12,7 +12,7 @@
       2. 文件预检  PDF/Excel/Word/图片(OCR) + magic 嗅探 + 表头/关键词/水印
       3. L1 规则   Regex(身份证/手机/AKIA/私钥) + 熵 + Luhn + 关键词三档 + PII 加权评分
       4. L2 小模型 qwen(OpenAI 协议) 或 laya(非自回归决策模型 /classify)，
-                   灰区(risk 20~60)/长文本(>30字)触发；支持影子双跑（shadow_* 进审计）
+                   灰区(risk ≥20，2026-09-23 起取消字数触发)进 L2；支持影子双跑（shadow_* 进审计）
       5. 策略引擎  policy.yaml 按 priority 命中即停（Pydantic 强校验）
       6. 路由      allow -> 外网（候选失败按 rank→价格自动切换）/ route_local -> 内网 / block
       7. 审计      Redis 热缓存 + MySQL 持久化（90 天，含 L2 判定 JSON），密钥自动脱敏
@@ -20,21 +20,17 @@
 
 ## 界面预览
 
-| 管理台 · 总览 | 演示页（文件上传预检） |
+| 管理台 · 总览 | 审计日志（含脱敏） |
 |---|---|
-| ![overview](docs/screenshots/admin-overview.png) | ![demo](docs/screenshots/demo-page.png) |
+| ![overview](docs/screenshots/admin-overview.png) | ![audit](docs/screenshots/admin-audit.png) |
 
-| 审计日志（含脱敏） | 模型配置（别名/候选/限流） |
+| 模型配置（别名/候选/限流） | API KEY 管理 |
 |---|---|
-| ![audit](docs/screenshots/admin-audit.png) | ![model-policy](docs/screenshots/admin-model-policy.png) |
+| ![model-policy](docs/screenshots/admin-model-policy.png) | ![keys](docs/screenshots/admin-keys.png) |
 
-| API KEY 管理 | 统计可视化 |
+| 统计可视化 | L2 影子（双跑看板/提示词/重训管道） |
 |---|---|
-| ![keys](docs/screenshots/admin-keys.png) | ![stats](docs/screenshots/admin-stats.png) |
-
-| L2 影子（双跑看板/提示词/重训管道） | |
-|---|---|
-| ![l2](docs/screenshots/admin-l2.png) | |
+| ![stats](docs/screenshots/admin-stats.png) | ![l2](docs/screenshots/admin-l2.png) |
 
 ## 特性
 
@@ -118,7 +114,7 @@ conftest 保证**零真实出境**：`OLLAMA_MOCK=true` + `SMALL_MODEL_ENABLED=f
 src/gateway/       网关主服务（main/policy/routing/inspection/file_inspector/small_model/admin_api/...）
   llms/            provider 线协议适配层（OpenAI-compat / Anthropic / Responses 桥）
 tests/             pytest 套件（零出境隔离，fixtures/ 含图纸 PDF 与安全测试集 jsonl）
-static/            演示页 index.html + 管理台前端构建产物（/admin 直服，须与 web/admin 同提交）
+static/            管理台前端构建产物（/admin 直服，须与 web/admin 同提交）
 web/admin/         管理台前端源码（React+antd+uPlot，npm run build 输出到 static/admin）
 demo/              示例财务表格/图纸的生成脚本与样例文件
 docs/              用户说明书 / 管理台操作手册
@@ -133,16 +129,18 @@ docker-compose.yml / Dockerfile
 .env.example       配置模板（.env 不入库）
 ```
 
-## 策略（policy.yaml，priority 升序）
+## 策略（policy.yaml，priority 升序，2026-10 现值）
 
 | priority | 规则 | 行为 |
 |---|---|---|
-| 5 | session_route_local | 机密会话内全部请求 -> 本地 |
+| 5 | pii_weighted_route_local | PII 加权评分 >= 60 -> 本地 |
 | 10 | financial_local_only | 表头/表名/文件名财务关键词 -> 本地 |
-| 12/13 | ocr_empty_image / unparsed_binary | OCR 失败 / 二进制解析失败 -> fail-closed 本地 |
-| 20 | drawing_local_only | 机密/保密水印或关键词 -> 本地 |
-| 25/30 | pii_critical_block / block_secrets | AKIA/私钥/sk-ant- -> block（`on_block: fallback_local` 时降本地） |
-| 40 | pii_weighted_route_local | PII 加权评分 >= 60 -> 本地 |
+| 12 | session_route_local / tainted_file_ref | 会话已判密 / 提及已判密文件名 -> 本地 |
+| 13 | unparsed_binary_route_local | 解析不出的二进制 -> 本地（fail-closed） |
+| 20 | pii_critical_block | 正文命中 AKIA/PEM私钥/ghp_/sk-ant 正则 -> block |
+| 25 | block_secrets | AKIA/私钥 -> block（`on_block: fallback_local` 时降本地） |
+| 30 | ocr_empty_image_route_local | OCR 空结果图片 -> 本地（fail-closed） |
+| 40 | drawing_local_only | 扩展名/水印/内容含"机密/图纸" -> 本地 |
 | 100 | default_allow | 放行外网 |
 
 ## 安全基线

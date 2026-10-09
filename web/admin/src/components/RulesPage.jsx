@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, Slider, Checkbox, Tooltip, Row, Col } from 'antd';
 import { ReloadOutlined, RobotOutlined, ExperimentOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';
@@ -86,6 +86,7 @@ export default function RulesPage() {
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState(null); // 规则名或 null=新增
+  const [prioSort, setPrioSort] = useState('ascend'); // 优先级仅升/降两态，点击直接切换
   const [form] = Form.useForm();
   const [aiLoading, setAiLoading] = useState(false);
   const [l1Test, setL1Test] = useState(null);
@@ -97,8 +98,29 @@ export default function RulesPage() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsFailed, setModelsFailed] = useState(false);
   const [versions, setVersions] = useState([]);
+  const [choices, setChoices] = useState(null);
+  const [choicesLoading, setChoicesLoading] = useState(false);
+  const [matchType, setMatchType] = useState('');
   const [verView, setVerView] = useState(null);
   const [hits, setHits] = useState({});  // rule 名 -> {count, actions, last_seen}（168h）
+  // 构造器可选项来自后端 policy_admin.MATCH_CHOICES（唯一真源），不在前端抄一份
+  const loadChoices = useCallback(async () => {
+    setChoicesLoading(true);
+    try {
+      const d = await api('/policies/match-choices');
+      setChoices([...(d.choices || []), ...(d.self_field || [])]);
+    } catch (e) { setChoices([]); }
+    setChoicesLoading(false);
+  }, []);
+  const VALUE_HINT = {
+    regex: '正则表达式，如 AWS_SECRET|akia',
+    contains: '关键词1, 关键词2',
+    size: '字节数，如 1048576',
+    in: '枚举值1, 枚举值2',
+    not_in: '枚举值1, 枚举值2（都不匹配才算命中）',
+    bool: 'true / false（是 / 否 也认）',
+  };
+  const valueHint = VALUE_HINT[matchType] || '先选匹配条件';
   const loadProviders = useCallback(async () => {
     try {
       const d = await api('/providers');
@@ -129,8 +151,9 @@ export default function RulesPage() {
   useEffect(() => {
     if (!modalOpen) return;
     loadProviders();
+    loadChoices();
     loadModels(form.getFieldValue('target_provider') || '');
-  }, [modalOpen, loadProviders, loadModels, form]);
+  }, [modalOpen, loadProviders, loadChoices, loadModels, form]);
   // builder auto-sync: builder edits rebuild when_json (debounced 400ms);
   // manual when_json edits set a dirty flag pausing auto-sync until builder changes.
   const progRef = useRef(false);
@@ -138,14 +161,20 @@ export default function RulesPage() {
   const whenSyncTimer = useRef(null);
   const syncWhenFromBuilder = useCallback(async () => {
     if (!modalOpen) return;
-    const ct = form.getFieldValue('content_type');
-    const mt = form.getFieldValue('match_type');
-    let mv = form.getFieldValue('match_value');
+    const key = form.getFieldValue('match_cond');
+    if (!key) return;
+    const [ct, mt] = key.split('|');
+    const rawMv = form.getFieldValue('match_value');
+    // 匹配项还没填就切换条件时，别去 build-when 校验——否则空值必然 422
+    // （contains/in/not_in 要求至少一个值）弹出误报。留空=不同步，
+    // when_json 保持原样，等填了值再同步。
+    if (String(rawMv || '').trim() === '') return;
+    let mv = rawMv;
     if (mt === 'size') mv = Number(mv || 0);
     else if (mt === 'contains') mv = String(mv || '').split(',').map((x) => x.trim()).filter(Boolean);
     try {
       const d = await api('/policies/build-when', {
-        method: 'POST', body: JSON.stringify({ content_type: mt === 'size' ? 'size' : ct, match_type: mt, match_value: mv }),
+        method: 'POST', body: JSON.stringify({ content_type: ct, match_type: mt, match_value: mv }),
       });
       progRef.current = true;
       form.setFieldsValue({ when_json: JSON.stringify(d.when, null, 2) });
@@ -159,7 +188,8 @@ export default function RulesPage() {
       if (whenSyncTimer.current) { clearTimeout(whenSyncTimer.current); whenSyncTimer.current = null; }
       return;
     }
-    if (changed.content_type !== undefined || changed.match_type !== undefined || changed.match_value !== undefined) {
+    if (changed.match_cond !== undefined || changed.match_value !== undefined) {
+      if (changed.match_cond !== undefined) setMatchType(String(changed.match_cond).split('|')[1] || '');
       whenDirtyRef.current = false;
       if (whenSyncTimer.current) clearTimeout(whenSyncTimer.current);
       whenSyncTimer.current = setTimeout(() => { syncWhenFromBuilder(); }, 400);
@@ -191,29 +221,42 @@ export default function RulesPage() {
     } catch (e) { message.error(errText(e)); }
   };
 
-  const openEdit = (rec) => {
+  // setFieldsValue 不触发 onValuesChange，matchType（hint 用）得手动同步
+  const applyBuilderPrefill = (ct, mt, mv) => {
+    setMatchType(mt || '');
+    form.setFieldsValue({ match_cond: ct ? `${ct}|${mt}` : null, match_value: mv ?? '' });
+  };
+  const openEdit = async (rec) => {
     setEditing(rec ? rec.name : null);
+    progRef.current = true;
     if (rec) {
-      progRef.current = true;
       form.setFieldsValue({
         name: rec.name, priority: rec.priority, action: rec.action,
         description: rec.description, when_json: JSON.stringify(rec.when, null, 2),
         target_provider: rec.target?.provider || '', target_model: rec.target?.model || '',
-        content_type: 'prompt', match_type: 'regex', match_value: '',
+        match_cond: null, match_value: '',
         ai_description: '',
       });
-      progRef.current = false;
+      setMatchType('');
+      // 已有规则：先尝试把 when 逆解析回构造器控件（开关/单条件规则直接
+      // 在构造器里改，而不是当作新增）。认不出的形状保持空白，绝不预填
+      // 默认值——空白构造器不会去覆盖下方 when_json。
+      try {
+        const d = await api('/policies/parse-when', {
+          method: 'POST', body: JSON.stringify({ when: rec.when }),
+        });
+        if (d.parsed) applyBuilderPrefill(d.parsed.content_type, d.parsed.match_type, d.parsed.match_value);
+      } catch { /* 保持空白，手动改 when_json */ }
     } else {
-      progRef.current = true;
       form.setFieldsValue({
         name: '', priority: 100, action: 'allow', description: '',
         when_json: '{"text contains_any": ["关键词1", "关键词2"]}',
         target_provider: '', target_model: '',
-        content_type: 'prompt', match_type: 'regex', match_value: '',
         ai_description: '',
       });
-      progRef.current = false;
+      applyBuilderPrefill('prompt', 'contains', '');
     }
+    progRef.current = false;
     setModalOpen(true);
   };
 
@@ -224,8 +267,10 @@ export default function RulesPage() {
     try {
       const d = await api('/l2/generate-rule', { method: 'POST', body: JSON.stringify({ description: desc }) });
       const s = d.suggestion;
+      const mt = s.match_type === 'contains' ? 'contains' : 'regex';
+      setMatchType(mt);
       form.setFieldsValue({
-        match_type: s.match_type === 'contains' ? 'contains' : 'regex',
+        match_cond: `prompt|${mt}`,
         match_value: Array.isArray(s.value) ? s.value.join(', ') : s.value,
       });
       message.success(`已生成（${s.explanation}），请确认后保存`);
@@ -262,8 +307,14 @@ export default function RulesPage() {
       const f = document.getElementById('l1test-text');
       const fn = document.getElementById('l1test-filename');
       const sz = document.getElementById('l1test-size');
+      const md = document.getElementById('l1test-model');
+      const ck = document.getElementById('l1test-client');
+      const hr = document.getElementById('l1test-hour');
       setL1Test(await api('/policies/test', { method: 'POST', body: JSON.stringify({
-        text: f?.value || '', filename: fn?.value || '', size: Number(sz?.value || 0) }) }));
+        text: f?.value || '', filename: fn?.value || '', size: Number(sz?.value || 0),
+        model: md?.value || '', client_key: ck?.value || '',
+        // 空串 = 不传（后端回落到当前小时），别传 0 把「凌晨」规则测成假阴性
+        hour: hr?.value === '' ? null : Number(hr?.value) }) }));
     } catch (e) { message.error(errText(e)); }
   };
 
@@ -275,12 +326,12 @@ export default function RulesPage() {
   };
 
   const cols = [
-    { title: '优先级', dataIndex: 'priority', width: 80, sorter: (a, b) => a.priority - b.priority },
+    { title: '优先级', dataIndex: 'priority', width: 80, sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
     { title: '名称', dataIndex: 'name', width: 190, ellipsis: true, render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
     { title: '动作', dataIndex: 'action', width: 110,
       render: (v) => <Tag color={v === 'block' ? 'red' : v === 'route_local' ? 'orange' : 'green'}>{v}</Tag> },
-    { title: '条件', dataIndex: 'when', width: 450, ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
-    { title: <Tooltip title="近 7 天命中次数（审计库口径，排除 default_allow）">168h 命中</Tooltip>, width: 100,
+    { title: '条件', dataIndex: 'when', ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
+    { title: <Tooltip title="近 7 天命中次数（审计库口径，排除 default_allow）">7d 命中</Tooltip>, width: 100,
       render: (_, r) => {
         const h = hits[r.name];
         if (!h) return <Text type="secondary">0</Text>;
@@ -290,8 +341,10 @@ export default function RulesPage() {
           </Tooltip>
         );
       } },
-    { title: '说明', dataIndex: 'description', ellipsis: true },
-    { title: '操作', width: 150,
+    { title: '说明', dataIndex: 'description', width: 150, ellipsis: true },
+    // 操作列要装下 编辑+删除 两个默认尺寸按钮 + 24/24 cell padding，
+    // 150 会撑出 wrapper 右缘（2026-10 实测）
+    { title: '操作', width: 180,
       render: (_, rec) => (
         <Space>
           <Button onClick={() => openEdit(rec)}>编辑</Button>
@@ -312,7 +365,12 @@ export default function RulesPage() {
             <Button aria-label="刷新" icon={<ReloadOutlined />} onClick={load} />
         </Space>
       }>
-        <Table rowKey="name" columns={cols} dataSource={items} loading={loading} size="small" pagination={{ pageSize: 50, showSizeChanger: false }} />
+        <Table rowKey="name" columns={cols} dataSource={items} loading={loading} size="small"
+          tableLayout="fixed" scroll={{ x: 1070 }} pagination={{ pageSize: 50, showSizeChanger: false }}
+          onChange={(_p, _f, sorter, extra) => {
+            // antd 默认三态 升→降→取消(null)；把 null 映射回升序 ⇒ 只有升/降两态，点击直接切换
+            if (extra.action === 'sort') setPrioSort(sorter.order === 'descend' ? 'descend' : 'ascend');
+          }} />
       </Card>
 
       <L2RulesCard />
@@ -325,6 +383,9 @@ export default function RulesPage() {
               <Space wrap>
                 <Input id="l1test-filename" style={{ width: 200 }} placeholder="模拟文件名（可选）" />
                 <Input id="l1test-size" style={{ width: 130 }} placeholder="文件大小(bytes，可选)" />
+                <Input id="l1test-model" style={{ width: 150 }} placeholder="模型名(可选)" />
+                <Input id="l1test-client" style={{ width: 150 }} placeholder="客户端登记名(可选)" />
+                <Input id="l1test-hour" style={{ width: 110 }} placeholder="小时0-23(空=当前)" />
                 <Button icon={<ExperimentOutlined />} onClick={runL1Test}>测试命中</Button>
               </Space>
               {l1Test && (
@@ -405,23 +466,13 @@ export default function RulesPage() {
 
           <Card title="匹配方式构造器" style={{ marginBottom: 12 }}>
             <Space style={{ width: '100%' }} size="middle" wrap>
-              <Form.Item name="content_type" label="内容类型" style={{ marginBottom: 0 }}>
-                <Select style={{ width: 130 }} options={[
-                  { value: 'prompt', label: '提示词' },
-                  { value: 'filename', label: '文件名' },
-                  { value: 'file', label: '文件' },
-                  { value: 'ocr', label: 'OCR' },
-                ]} />
-              </Form.Item>
-              <Form.Item name="match_type" label="匹配类型" style={{ marginBottom: 0 }}>
-                <Select style={{ width: 110 }} options={[
-                  { value: 'regex', label: '正则' },
-                  { value: 'contains', label: '包含任一' },
-                  { value: 'size', label: '文件大小' },
-                ]} />
+              <Form.Item name="match_cond" label="匹配条件" style={{ marginBottom: 0 }}>
+                <Select showSearch style={{ width: 260 }} loading={choicesLoading}
+                  placeholder="选字段 + 匹配方式"
+                  options={(choices || []).filter((c) => editing || c.match_type !== 'bool').map((c) => ({ value: c.key, label: c.label }))} />
               </Form.Item>
               <Form.Item name="match_value" label="匹配项" style={{ marginBottom: 0, minWidth: 260 }}>
-                <Input id="rule-match-value" placeholder="正则 / 关键词1, 关键词2 / 字节数" />
+                <Input id="rule-match-value" placeholder={valueHint} />
               </Form.Item>
             </Space>
             <Space style={{ marginTop: 8 }} wrap>

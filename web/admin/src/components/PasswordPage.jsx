@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, Input, Form, message, Alert, Card } from 'antd';
 import { LockOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';

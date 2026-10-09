@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
@@ -49,11 +49,11 @@ function EventStreamCard({ events }) {
       {series.length ? (
         <Row gutter={[12, 12]}>
           <Col span={12}>
-            <UPlotChart height={200} series={series} />
+            <UPlotChart height={300} series={series} />
           </Col>
           <Col span={12}>
             <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" columns={cols} dataSource={events.recent || []}
-              pagination={false} scroll={{ y: 170 }} />
+              pagination={false} scroll={{ y: 270 }} />
           </Col>
         </Row>
       ) : (
@@ -104,6 +104,8 @@ function ChartPanel({ title, go, children, right }) {
 export default function OverviewPage() {
   const [d, setD] = useState(null);
   const [err, setErr] = useState('');
+  // 初次使用指引：落地页顶部一次性引导，关掉后记 localStorage 不再出现
+  const [guideHidden, setGuideHidden] = useState(() => localStorage.getItem('gw-firstguide-dismissed') === '1');
   // 跨度管拦截率/本地路由率/Token（stats/overview 口径）+ 两大折线图（stats/chart 按窗口重分桶）；
   // QPS/错误率 KPI 是实时信号（环近 10 tick），不随跨度变
   const [hours, setHours] = useState(24);
@@ -163,6 +165,17 @@ export default function OverviewPage() {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
       {err && <Alert type="error" showIcon message={`总览刷新失败：${err}（显示上次数据）`} />}
+      {!guideHidden && (
+        <Alert type="info" showIcon message="初次使用指引"
+          description={
+            <ul style={{ margin: '4px 0 0', paddingLeft: 18, lineHeight: 1.8 }}>
+              <li>先在「API KEY 管理」登记客户端 KEY —— 未登记的 key 调 /v1/* 直接 401</li>
+              <li>快速验证：「路由检查」页干跑（文本 / 文件都支持，不落审计），或 README 的三行 curl</li>
+              <li>改规则 / 路由后先到「路由检查」页干跑验证（生产同款决策链，不产生真实流量）</li>
+            </ul>
+          }
+          onClose={() => { localStorage.setItem('gw-firstguide-dismissed', '1'); setGuideHidden(true); }} />
+      )}
       {/* 时间窗：Portal 进标题右侧（#page-toolbar-slot），标题栏本就常驻；切页卸载自动清空 */}
       {typeof document !== 'undefined' && document.getElementById('page-toolbar-slot')
         ? createPortal((

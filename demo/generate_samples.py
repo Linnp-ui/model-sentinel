@@ -1,5 +1,5 @@
 """
-生成演示用 财务表格 + 图纸PDF
+生成手动测试用 财务表格 + 图纸PDF（管理台「路由检查」页 / /v1/files/check 上传用）
 运行: python demo/generate_samples.py
 """
 import os

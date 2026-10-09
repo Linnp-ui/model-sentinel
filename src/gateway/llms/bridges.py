@@ -30,14 +30,14 @@ def sse(obj: Dict[str, Any], event: str | None = None) -> bytes:
 # Anthropic Messages 入站
 # ================================================================
 
-def _clip(s: Any, n: int) -> str:
+def clip_audit(s: Any, n: int) -> str:
     """送审截断：防超大字段(base64/长文档)拖慢 L1/L2。"""
     if s is None:
         return ""
     return str(s)[:n]
 
 
-def _clip_url(url: Any) -> str:
+def clip_audit_url(url: Any) -> str:
     """URL 送审：http(s) 全收(限 2000)；data: 只留前 200 字符作存在标记，不解码。"""
     u = str(url or "")
     return u[:200] if u.startswith("data:") else u[:2000]
@@ -47,10 +47,10 @@ def _anthropic_content_ref(c: Any) -> str:
     if c is None:
         return ""
     if isinstance(c, str):
-        return _clip(c, 4000)
+        return clip_audit(c, 4000)
     if isinstance(c, list):
         return " ".join(
-            _anthropic_block_ref(x) if isinstance(x, dict) else _clip(x, 4000) for x in c)
+            _anthropic_block_ref(x) if isinstance(x, dict) else clip_audit(x, 4000) for x in c)
     return ""
 
 
@@ -61,39 +61,39 @@ def _anthropic_block_ref(b: Dict[str, Any]) -> str:
     """
     t = b.get("type", "")
     if t in ("text", "input_text"):
-        return _clip(b.get("text", ""), 4000)
+        return clip_audit(b.get("text", ""), 4000)
     if t in ("image", "document", "input_image"):
         src = b.get("source")
         if isinstance(src, dict):
             st = src.get("type", "")
             if st == "url":
-                return _clip_url(src.get("url", ""))
+                return clip_audit_url(src.get("url", ""))
             if st == "text":
-                return _clip(src.get("data", ""), 4000)
+                return clip_audit(src.get("data", ""), 4000)
             if st == "file":
-                return _clip(src.get("file_id", ""), 500)
+                return clip_audit(src.get("file_id", ""), 500)
             if st == "base64":
-                return _clip(str(src.get("data", ""))[:200], 200)
+                return clip_audit(str(src.get("data", ""))[:200], 200)
         for k in ("url", "image_url"):
             if isinstance(b.get(k), str) and b[k]:
-                return _clip_url(b[k])
+                return clip_audit_url(b[k])
         return ""
     if t == "tool_use":
         parts = []
         if b.get("name"):
-            parts.append(_clip(b["name"], 200))
+            parts.append(clip_audit(b["name"], 200))
         try:
-            parts.append(_clip(json.dumps(b.get("input", ""), ensure_ascii=False), 4000))
+            parts.append(clip_audit(json.dumps(b.get("input", ""), ensure_ascii=False), 4000))
         except Exception:
-            parts.append(_clip(b.get("input", ""), 4000))
+            parts.append(clip_audit(b.get("input", ""), 4000))
         return " ".join(x for x in parts if x)
     if t in ("tool_result", "tool_search_tool_result", "web_search_tool_result"):
         return _anthropic_content_ref(b.get("content"))
     if t == "container_upload":
-        return _clip(b.get("file_id", ""), 500)
+        return clip_audit(b.get("file_id", ""), 500)
     for k in ("filename", "file_id", "url", "image_url"):
         if isinstance(b.get(k), str) and b[k]:
-            return _clip_url(b[k]) if "url" in k else _clip(b[k], 500)
+            return clip_audit_url(b[k]) if "url" in k else clip_audit(b[k], 500)
     return ""
 
 
@@ -101,36 +101,36 @@ def _responses_block_ref(b: Dict[str, Any]) -> str:
     """Responses 内容块的可审查文本(P1)：input_image/file、function_call/output。"""
     t = b.get("type", "")
     if t in ("input_text", "text", "output_text"):
-        return _clip(b.get("text", ""), 4000)
+        return clip_audit(b.get("text", ""), 4000)
     if t in ("input_image", "image", "image_url"):
         v = b.get("image_url", "")
-        return _clip_url(v if isinstance(v, str) else "")
+        return clip_audit_url(v if isinstance(v, str) else "")
     if t in ("input_file", "file"):
-        return " ".join(_clip(b.get(k, ""), 500) for k in ("filename", "file_id")).strip()
+        return " ".join(clip_audit(b.get(k, ""), 500) for k in ("filename", "file_id")).strip()
     if t == "function_call":
         parts = []
         if b.get("name"):
-            parts.append(_clip(b["name"], 200))
+            parts.append(clip_audit(b["name"], 200))
         if b.get("arguments"):
-            parts.append(_clip(b["arguments"], 4000))
+            parts.append(clip_audit(b["arguments"], 4000))
         return " ".join(x for x in parts if x)
     if t in ("function_call_output", "output"):
-        return _clip(b.get("output", b.get("text", "")), 4000)
+        return clip_audit(b.get("output", b.get("text", "")), 4000)
     for k in ("filename", "file_id"):
         if isinstance(b.get(k), str) and b[k]:
-            return _clip(b[k], 500)
+            return clip_audit(b[k], 500)
     return ""
 
 
 def _responses_item_ref(item: Dict[str, Any]) -> str:
     c = item.get("content")
     if isinstance(c, str):
-        return _clip(c, 4000)
+        return clip_audit(c, 4000)
     if isinstance(c, list):
         return " ".join(
-            _responses_block_ref(x) if isinstance(x, dict) else _clip(x, 4000) for x in c)
+            _responses_block_ref(x) if isinstance(x, dict) else clip_audit(x, 4000) for x in c)
     if isinstance(item.get("text"), str):
-        return _clip(item["text"], 4000)
+        return clip_audit(item["text"], 4000)
     return _responses_block_ref(item)
 
 

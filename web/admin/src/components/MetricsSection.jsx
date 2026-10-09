@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, Card, Segmented, Space, Typography } from 'antd';
 import UPlotChart, { msAxis, qpsAxis } from '../UPlotChart.jsx';
 import { fetchJson as api } from '../api.js';

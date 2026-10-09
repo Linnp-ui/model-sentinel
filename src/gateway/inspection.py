@@ -47,9 +47,28 @@ KEYWORD_WEIGHTS = {
     "密钥": 20, "token": 20, "password": 20, "AKIA": 20,
 }
 
-RISK_THRESHOLD_ROUTE_LOCAL = 60  # >=60 -> route_local
-RISK_THRESHOLD_BLOCK = 150        # >=150 -> block (override to block)
-
+# 2026-10-08 补（160 条矩阵 7 条 risk=0 漏网分析）：单关键词打不中的"口语化/暗语"
+# 形状。每条规则一个 20 档 = 恰好落进灰区下界，交给 L2 判密，网关门逻辑不变。
+# 计数按规则去重（同名规则多次命中只算一次）。
+RISK_RULES = {
+    # 暗语金额指代："那个数你懂的,38后面加个k" / "图上那个数,C后面35" / "会上定的那个月数,2加13"
+    "implied_amount": re.compile(
+        r"(?:那个|这份|那份|这个)[^,，。;；]{0,4}(?:数|金额|工资|月薪|薪资)"
+        r"|[A-Za-z0-9]{1,4}\s*后面\s*[加接][^,，。;；]{0,3}[A-Za-z0-9kK万千]"
+    ),
+    # 口语金额："涨到38000了" / "加到50k"（要求 4+ 位数，避免命中"上涨5%"这类公开报道）
+    "raise_amount": re.compile(r"(?:涨到|涨至|加到|涨了|拿到|到手)[^,，。;；]{0,6}\d{4,}"),
+    # 拼音/拆字薪资："我 g 资 daoshou 12k"
+    "salary_pinyin": re.compile(
+        r"(?:到手|daoshou|gongzi|xinzi|gong\s?zi|xin\s?zi)\s*[:：]?\s*[\d一二三四五六七八九十]"
+    ),
+    # 高管行程："老板周三下午3点见红杉的人,行程没变吧"（必须与职务同现，避开"行程单私发我"）
+    # 间隔允许跨逗号，故用 [\s\S] 而非排除标点的字符类
+    "exec_schedule": re.compile(
+        r"(?:老板|领导|高管|总裁|总经理|副总)[\s\S]{0,24}(?:行程|日程|在哪|几点|见谁)"
+        r"|(?:行程|日程)[\s\S]{0,10}(?:老板|领导|高管|总裁|总经理|副总)"
+    ),
+}
 
 def luhn_valid(card: str) -> bool:
     s = 0
@@ -270,15 +289,13 @@ def inspect_text(text: str) -> Dict:
         if kw in (text or ""):
             keyword_hits.append(kw)
             keyword_score += w
+    # 规则跑归一化副本（零宽/全角绕过），与 PII 层同一份，见 _normalize_for_pii
+    for name, pat in RISK_RULES.items():
+        if pat.search(pii_text):
+            keyword_hits.append(name)
+            keyword_score += 20
 
     risk_score = min(200, weighted_count + keyword_score)
-    severity = "LOW"
-    if risk_score >= RISK_THRESHOLD_BLOCK:
-        severity = "CRITICAL"
-    elif risk_score >= RISK_THRESHOLD_ROUTE_LOCAL:
-        severity = "HIGH"
-    elif risk_score >= 30:
-        severity = "MEDIUM"
 
     return {
         "findings": findings,
@@ -288,5 +305,4 @@ def inspect_text(text: str) -> Dict:
         "keyword_hits": keyword_hits,
         "by_type": by_type,
         "risk_score": risk_score,
-        "severity": severity,
     }

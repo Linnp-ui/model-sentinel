@@ -1,4 +1,4 @@
-import React, { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react';
+import { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react';
 import { Layout, Menu, Button, Tag, Tooltip, Typography, Spin } from 'antd';
 import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
@@ -12,37 +12,46 @@ import {
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
 
-// ---------------- 全局状态条：外网 key / 内网 / L2 / 熔断 / 审计，60s 自动刷新 ----------------
+// ---------------- 全局状态条：外网 key / 内网 / L2 / 熔断 / 审计，SSE 推送 ----------------
 function StatusBar() {
   const [st, setSt] = useState(null);
   const [busy, setBusy] = useState(false);
-  const load = useCallback(async () => {
-    setBusy(true);
-    try {
-      const [h, c, l2, a] = await Promise.all([
-        fetch('/health').then((r) => r.json()),
-        fetch('/admin/api/circuit').then((r) => r.json()),
-        fetch('/admin/api/l2-config').then((r) => r.json()),
-        fetch('/admin/audit/status').then((r) => r.json()).catch(() => null),
-      ]);
-      const ext = (h.providers || {})[h.default_external];
-      const open = Object.entries(c.providers || {}).filter(([, p]) => p.state === 'open').map(([n]) => n);
-      const my = (a && a.mysql) || {};
-      const auditBad = a ? !!(a.redis && a.redis.connected === false)
-        || (my.enabled && (my.last_error || (my.err_count || 0) > 0)) : false;
-      const auditTip = a ? `审计 ${a.backend}｜mysql err=${my.err_count || 0}${my.last_error ? '：' + my.last_error : ''}` : '审计状态未知';
-      setSt({ extName: h.default_external, extOk: !!(ext && ext.configured),
-              localName: h.default_local, l2On: !!l2.SMALL_MODEL_ENABLED,
-              open, auditBad, auditTip,
-              updatedAt: new Date() });
-    } catch (e) { setSt(null); }
-    setBusy(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const apply = useCallback((raw) => {
+    const h = raw.health, c = raw.circuit, l2 = raw.l2 || {}, a = raw.audit;
+    if (!h || !c) return;
+    const provs = h.providers || {};
+    const ext = provs[h.default_external];
+    // 外网 provider 全量 key 覆盖（默认那家缺 key 是硬故障，其余缺只是没配）
+    const exts = Object.entries(provs).filter(([, p]) => !p.local);
+    const extMissing = exts.filter(([, p]) => !p.configured).map(([n]) => n);
+    const localMissing = Object.entries(provs).filter(([, p]) => p.local && !p.configured).map(([n]) => n);
+    const open = Object.entries(c.providers || {}).filter(([, p]) => p.state === 'open').map(([n]) => n);
+    const my = (a && a.mysql) || {};
+    const dropped = (my.dropped || {}).total || 0;
+    const auditBad = a ? !!(a.redis && a.redis.connected === false)
+      || (my.enabled && (my.last_error || (my.err_count || 0) > 0)) : false;
+    const auditTip = a ? `审计 ${a.backend}｜mysql err=${my.err_count || 0}${my.last_error ? '：' + my.last_error : ''}｜丢行 ${dropped}` : '审计状态未知';
+    setSt({ extName: h.default_external, extOk: !!(ext && ext.configured),
+            extTotal: exts.length, extMissing, localMissing,
+            localName: h.default_local, l2On: !!l2.SMALL_MODEL_ENABLED,
+            l2Backend: l2.AI_GATEWAY_L2_BACKEND || 'qwen', l2Shadow: !!l2.AI_GATEWAY_L2_SHADOW,
+            open, auditBad, dropped, auditTip,
+            updatedAt: new Date() });
   }, []);
+  // 服务端每 60s 推一拍；EventSource 断线浏览器自带重连（401 时永远拿不到数据 → 整条不渲染）
   useEffect(() => {
-    load();
-    const t = setInterval(load, 60000);
-    return () => clearInterval(t);
-  }, [load]);
+    setBusy(true);
+    const es = new EventSource('/admin/api/status/stream');
+    es.onopen = () => setBusy(false);
+    es.onmessage = (e) => {
+      setBusy(false);
+      const raw = JSON.parse(e.data);
+      if (!raw.error) apply(raw);
+    };
+    es.onerror = () => setBusy(false);
+    return () => es.close();
+  }, [apply, reloadKey]);
   if (!st) return null;
   const light = (on, tOn, tOff) => on
     ? <Tag color="green" style={{ marginInlineEnd: 0 }}>{tOn}</Tag>
@@ -55,13 +64,33 @@ function StatusBar() {
         : '默认外网 provider 未配 key：外发将 503（Provider 管理页可一键配置，即时生效）'}>
         {light(st.extOk, `外网 ${st.extName} key已配`, `外网 ${st.extName} 缺key`)}
       </Tooltip>
-      <Tag color="blue" style={{ marginInlineEnd: 0 }}>内网 {st.localName}</Tag>
-      {light(st.l2On, 'L2 审查开', 'L2 审查关')}
+      <Tooltip title={st.extMissing.length
+        ? `未配网关 key 的外网 provider：${st.extMissing.join(', ')}（Provider 管理页可一键配置）`
+        : '全部外网 provider 网关 key 已配置'}>
+        <Tag color={st.extMissing.length ? 'orange' : 'green'} style={{ marginInlineEnd: 0 }}>
+          外网 key {st.extTotal - st.extMissing.length}/{st.extTotal}
+        </Tag>
+      </Tooltip>
+      <Tooltip title={st.localMissing.length
+        ? `未配置（缺 base_url）的内网 provider：${st.localMissing.join(', ')}`
+        : '内网 provider 均已配置'}>
+        <Tag color={st.localMissing.length ? 'red' : 'blue'} style={{ marginInlineEnd: 0 }}>
+          内网 {st.localName}{st.localMissing.length ? ` 缺${st.localMissing.join(',')}` : ''}
+        </Tag>
+      </Tooltip>
+      <Tooltip title={`权威后端 ${st.l2Backend}｜影子 ${st.l2Shadow ? '开（并行打标，不改路由）' : '关'}｜关闭时 L2 不可用将放行（AI_GATEWAY_L2_FAIL_MODE）`}>
+        {light(st.l2On, `L2 审查开·${st.l2Backend}`, 'L2 审查关')}
+      </Tooltip>
+      {st.l2Shadow && st.l2On && (
+        <Tag color="blue" style={{ marginInlineEnd: 0 }}>L2 影子开</Tag>
+      )}
       {st.open.length
         ? <Tag color="red" className="status-critical" style={{ marginInlineEnd: 0 }}>熔断 {st.open.length}（{st.open.join(', ')}）</Tag>
         : <Tag color="green" style={{ marginInlineEnd: 0 }}>熔断正常</Tag>}
       <Tooltip title={st.auditTip}>
-        {light(!st.auditBad, '审计/DB 正常', '审计/DB 异常')}
+        {st.dropped > 0
+          ? <Tag color="orange" className="status-critical" style={{ marginInlineEnd: 0 }}>审计丢行 {st.dropped}</Tag>
+          : light(!st.auditBad, '审计/DB 正常', '审计/DB 异常')}
       </Tooltip>
       {st.updatedAt && (
         <Text type="secondary" style={{ fontSize: 12, marginLeft: 'auto' }}>
@@ -69,7 +98,7 @@ function StatusBar() {
         </Text>
       )}
       <Button size="small" type="text" aria-label="刷新状态" icon={<ReloadOutlined />}
-        loading={busy} onClick={load} />
+        loading={busy} onClick={() => setReloadKey((k) => k + 1)} />
     </div>
   );
 }
