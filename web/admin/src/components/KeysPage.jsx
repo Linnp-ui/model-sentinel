@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Table, Button, Input, Modal, Form, Tag, Space, message, Popconfirm, Typography, Alert } from 'antd';
+import { Table, Button, Input, Modal, Form, Tag, Space, message, Popconfirm, Typography, Alert, Card } from 'antd';
 import { ImportOutlined, KeyOutlined, ReloadOutlined, CopyOutlined } from '@ant-design/icons';
 import { api, errText, copyText } from '../api.js';
 
@@ -84,14 +84,16 @@ export default function KeysPage() {
   };
 
 
+  /* 列宽用 % 自适应（灌数轮次表口径）：备注 600px 定宽曾把窄屏表撑出横向滚动 */
   const cols = [
-    { title: '名称（人员）', dataIndex: 'name', width: 140, ellipsis: true },
-    { title: 'KEY', dataIndex: 'key_masked', width: 170, render: (v) => <Text code>{v}</Text> },
-    { title: '备注', dataIndex: 'note', width: 600, ellipsis: true },
-    { title: '状态', dataIndex: 'disabled', width: 72, render: (v, rec) => (<Tag data-testid={`keys-status-${rec.id}`} color={v ? 'red' : 'green'}>{v ? '停用' : '启用'}</Tag>) },
-    { title: '登记时间', dataIndex: 'created_at' },
+    { title: '名称（人员）', dataIndex: 'name', width: '14%', ellipsis: true },
+    { title: 'KEY', dataIndex: 'key_masked', width: '16%', ellipsis: true, render: (v) => <Text code>{v}</Text> },
+    { title: '备注', dataIndex: 'note', width: '23%', ellipsis: true },
+    { title: '状态', dataIndex: 'disabled', width: '8%', render: (v, rec) => (<Tag data-testid={`keys-status-${rec.id}`} color={v ? 'red' : 'green'}>{v ? '停用' : '启用'}</Tag>) },
+    { title: '登记时间', dataIndex: 'created_at', width: '16%', ellipsis: true },
     {
       title: '操作',
+      width: '23%',
       render: (_, rec) => (
         <Space>
           <Button onClick={() => openEdit(rec)}>编辑</Button>
@@ -113,13 +115,11 @@ export default function KeysPage() {
         <Button data-testid="keys-reload" icon={<ReloadOutlined />} onClick={load}>刷新</Button>
         {meta && <Text data-testid="keys-meta-registered" style={{ marginLeft: 16, fontSize: 16 }}>已登记 <Text strong style={{ fontSize: 18 }}>{meta.api_keys}</Text></Text>}
       </Space>
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        用法：客户端带 <Text code>Authorization: Bearer &lt;key&gt;</Text>（或 <Text code>x-api-key</Text> 头）调
-        <Text code>/v1/chat/completions</Text> 等端点；未登记的 key 直接 401。KEY 明文只在登记 / 生成时显示一次。
-      </Text>
-      <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small"
+      <Card title="已登记 KEY">
+      <Table rowKey="id" className="tbl-keys" columns={cols} dataSource={items} loading={loading} size="small"
         locale={{ emptyText: '暂无已登记 KEY，点上方「登记 KEY」添加' }}
         pagination={{ pageSize: 50, showSizeChanger: false }} />
+      </Card>
       <Modal title={editing ? "编辑 API KEY" : "登记 API KEY"} open={modalOpen} onOk={submit} onCancel={() => { setEditing(null); form.resetFields(); setModalOpen(false); }}>
         <Form form={form} layout="vertical">
           {editing ? null : (

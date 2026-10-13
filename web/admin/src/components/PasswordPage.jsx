@@ -19,7 +19,7 @@ export default function PasswordPage() {
   };
 
   return (
-    <Card title="修改管理员密码" style={{ maxWidth: 480 }}>
+    <Card title="修改管理员密码" style={{ maxWidth: 480, margin: '0 auto' }}>
       {meta && (
         <Alert style={{ marginBottom: 16 }} showIcon
           type={meta.credential_set ? 'success' : 'warning'}

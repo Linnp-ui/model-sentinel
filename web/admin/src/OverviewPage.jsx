@@ -1,10 +1,12 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip } from 'antd';
+import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip, Spin } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
+import DailyHeatmap, { dailyPointsFromChart } from './components/DailyHeatmap.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
 import { SuggestionCard } from './components/KeyRulesPage.jsx';
+import WheelGate from './components/WheelGate.jsx';
 
 // ---------------- 降级事件流：流式降级 / 本地路由 / L2 不可用（数据源 audit_logs） ----------------
 const EV_META = [
@@ -13,28 +15,34 @@ const EV_META = [
   ['l2_unavailable', 'L2 不可用', '#faad14'],
 ];
 
+// UTC 字符串 → 北京时间显示（同 L2Page bj 范式：ts 存 UTC，展示 +8）
+const _bjFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai',
+  dateStyle: 'short', timeStyle: 'medium', hour12: false });
+const bj = (ts) => {
+  const t = Date.parse(String(ts).replace(' ', 'T').slice(0, 19) + 'Z');
+  if (Number.isNaN(t)) return String(ts || '');
+  return _bjFmt.format(t);
+};
+
 function EventStreamCard({ events }) {
+  // 三计数（金丝雀：今天外发链路/安全降级正不正常）+ 明细表（预筛的最近事件）。
+  // 时间线散点已删：~5 条/天频率下近乎恒空，信息量≈0，表格已能看时间分布（2026-10-12 拍板）
   const s = events.summary || {};
-  const series = (events.by_hour || []).length
-    ? [
-      { name: '流式降级', color: '#ff4d4f', points: (events.by_hour || []).map((x) => ({ t: Math.floor(Date.parse(x.t.replace(' ', 'T') + 'Z') / 1000), v: x.degrade })) },
-      { name: '本地路由', color: '#fa8c16', points: (events.by_hour || []).map((x) => ({ t: Math.floor(Date.parse(x.t.replace(' ', 'T') + 'Z') / 1000), v: x.route_local })) },
-      { name: 'L2 不可用', color: '#faad14', points: (events.by_hour || []).map((x) => ({ t: Math.floor(Date.parse(x.t.replace(' ', 'T') + 'Z') / 1000), v: x.l2_unavailable })) },
-    ] : [];
   const cols = [
-    { title: '时间 (UTC)', dataIndex: 'ts', width: 150 },
-    { title: '事件', dataIndex: 'kinds', width: 190,
+    /* 列宽用 % 自适应（灌数轮次表口径）；时间为纯文本，窄列溢出需 ellipsis 裁切 */
+    { title: '时间 (北京时间)', dataIndex: 'ts', width: '16%', ellipsis: true, render: (v) => bj(v) },
+    { title: '事件', dataIndex: 'kinds', width: '20%',
       render: (ks) => (ks || []).map((k) => {
         const m = EV_META.find(([id]) => id === k);
         return <Tag key={k} color={m ? m[2] : 'default'} style={{ marginInlineEnd: 4 }}>{m ? m[1] : k}</Tag>;
       }) },
-    { title: '明细', width: 220,
+    { title: '明细', width: '22%',
       render: (_, r) => (
         <Tooltip title={`${r.rule || '-'} / ${r.downgraded_from || '-'} / ${r.provider || '-'}${r.model ? ':' + r.model : ''}`}>
           <span>{[r.downgraded_from, r.rule].filter(Boolean).join(' · ') || '-'}</span>
         </Tooltip>
       ) },
-    { title: '内容', dataIndex: 'text_preview', ellipsis: true },
+    { title: '内容', dataIndex: 'text_preview', width: '42%', ellipsis: true },
   ];
   return (
     <Card title="降级事件流"
@@ -46,27 +54,24 @@ function EventStreamCard({ events }) {
           ))}
         </Space>
       }>
-      {series.length ? (
-        <Row gutter={[12, 12]}>
-          <Col span={12}>
-            <UPlotChart height={300} series={series} />
-          </Col>
-          <Col span={12}>
-            <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" columns={cols} dataSource={events.recent || []}
-              pagination={false} scroll={{ y: 270 }} />
-          </Col>
-        </Row>
-      ) : (
+      {/* 明细表是总览页唯一嵌套滚动容器：滚轮让位页面（表仍可拖细滚动条翻），见 WheelGate */}
+      <WheelGate>
+      {(events.recent || []).length === 0 ? (
         <Alert type="success" showIcon message="本窗口无降级事件（外发链路全绿：无流式降级、无本地路由、L2 正常）" />
+      ) : (
+        <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" columns={cols} dataSource={events.recent}
+          pagination={false} scroll={{ y: 300 }} />
       )}
+      </WheelGate>
     </Card>
   );
 }
 
 const { Text: T } = Typography;
 
-// ---------------- 总览（默认落地页）：每页挑一个最重要信号，同指标不重复 ----------------
-// 运行指标 → QPS / 延迟分位（两大图）+ 错误率；审计 → 拦截率 / 本地路由；统计 → Token
+// ---------------- 总览（默认落地页）：一个页面看到尽量多信息 ----------------
+// KPI 5 卡 + QPS/延迟分位两大图 + 降级事件流 + 建议/Provider 健康全在页上；
+// 与统计页 MetricsSection 的重复是有意保留（落地页密度优先，详情点「详情 →」跳统计页）
 // KEY 规则 → 调节策略建议（SuggestionCard 同卡）；熔断/外网key 由全局 StatusBar 灯覆盖，不重复做卡
 
 const avg = (vs) => {
@@ -89,13 +94,10 @@ function Kpi({ testid, title, value, suffix, color, go, goLabel }) {
   );
 }
 
-function ChartPanel({ title, go, children, right }) {
+function ChartPanel({ title, go, children }) {
   return (
-    <Card title={title} extra={
-      <Space size="small">
-        {right}
-        <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>
-      </Space>}>
+    <Card title={title} style={{ height: '100%' }} extra={
+      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>}>
       {children}
     </Card>
   );
@@ -104,20 +106,32 @@ function ChartPanel({ title, go, children, right }) {
 export default function OverviewPage() {
   const [d, setD] = useState(null);
   const [err, setErr] = useState('');
-  // 初次使用指引：落地页顶部一次性引导，关掉后记 localStorage 不再出现
+  // 初次使用指引：落地页顶部引导。X = 本次会话收起；「不再提醒」= 记 localStorage 永久不再出现
   const [guideHidden, setGuideHidden] = useState(() => localStorage.getItem('gw-firstguide-dismissed') === '1');
+  const [guideSessionHidden, setGuideSessionHidden] = useState(false);
+  const dismissGuide = () => { localStorage.setItem('gw-firstguide-dismissed', '1'); setGuideHidden(true); };
   // 跨度管拦截率/本地路由率/Token（stats/overview 口径）+ 两大折线图（stats/chart 按窗口重分桶）；
   // QPS/错误率 KPI 是实时信号（环近 10 tick），不随跨度变
   const [hours, setHours] = useState(24);
+  // 切窗反馈：只有手动切窗显加载动画，30s 轮询刷新不闪 Spin
+  const [loading, setLoading] = useState(false);
+  const hoursRef = useRef(hours);
+  hoursRef.current = hours;
+  const seqRef = useRef(0);
 
   const load = useCallback(async (h = hours) => {
+    // 只有最新一次 load 有权摘遮罩：在飞的旧窗请求（30s 轮询）后落地时
+    // 不能把刚切窗接上的遮罩立刻拆掉
+    const seq = ++seqRef.current;
     try {
       const [ts, ov, ch, ev] = await Promise.all([
-        get('/admin/metrics/timeseries'),
+        get('/admin/metrics/timeseries?recent=20'),
         get(`/admin/api/stats/overview?hours=${h}`),
         get(`/admin/api/stats/chart?hours=${h}`),
         get(`/admin/api/events?hours=${h}`).catch(() => null),
       ]);
+      // 切窗后旧窗请求才落地 → 丢弃，防止旧窗数据覆盖新窗（30s 轮询与切窗竞态）
+      if (h !== hoursRef.current) return;
       const w = ts.ticks || [];
       const last = w.slice(-10);
       const qpsNow = avg(last.map((t) => t.qps_total));
@@ -133,7 +147,10 @@ export default function OverviewPage() {
         events: ev,
       });
       setErr('');
-    } catch (e) { setErr(errText(e)); }
+    } catch (e) { if (h === hoursRef.current) setErr(errText(e)); }
+    // 摘遮罩双守卫：seq 防同窗双击刷新互拆；hoursRef 防切窗后、新 load 启动前
+    // 旧窗请求先落地把刚接上的遮罩拆掉
+    finally { if (seq === seqRef.current && h === hoursRef.current) setLoading(false); }
   }, [hours]);
 
   useEffect(() => {
@@ -142,22 +159,36 @@ export default function OverviewPage() {
     return () => clearInterval(t);
   }, [load]);
 
+  // hooks 必须在早退 return 之前（eslint react-hooks/rules-of-hooks）
+  const ch = d?.chart || { ts: [], qps: [], qps_max: [], counts: [], p50: [], p95: [], p99: [], lat_min: [] };
+  // useMemo：数据不变不重算（30s 轮询/切窗点击渲染都会重跑本组件）；
+  // ≤24h 不渲染热力图，跳过计算
+  const dailyCounts = useMemo(() => (hours > 24 ? dailyPointsFromChart(ch) : null), [ch, hours]);
+
   if (!d && !err) return <Card loading />;
 
-  const ch = d?.chart || { ts: [], qps: [], p50: [], p95: [], p99: [] };
   const pts = (arr, zero) => (ch.ts || []).map((t, i) => ({
     t, v: !arr || arr[i] == null ? null : (arr[i] ?? (zero ? 0 : null)) }));
-  // 总览只看总量（分类型是运行指标页的活）；数据源自 stats/chart（request_log 按窗口分桶）
-  // 峰值保持：QPS 峰值=桶内 10s 子槽最大速率，延迟 Max/Min=桶内极值，毛刺不被桶均值吃掉
+  // 两大图数据源自 stats/chart（request_log 按窗口分桶，与统计页延迟分位同源同口径）；
+  // 峰值保持：QPS 峰值=桶内 10s 子槽最大速率，延迟 Min=桶内极值，毛刺不被桶均值吃掉
+  const nArr = (ch.counts || []).map((v) => v || 0);
+  const winCalls = nArr.reduce((a, b) => a + b, 0);
+  const nzBuckets = nArr.filter((v) => v > 0).length;
+  // QPS：窗口 0 调用 → 显式空态（平 0 线会读成"正常运行"）；>24h 窗稀疏流量 → 日粒度热力
+  const qpsEmpty = winCalls === 0 ? `近 ${hours} 小时 0 次调用（外发链路空闲，不是"正常运行"）` : null;
   const qpsSeries = ch.ts?.length
     ? [{ name: 'QPS', color: '#1677ff', points: pts(ch.qps, true) },
        { name: 'QPS 峰值', color: '#722ed1', points: pts(ch.qps_max, true) }] : [];
-  // 网关延迟分位 P50/P95/P99（分位口径同 latency_percentiles，空桶断线）
+  // 网关延迟分位 P50/P95/P99 改散点：生产是低流量，桶内样本 1~36，
+  // 小样本桶的分位数≈单请求值，连线是误导；点大小 ∝ 桶内样本数 n
+  const hasLat = (ch.p50 || []).some((v) => v != null);
+  const latEmpty = !hasLat ? '窗口内无延迟样本（无经网关的请求）' : null;
   const latSeries = ch.ts?.length ? [
-    { name: 'P50', color: '#52c41a', points: pts(ch.p50, false) },
-    { name: 'P95', color: '#fa8c16', points: pts(ch.p95, false) },
-    { name: 'P99', color: '#ff4d4f', points: pts(ch.p99, false) },
-    { name: 'Min', color: '#b7eb8f', points: pts(ch.lat_min, false) },
+    { name: 'P50', color: '#52c41a', dots: true, n: nArr, points: pts(ch.p50, false) },
+    { name: 'P95', color: '#fa8c16', dots: true, n: nArr, points: pts(ch.p95, false) },
+    { name: 'P99', color: '#ff4d4f', dots: true, n: nArr, points: pts(ch.p99, false) },
+    // Min 用中性灰：#b7eb8f 浅绿与 P50 #52c41a 同色系难分辨，白底上对比度仅 ~1.9:1
+    { name: 'Min', color: '#8c8c8c', dots: true, n: nArr, points: pts(ch.lat_min, false) },
   ] : [];
   const errColor = d && d.err != null
     ? (d.err >= 0.05 ? '#ff4d4f' : d.err > 0 ? '#fa8c16' : '#52c41a') : undefined;
@@ -165,8 +196,9 @@ export default function OverviewPage() {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
       {err && <Alert type="error" showIcon message={`总览刷新失败：${err}（显示上次数据）`} />}
-      {!guideHidden && (
+      {!guideHidden && !guideSessionHidden && (
         <Alert type="info" showIcon message="初次使用指引"
+          action={<Button size="small" type="link" style={{ padding: 0 }} onClick={dismissGuide}>不再提醒</Button>}
           description={
             <ul style={{ margin: '4px 0 0', paddingLeft: 18, lineHeight: 1.8 }}>
               <li>先在「API KEY 管理」登记客户端 KEY —— 未登记的 key 调 /v1/* 直接 401</li>
@@ -174,16 +206,19 @@ export default function OverviewPage() {
               <li>改规则 / 路由后先到「路由检查」页干跑验证（生产同款决策链，不产生真实流量）</li>
             </ul>
           }
-          onClose={() => { localStorage.setItem('gw-firstguide-dismissed', '1'); setGuideHidden(true); }} />
+          onClose={() => setGuideSessionHidden(true)} />
       )}
       {/* 时间窗：Portal 进标题右侧（#page-toolbar-slot），标题栏本就常驻；切页卸载自动清空 */}
       {typeof document !== 'undefined' && document.getElementById('page-toolbar-slot')
         ? createPortal((
-          <Select size="small" value={hours} onChange={(v) => setHours(v)} style={{ width: 130 }}
+          <Select size="small" value={hours} onChange={(v) => { setLoading(true); setHours(v); }} style={{ width: 130 }}
             options={RANGES.map((r) => ({ value: r.hours, label: r.label }))} />
         ), document.getElementById('page-toolbar-slot'))
         : null}
-      <Row gutter={[12, 12]}>
+      {/* 切窗期间旧窗数据仍在（不清空），Spin 遮罩给出"在换"的反馈；
+          KPI/图表/事件流三块各自是外层 Space 的 item（vertical middle=16px 块间 gap） */}
+      <Spin spinning={loading}>
+      <Row gutter={[16, 16]}>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-qps" title="当前 QPS"
             value={d && d.qps != null ? d.qps.toFixed(1) : '-'} suffix="req/s"
@@ -214,22 +249,48 @@ export default function OverviewPage() {
             go="/stats" goLabel="统计可视化 →" />
         </Col>
       </Row>
-      <Row gutter={[12, 12]}>
-        <Col span={12}>
+      </Spin>
+      <Spin spinning={loading}>
+      <Row gutter={[16, 16]}>
+        <Col span={12} style={{ minWidth: 0 }}>
           <ChartPanel title="QPS" go="/stats">
-            <UPlotChart height={300} yVal={qpsAxis} series={qpsSeries} />
+            {qpsEmpty ? (
+              <Alert type="info" showIcon message={qpsEmpty} />
+            ) : hours <= 24 ? (
+              <UPlotChart height={300} yVal={qpsAxis} series={qpsSeries} />
+            ) : (
+              <>
+                <T type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 8 }}>
+                  窗口 {winCalls} 次调用 · {(ch.ts || []).length} 桶仅 {nzBuckets} 桶有流量 → 日粒度（北京时区）
+                </T>
+                <DailyHeatmap points={dailyCounts} testid="ov-qps-daily" />
+              </>
+            )}
           </ChartPanel>
         </Col>
-        <Col span={12}>
+        <Col span={12} style={{ minWidth: 0 }}>
           <ChartPanel title="网关延迟分位 P50/P95/P99" go="/stats">
-            <UPlotChart height={300} yVal={msAxis} series={latSeries} />
+            {latEmpty ? (
+              <Alert type="info" showIcon message={latEmpty} />
+            ) : (
+              <>
+                {/* 与统计页同图同编码：点大小含义只在那里有提示，落地页补同款 */}
+                <T type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 4 }}>
+                  散点：点大小 ∝ 桶内样本数 n（小样本桶的分位数≈单请求值）
+                </T>
+                <UPlotChart height={300} yVal={msAxis} series={latSeries} />
+              </>
+            )}
           </ChartPanel>
         </Col>
       </Row>
+      </Spin>
       {d.events && (
+        <Spin spinning={loading}>
         <EventStreamCard events={d.events} />
+        </Spin>
       )}
-      <Row gutter={[12, 12]}>
+      <Row gutter={[16, 16]}>
         <Col span={12}>
           <SuggestionCard />
         </Col>

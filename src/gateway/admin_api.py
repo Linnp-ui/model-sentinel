@@ -53,6 +53,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from src.gateway.admin_store import get_admin_store, mask_key
+from src.gateway.stat_scope import to_beijing
 from src.gateway import l2_overrides as _l2ov
 from src.gateway import policy_admin
 
@@ -146,7 +147,10 @@ def change_password(body: PasswordChangeReq):
 
 @router.get("/keys")
 def list_keys():
-    return {"items": get_admin_store().list_api_keys()}
+    items = get_admin_store().list_api_keys()
+    for r in items:
+        r["created_at"] = to_beijing(r.get("created_at"))
+    return {"items": items}
 
 
 @router.post("/keys")
@@ -244,6 +248,7 @@ def list_keyrules(kind: Optional[str] = None):
     items = get_admin_store().list_key_rules(kind)
     for it in items:
         it["key_masked"] = mask_key(it.pop("key_value", ""))
+        it["created_at"] = to_beijing(it.get("created_at"))
     return {"items": items}
 
 
@@ -341,7 +346,7 @@ def list_logs_api(
 def cleanup_logs_api(days: float = 90.0):
     """手动清理超过 days 天的明细。"""
     import time as _t
-    cutoff = _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(_t.time() - days * 86400))
+    cutoff = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime(_t.time() - days * 86400))
     return {"deleted": get_admin_store().purge_request_logs(cutoff)}
 
 
@@ -973,7 +978,10 @@ def delete_policy_api(name: str, request: Request):
 @router.get("/policy/versions")
 def policy_versions_api(limit: int = 50):
     """policy.yaml 历史版本列表（每次写盘前快照；yaml_text 仅 200 字预览）。"""
-    return {"items": get_admin_store().list_policy_versions(limit)}
+    items = get_admin_store().list_policy_versions(limit)
+    for r in items:
+        r["ts"] = to_beijing(r.get("ts"))
+    return {"items": items}
 
 
 @router.get("/policy/versions/{vid}")
@@ -1220,7 +1228,10 @@ def l2_prompts_put(req: L2PromptsPutReq, request: Request):
 @router.get("/l2-prompt-versions")
 def l2_prompt_versions_api(limit: int = 50):
     """L2 提示词历史版本（每次 PUT 前快照；system 只给 200 字预览 + sha12）。"""
-    return {"items": get_admin_store().list_prompt_versions(limit)}
+    items = get_admin_store().list_prompt_versions(limit)
+    for r in items:
+        r["ts"] = to_beijing(r.get("ts"))
+    return {"items": items}
 
 
 @router.get("/l2-prompt-versions/{vid}")
@@ -1667,6 +1678,8 @@ def rule_hits_api(hours: int = 168):
         if ts > a["last_seen"]:
             a["last_seen"] = ts
     items = sorted(agg.values(), key=lambda x: -x["count"])
+    for a in items:
+        a["last_seen"] = to_beijing(a["last_seen"])
     return {"hours": hours, "total": total, "items": items}
 
 
@@ -2099,49 +2112,20 @@ class ProviderCheckReq(BaseModel):
 def providers_check_api(body: ProviderCheckReq):
     """provider 主动健康检查：GET {base_url}/models 测连通+鉴权+延迟。
 
-    name 空 = 查全部；不发起真实模型调用（不耗 token）。"""
-    import time as _t
-
-    import httpx
-
+    name 空 = 查全部；不发起真实模型调用（不耗 token）。探测逻辑复用 provider_probe，
+    与后台周期探测同一份代码（口径不漂移）。"""
+    from src.gateway import provider_probe
     from src.gateway.providers import load_routing
-    from src.gateway.routing import upstream_proxy
 
     cfg = load_routing()
     names = [body.name] if body.name else list(cfg.providers)
     results = []
     for name in names:
         prov = cfg.get(name)
-        entry: dict = {"name": name, "ok": False}
         if prov is None:
-            entry["error"] = "未知 provider"
-            results.append(entry)
+            results.append({"name": name, "ok": False, "error": "未知 provider"})
             continue
-        base = (prov.base_url or "").rstrip("/")
-        if not base:
-            entry["error"] = "未配置 base_url"
-            results.append(entry)
-            continue
-        key, src = _models_list_key(prov, "")
-        entry["key_source"] = src
-        t0 = _t.monotonic()
-        try:
-            resp = httpx.get(f"{base}/models", headers=prov.headers(key),
-                             timeout=body.timeout, trust_env=False,
-                             proxy=upstream_proxy())
-            entry["latency_ms"] = round((_t.monotonic() - t0) * 1000)
-            entry["status"] = resp.status_code
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("data") if isinstance(data, dict) else data
-                entry["ok"] = True
-                entry["model_count"] = len([i for i in (items or []) if i])
-            else:
-                entry["error"] = f"上游 HTTP {resp.status_code}"
-        except Exception as e:
-            entry["latency_ms"] = round((_t.monotonic() - t0) * 1000)
-            entry["error"] = repr(e)[:200]
-        results.append(entry)
+        results.append(provider_probe.probe_one(prov, body.timeout))
     return {"results": results}
 
 

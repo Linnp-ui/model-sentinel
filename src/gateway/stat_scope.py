@@ -24,7 +24,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 __all__ = ["is_abnormal", "is_blocked", "is_local_route", "resolve_action",
-           "to_beijing", "to_local_naive"]
+           "to_beijing"]
 
 
 def _norm_action(action) -> str:
@@ -83,25 +83,11 @@ def resolve_action(reason, status_code) -> str:
         pass
     return "route_local" if str(reason or "").strip() else "allow"
 
-def to_local_naive(dt):
-    """aware datetime -> 本地墙钟（去 tzinfo）；朴素时间原样返回。
-
-    审计明细的 time 是 time.strftime("%Y-%m-%d %H:%M:%S")（本地墙钟），所以任何
-    ISO 入参都必须先 astimezone() 落到本地再比。原实现直接 replace(tzinfo=None)，
-    把 UTC 串当本地墙钟用，窗口整体偏一个时区（趋势桶跟着左移）。
-    """
-    if dt is None:
-        return None
-    if dt.tzinfo is not None:
-        return dt.astimezone().replace(tzinfo=None)
-    return dt
-
-
 def to_beijing(value):
     """审计时间落库为 UTC（naive），展示时 +8h 对齐北京时间。解析失败原样返回。
 
     只在**读/展示**路径调用（entries API / CSV 导出 / 分日聚合），存储与
-    since/until 过滤仍按 UTC，避免口径漂移；服务器时区是 UTC，别挪到写路径。
+    since/until 过滤仍按 UTC（写入侧一律显式 gmtime/utcnow，不依赖宿主 TZ）。
     接收 datetime 或 str（容忍 'T' 分隔与秒后尾巴）。
     """
     if not value:

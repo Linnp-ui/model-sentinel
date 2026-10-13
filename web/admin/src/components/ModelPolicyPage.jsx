@@ -5,6 +5,7 @@ import { api, errText } from '../api.js';
 
 const { Text } = Typography;
 import ExternalCandidateModal, { ExternalCandidateFormItems } from './ExternalCandidateBits.jsx';
+import WheelGate from './WheelGate.jsx';
 
 // model_policy 无局部保存接口，整文档按段保存：GET 现值 → 换目标段 → PUT 全文。
 // 候选/内部模型/限流三卡 + 别名弹窗内"新增候选"共用，防漏带其他段（曾漏 model_limits）。
@@ -106,8 +107,9 @@ function AliasGroupsCard() {
         pagination={false}
         size="small"
         columns={[
-          { title: '别名', dataIndex: 'name', width: 120, render: (v) => <Tag color="blue">{v}</Tag> },
-          { title: '候选链（顺序即优先级，第一个为默认）', render: (_, g) => (
+          /* 列宽用 % 自适应（灌数轮次表口径）；操作列是按钮组，保留定宽 */
+          { title: '别名', dataIndex: 'name', width: '12%', render: (v) => <Tag color="blue">{v}</Tag> },
+          { title: '候选链（顺序即优先级，第一个为默认）', width: '77%', render: (_, g) => (
               <Space direction="vertical" size={2}>
                 {(g.members || []).map((m, i) => (
                   <Typography.Text key={i} type={m.enabled ? undefined : 'secondary'}>
@@ -281,22 +283,23 @@ function ExternalCandidatesCard() {
           onChange={setFallback} />
         <Text type="secondary">关闭后报错/溢出不再自动切换；重启后恢复 env 配置</Text>
       </Space>
-      <Table rowKey={(r) => `${r.provider}/${r.model}`} size="small" pagination={false}
+      <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" pagination={false}
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无外部候选，点「新增候选」添加' }}
         columns={[
-          { title: 'Provider', dataIndex: 'provider' },
-          { title: '模型', dataIndex: 'model' },
-          { title: '价格入(¥/1M)', dataIndex: 'price_per_1m_in' },
-          { title: '价格出(¥/1M)', dataIndex: 'price_per_1m_out' },
-          { title: '上下文', dataIndex: 'context_length' },
-          { title: 'Rank', dataIndex: 'rank' },
-          { title: '启用', dataIndex: 'enabled', render: (v, _, i) => (
+          /* 全部列显式 % 宽（fixed 布局下无宽 auto 列没有最窄列宽，会塌到 0） */
+          { title: 'Provider', dataIndex: 'provider', width: '12%' },
+          { title: '模型', dataIndex: 'model', width: '15%' },
+          { title: '价格入(¥/1M)', dataIndex: 'price_per_1m_in', width: '13%' },
+          { title: '价格出(¥/1M)', dataIndex: 'price_per_1m_out', width: '13%' },
+          { title: '上下文', dataIndex: 'context_length', width: '11%' },
+          { title: 'Rank', dataIndex: 'rank', width: '9%' },
+          { title: '启用', dataIndex: 'enabled', width: '8%', render: (v, _, i) => (
             <Switch size="small" checked={!!v} onChange={(on) => {
               const next = rows.slice(); next[i] = { ...next[i], enabled: on };
               saveAll(next).catch((e) => message.error(errText(e)));
             }} />) },
-          { title: '操作', render: (_, r, i) => (
+          { title: '操作', width: '18%', render: (_, r, i) => (
             <Space>
               <Button type="link" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.provider}/${r.model}？`} onConfirm={() => {
@@ -553,10 +556,12 @@ export function L2PromptsSection() {
         <Text type="secondary" style={{ fontSize: 12 }}>{dirty ? '（有未保存改动）' : ''}</Text>
         <Button icon={<ReloadOutlined />} onClick={load}>刷新</Button>
       </Space>
+      <WheelGate>
       <Row gutter={8}>
         <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>SYSTEM</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.system_prompt.slice(0, 200)}{data.system_prompt.length > 200 ? '…' : ''}</Typography.Paragraph></Col>
         <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>USER 模板</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.user_prompt_template}</Typography.Paragraph></Col>
       </Row>
+      </WheelGate>
       <Space style={{ marginTop: 8 }}>
         <Button loading={proposing} onClick={propose}>自动修补（qwen 自省错题，~2min，只生成不应用）</Button>
       </Space>
@@ -666,22 +671,23 @@ function InternalModelsCard() {
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无内部模型，点「新增内部模型」添加' }}
         columns={[
-          { title: 'Provider', dataIndex: 'provider' },
-          { title: '模型', dataIndex: 'model' },
-          { title: '网址', dataIndex: 'url', ellipsis: true,
+          /* 列宽用 % 自适应（灌数轮次表口径）；操作列是按钮组，保留定宽 */
+          { title: 'Provider', dataIndex: 'provider', width: '14%' },
+          { title: '模型', dataIndex: 'model', width: '16%', ellipsis: true },
+          { title: '网址', dataIndex: 'url', width: '20%', ellipsis: true,
             render: (v) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : <Text type="secondary">—</Text>) },
-          { title: '备注', dataIndex: 'note' },
-          { title: '健康', width: 170, ellipsis: true, render: (_, r) => (
+          { title: '备注', dataIndex: 'note', width: '13%', ellipsis: true },
+          { title: '健康', width: '12%', ellipsis: true, render: (_, r) => (
               !r._health ? <Text type="secondary">—</Text>
               : r._health.ok
                 ? <Text type="success">正常 {r._health.latency_ms ?? '?'}ms{r._health.label ? ` ${r._health.label}` : ''}</Text>
                 : <Text type="danger" title={r._health.error}>{r._health.error || '异常'}</Text>) },
-          { title: '启用', dataIndex: 'enabled', render: (v, _, i) => (
+          { title: '启用', dataIndex: 'enabled', width: '14%', render: (v, _, i) => (
             <Switch size="small" checked={!!v} onChange={(on) => {
               const next = rows.slice(); next[i] = { ...next[i], enabled: on };
               saveAll(next).catch((e) => message.error(errText(e)));
             }} />) },
-          { title: '操作', render: (_, r, i) => (
+          { title: '操作', width: 180, render: (_, r, i) => (
             <Space>
               <Button type="link" size="small" loading={checking === i} onClick={() => checkRow(r, i)}>检查</Button>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
@@ -776,19 +782,20 @@ function ModelLimitsCard() {
   return (
     <Card title="模型限流（全局，超限 429）"
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增限流</Button>}>
-      <Table rowKey="model" size="small" pagination={false}
+      <Table rowKey="model" className="tbl-limits" size="small" pagination={false}
         loading={loading} dataSource={rows}
         locale={{ emptyText: '未配置限流（全部不限）' }}
         columns={[
-          { title: '模型', dataIndex: 'model', render: (v) => <Text code>{v}</Text> },
-          { title: 'RPM', dataIndex: 'rpm', render: (v) => (v > 0 ? v : <Tag>不限</Tag>) },
-          { title: '备注', dataIndex: 'note' },
-          { title: '启用', dataIndex: 'enabled', render: (v, _, i) => (
+          /* 全部列显式 % 宽（fixed 布局下无宽 auto 列没有最窄列宽，会塌到 0） */
+          { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true, render: (v) => <Text code>{v}</Text> },
+          { title: 'RPM', dataIndex: 'rpm', width: '20%', render: (v) => (v > 0 ? v : <Tag>不限</Tag>) },
+          { title: '备注', dataIndex: 'note', width: '20%' },
+          { title: '启用', dataIndex: 'enabled', width: '20%', render: (v, _, i) => (
             <Switch size="small" checked={!!v} onChange={(on) => {
               const next = rows.slice(); next[i] = { ...next[i], enabled: on };
               saveAll(next).catch((e) => message.error(errText(e)));
             }} />) },
-          { title: '操作', render: (_, r, i) => (
+          { title: '操作', width: '20%', render: (_, r, i) => (
             <Space>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.model} 的限流？`} onConfirm={() => {

@@ -119,9 +119,11 @@ export default function AuditPage() {
 
   const setFld = (k) => (e) => { const next = { ...f, [k]: e.target.value }; setF(next); writeUrl(next); };
 
+  /* 列宽用 % 自适应（灌数轮次表口径）：固定 px 在窄屏撑出表内横向滚动 */
   const cols = [
-    { title: '时间', dataIndex: 'time', width: 165, align: 'center' },
-    { title: '动作 / 规则', width: 190, align: 'center', ellipsis: true, className: 'cell-center',
+    /* 时间/Provider 是纯文本无省略号：窄列会溢出到邻列，加 ellipsis 裁切 */
+    { title: '时间', dataIndex: 'time', width: '15%', align: 'center', ellipsis: true },
+    { title: '动作 / 规则', width: '16%', align: 'center', ellipsis: true, className: 'cell-center',
       render: (_, r) => {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
         return (
@@ -130,13 +132,13 @@ export default function AuditPage() {
           </Tag>
         );
       } },
-    { title: 'Provider', dataIndex: 'provider', width: 110, align: 'center', render: (v) => v || '—' },
-    { title: '模型', dataIndex: 'model', width: 150, align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
-    { title: '调用方名称', dataIndex: 'key_name', width: 130, align: 'center',
+    { title: 'Provider', dataIndex: 'provider', width: '10%', align: 'center', ellipsis: true, render: (v) => v || '—' },
+    { title: '模型', dataIndex: 'model', width: '12%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
+    { title: '调用方名称', dataIndex: 'key_name', width: '12%', align: 'center',
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
-    { title: '客户端 IP', dataIndex: 'client_ip', width: 120, align: 'center', render: (v) => v || '—' },
-    { title: '文件名', dataIndex: 'filename', width: 220, ellipsis: true, render: (v) => v || '—' },
-    { title: '内容摘要', dataIndex: 'text_preview',
+    { title: '客户端 IP', dataIndex: 'client_ip', width: '10%', align: 'center', render: (v) => v || '—' },
+    { title: '文件名', dataIndex: 'filename', width: '13%', ellipsis: true, render: (v) => v || '—' },
+    { title: '内容摘要', dataIndex: 'text_preview', width: '9%',
       render: (v) => (
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
@@ -182,6 +184,7 @@ export default function AuditPage() {
           </Text>
         </>
       )}
+      <Card title="审计日志">
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}
         expandable={{ expandedRowRender: (rec) => <L2Detail rec={rec} />,
@@ -193,6 +196,7 @@ export default function AuditPage() {
           onChange: (pg) => setPageNo(pg), showSizeChanger: false,
           showTotal: (t, rg) => `第 ${rg[0]}-${rg[1]} 条 / 共 ${t} 条`,
         }} />
+      </Card>
     </Space>
   );
 }

@@ -13,7 +13,7 @@
   .status-critical { animation: none; }
 }
 
-/* 页面 Content padding=24；统一所有卡片（含 size=small）head 为同一格式：
+/* 页面 Content padding=16；统一所有卡片（含 size=small）head 为同一格式：
    antd small 卡默认 head min-height=38px/font=14px/body=12px，
    normal 卡 min-height=56px/font=16px/body=24px —— 全部对齐到 normal 值 */
 .ant-card-head {
@@ -23,6 +23,38 @@
   font-size: 16px !important;
 }
 .ant-card-head-title { padding: 0 !important; }
+/* 单元格不换行：fixed 布局缩宽时 % 列等比缩小，压到最窄列宽后表内横向滚动而不是
+   折行；ellipsis 列本就 nowrap+省略号，不受影响 */
+.ant-table-cell { white-space: nowrap; }
+/* 每列最窄列宽：rc-table 默认 tableLayout=fixed，列宽只认 col 的 %，单元格
+   min-width/内容宽都不参与布局 ⇒ ellipsis 列可被压到 0、各表横滚起点互不相同
+   （2026-10 实测；auto 布局也不行——Blink 把 nowrap 全文宽当硬下限，长文本列
+   直接撑爆容器）。fixed 下 <col> 的 min-width 才生效（探针验证）：全部列 96px
+   兜底，列宽 = max(指定宽, 96px)，总和放不下时表内横滚——「灌数轮次」表的行为，
+   全部表同口径 */
+.ant-table col { min-width: 96px; }
+/* 逐列下限：内容宽于 96 的 Tag/按钮列不能 ellipsis 裁切（切 Tag/切按钮会坏），
+   按列给足。rc-table 只在 auto 布局反映 column.minWidth，fixed 只能 col nth-child
+   （2026-10 实测内容宽：主→影双 Tag≈300 / 方向 Tag≈130 / 动作 Tag≈152 / 类型双 Tag≈155 /
+   keys 操作 3 按钮≈255 / 外部候选·限流 操作双链接≈150 / 熔断 操作 2 按钮≈170 /
+   注册表 操作≈145 / 注册表 Key 列 code+Tag+按钮≈305） */
+.tbl-divs col:nth-child(2) { min-width: 130px; }
+.tbl-divs col:nth-child(3) { min-width: 310px; }
+.tbl-l1 col:nth-child(3) { min-width: 155px; }
+.tbl-registry col:nth-child(4) { min-width: 160px; }
+.tbl-registry col:nth-child(6) { min-width: 310px; }
+.tbl-registry col:nth-child(8) { min-width: 150px; }
+.tbl-keys col:nth-child(6) { min-width: 275px; }
+.tbl-ext col:nth-child(8) { min-width: 150px; }
+.tbl-limits col:nth-child(5) { min-width: 150px; }
+.tbl-circuit col:nth-child(5) { min-width: 170px; }
+/* 无固定头的表 .ant-table-content 默认 overflow visible：nowrap 后表宽超卡会顶出
+   卡片撑宽 body，改表内横向滚动（固定头表走 .ant-table-body，不受影响） */
+.ant-table-content { overflow-x: auto; }
+/* 卡内正文基准 14→16（antd 默认）：继承生效，显式字号组件（KPI 标签/注释行等）不受影响 */
+.ant-card-body { font-size: 16px; }
+/* Statistic title 被 antd css-xxx 硬编码 14px、不吃卡体继承（同 head/cell 的 !important 因） */
+.ant-statistic-title { font-size: 16px !important; }
 /* 表格单元格左右留白对称（small 表基础 padding 8px → 24px；原只加左侧
    导致左 24/右 8 不对称、内容偏右，17 张表都受影响。审计表 :39 另限定 12/12） */
 .ant-table-cell { padding-left: 24px !important; padding-right: 24px !important; }
@@ -35,6 +67,7 @@
 .ant-table tbody > tr > td.ant-table-cell-ellipsis { text-align: left !important; }
 /* 列显式要求居中且带省略号时（审计表规则/模型列）：覆盖上面的左对齐例外 */
 .ant-table tbody > tr > td.ant-table-cell-ellipsis.cell-center { text-align: center !important; }
+
 /* 审计表 10 列且窄（最小 110px），表头挤在左边认不出对应哪列：左右留白对称。
    只审计表需要，用组件根 class 限定作用域，别改全局 .ant-table-cell。 */
 .audit-table .ant-table-cell { padding-left: 12px !important; padding-right: 12px !important; }
@@ -46,3 +79,7 @@
   margin-bottom: 12px;
 }
 .ant-card-body > [data-testid="l2cfg-section"] { width: 100%; }
+/* 加载遮罩立即接上：antd 嵌套 Spin 的内容模糊（opacity 0.3s）与白罩（::after
+   all 0.3s）都带 300ms 淡入（motionDurationSlow），切时间窗时遮罩"慢半拍"。
+   transition 置 none 挂载即满遮罩；管理台其余 Spin/Table loading 同口径即时。 */
+.ant-spin-container, .ant-spin-blur::after { transition: none !important; }

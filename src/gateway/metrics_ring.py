@@ -167,7 +167,8 @@ class Ring:
         now = self._now()
 
         def fmt(ts: float) -> str:
-            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            # 显式 UTC：与 request_log.ts（UTC 落库）同基，宿主 TZ 无关
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
 
         try:
             pct = _percentiles_for_window(fmt(now - PCT_WINDOW_S), fmt(now))

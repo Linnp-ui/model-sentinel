@@ -240,13 +240,20 @@ def _real_model_label(routes: dict, provider: str, model: str) -> str:
 
     stats_key_model 与 stats_billing 共用。别名按**当前**主候选解析，
     历史改名会有小偏差（计费/占比口径声明，不修）。
+    历史脏行在读侧归一：空 model 只留 provider、model 已含 provider 前缀去重
+    （写入侧保留原值供审计追溯，不迁移数据）。
     """
     m = (model or "").strip()
     p = (provider or "").strip()
     cands = ((routes or {}).get(m.lower()) or {}).get("candidates") or []
     if cands:
         return f"{cands[0]['provider']}/{cands[0]['model']}"
-    return f"{p}/{m}" if p else (m or "(unknown)")
+    # 脏行归一：空 model（files/check 等路径传 ""）→ 只留 provider；
+    # 客户端斜杠式 model 已含 provider 前缀 → 去重，避免 "vllm_local/vllm_local/..."
+    # 双前缀行在外网 provider 上让 _price_billing 按首 / 拆名静默漏定价。
+    if m and p and m.lower().startswith(p.lower() + "/"):
+        m = m[len(p) + 1:]
+    return f"{p}/{m}" if (p and m) else (m or p or "(unknown)")
 
 
 def _parse_ts(s):
@@ -415,7 +422,7 @@ class AdminStore:
         if not pw or len(pw) < 8:
             raise ValueError("password must be >= 8 chars")
         h = hash_password(pw)
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             from sqlalchemy.dialects.mysql import insert as my_insert
             with self._engine.begin() as conn:
@@ -492,7 +499,7 @@ class AdminStore:
             raise ValueError("name is required")
         if len(name) > 128:
             raise ValueError("name too long")
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             with self._engine.begin() as conn:
                 exists = conn.execute(
@@ -654,7 +661,7 @@ class AdminStore:
 
     def log_ops(self, action: str, detail: str = "", operator: str = "") -> None:
         row = {
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
             "action": str(action or "")[:64],
             "detail": str(detail or "")[:512],
             "operator": str(operator or "")[:128],
@@ -678,7 +685,7 @@ class AdminStore:
         req_id = str(req_id or "")[:40]
         if not req_id:
             return
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             try:
                 from sqlalchemy.dialects.mysql import insert as my_insert
@@ -731,7 +738,7 @@ class AdminStore:
 
     def save_policy_version(self, yaml_text: str, operator: str = "", source: str = "save",
                             rule_count: int = 0) -> None:
-        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
                "operator": str(operator or "")[:128],
                "source": str(source or "save")[:16],
                "yaml_text": yaml_text,
@@ -786,7 +793,7 @@ class AdminStore:
 
     def save_prompt_version(self, system_prompt: str, user_template: str,
                             operator: str = "", source: str = "save") -> None:
-        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
                "operator": str(operator or "")[:128],
                "source": str(source or "save")[:16],
                "system_prompt": system_prompt or "",
@@ -899,7 +906,7 @@ class AdminStore:
         for i, m in enumerate(norm):
             m["priority"] = (i + 1) * 10
         new = (new_name or "").strip()
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             with self._engine.begin() as conn:
                 if new and new != name:
@@ -1007,7 +1014,7 @@ class AdminStore:
             raise ValueError("kind must be black|white")
         if not (8 <= len(key_value) <= 256):
             raise ValueError("key_value must be 8-256 chars")
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             with self._engine.begin() as conn:
                 exists = conn.execute(
@@ -1086,7 +1093,7 @@ class AdminStore:
     # ---------- 3.x 请求明细 ----------
 
     def insert_request_log(self, entry: dict) -> None:
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         ts_raw = entry.get("ts") or now
         if self._backend != "memory":
             _parsed = _parse_ts(ts_raw) if isinstance(ts_raw, str) else ts_raw

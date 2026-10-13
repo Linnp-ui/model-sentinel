@@ -26,6 +26,15 @@ Linux 纯 UTF-8 + LF，`src/gateway/*.py` 与 `tests/*.py` 直接 `Read` / 编�
 .venv/bin/python -c "import ast; ast.parse(open('src/gateway/main.py', encoding='utf-8').read())"
 ```
 
+## 时间约定（2026-10-12 起）
+
+宿主 TZ = `Asia/Shanghai`。**时间写入一律显式 UTC**（`gmtime`/`utcnow()`），禁裸
+`time.strftime()`/`datetime.now()`（会跟着宿主墙钟漂）；展示一律 `to_beijing +8h`。
+`_parse_window_ts` 三时基：存储值解析按 UTC 原样 / 用户朴素日期输入按北京解释（-8h）/
+ISO 带显式偏移精确换算 UTC；L1 规则的 `time.hour` 上下文 = 北京墙钟。MySQL 在 docker
+（容器自带 `TZ=Asia/Shanghai`，`NOW()` 北京时间），不受宿主 TZ 影响。细节见
+`agents/gotchas.md` 2026-10-12 条。
+
 ## Quick Start
 
 ```bash

@@ -119,8 +119,9 @@ def _thresholds() -> dict:
 
 
 def _window(since_hours: float) -> tuple:
-    until = time.strftime("%Y-%m-%d %H:%M:%S")
-    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - since_hours * 3600))
+    # 显式 UTC：request_log.ts 一律 UTC 落库，窗口与存储同基（不依赖宿主 TZ）
+    until = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - since_hours * 3600))
     return since, until
 
 
@@ -221,7 +222,7 @@ def _maybe_purge(store) -> None:
     try:
         days = float(os.getenv("AI_GATEWAY_LOG_RETENTION_DAYS", "90"))
         cutoff = time.strftime(
-            "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400)
+            "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - days * 86400)
         )
         store.purge_request_logs(cutoff)
     except Exception:
@@ -551,7 +552,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         except Exception:
             pass
         first_seen = _load_rule_first_seen()
-        today = time.strftime("%Y-%m-%d")
+        today = time.strftime("%Y-%m-%d", time.gmtime())
         touched = False
         for p in load_policy():
             if p.name not in first_seen:

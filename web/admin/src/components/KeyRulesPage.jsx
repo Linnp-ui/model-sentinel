@@ -1,9 +1,11 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, List, InputNumber } from 'antd';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, List, InputNumber, Spin } from 'antd';
 import { StopOutlined, ReloadOutlined, ThunderboltOutlined, SlidersOutlined } from '@ant-design/icons';
 import { api, errText, RANGES } from '../api.js';
 
 const { Text } = Typography;
+// 按窗口阈值 map（{'*': v} 或 {24:..,168:..,720:..}）取 24h 代表值：'*' 优先，否则 24，否则第一个
+const pick24 = (m) => (m && (m['*'] ?? m[24] ?? Object.values(m)[0])) || '-';
 // ---------------- 调节策略建议（总览 + KEY 黑白名单页共用；onApplied 供宿主刷新自己的表格） ----------------
 const RANGE_LABEL = (h) => (RANGES.find((r) => r.hours === h) || {}).label || `最近 ${h} 小时`;
 const sugTitleOf = (meta, h) => {
@@ -14,6 +16,18 @@ const sugTitleOf = (meta, h) => {
     : `${base}（${RANGE_LABEL(h)}）`;
 };
 const sevColor = { high: 'red', warn: 'orange', info: 'blue' };
+// 一键应用的按钮文案/确认提示/颜色按 kind 走（后端 6 种：black/white/unwhite/reorder/remove_rule/add_limit）。
+// 旧三元式只认 white/unwhite，reorder/remove_rule/add_limit 全部误标「一键拉黑」且确认框拼出空名。
+// 红色只给破坏性操作（拉黑=403、删规则）；加白/撤销白名单/重排/加限流方向偏安全，不红
+const APPLY_UI = {
+  black: { label: '一键拉黑', danger: true, confirm: (s) => `确认拉黑 ${s.key_name || s.ip || ''}？` },
+  white: { label: '一键加白', danger: false, confirm: (s) => `确认将 ${s.key_name || ''} 加入白名单（跳 L2，保留 L1+抽样）？` },
+  unwhite: { label: '撤销白名单', danger: false, confirm: () => '确认撤销该白名单规则？' },
+  reorder: { label: '一键重排优先级', danger: false, confirm: () => '确认按触发次数重排 L1 规则优先级（一次排到底）？' },
+  remove_rule: { label: '一键删除规则', danger: true, confirm: (s) => `确认删除规则 ${s.apply.rule_name || ''}？（policy.yaml 已入库可回滚）` },
+  add_limit: { label: '一键加限流', danger: false, confirm: (s) => `确认给 ${s.apply.limit_model || ''} 加全局限流 ${s.apply.limit_rpm}/分钟？` },
+};
+const applyUiOf = (s) => APPLY_UI[s.apply.kind] || { label: '一键应用', confirm: () => '确认应用该建议？' };
 // 调节建议阈值（挂在建议卡上的弹窗：只读写 3 个 SUGGEST_* 键，/l2-config 合并式更新不碰 L2 项）
 // 拉黑/用量两项按窗口各配一个阈值（窗口越长累计越多，单值在 30 天窗必误报）；错误率是比率，不随窗口变。
 const WIN_SHORT = { 24: '24h', 168: '7d', 720: '30d' };
@@ -70,7 +84,7 @@ function SuggestThresholdsModal({ open, onClose }) {
             onChange={(v) => setCfg((c) => ({ ...c, error: v }))} />
         </div>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          阈值按建议卡所选窗口分别生效（窗口越长应越大）；错误率与窗口无关。默认 拉黑 20 / 用量 1000 / 错误率 10%
+          阈值按建议卡所选窗口分别生效（窗口越长应越大）；错误率与窗口无关。当前 24h：拉黑 ≥{pick24(cfg.violation)} / 用量 ≥{pick24(cfg.volume)} / 错误率 ≥{cfg.error}（与上方输入框同源，非写死）
         </Text>
       </Space> : <Card size="small" loading />}
     </Modal>
@@ -78,14 +92,25 @@ function SuggestThresholdsModal({ open, onClose }) {
 }
 export function SuggestionCard({ onApplied }) {
   const [hours, setHours] = useState(168);
+  const [loading, setLoading] = useState(false);
   const [sug, setSug] = useState([]);
   const [sugMeta, setSugMeta] = useState(null);
   const [thOpen, setThOpen] = useState(false);
+  const hoursRef = useRef(hours);
+  hoursRef.current = hours;
+  const seqRef = useRef(0);
   const loadSug = useCallback(async (h = hours) => {
+    // 只有最新一次 load 有权摘遮罩：在飞的旧窗请求后落地不能拆掉新接的遮罩
+    const seq = ++seqRef.current;
+    setLoading(true);
     try {
       const s = await api(`/suggestions?hours=${h}`);
+      if (h !== hoursRef.current) return; // 切窗后旧窗请求落地 → 丢弃
       setSug(s.items || []); setSugMeta(s.meta || null);
-    } catch (e) { message.error(errText(e)); }
+    } catch (e) { if (h === hoursRef.current) message.error(errText(e)); }
+    // 摘遮罩双守卫：seq 防同窗双击刷新互拆；hoursRef 防切窗后、新 load 启动前
+    // 旧窗请求先落地把刚接上的遮罩拆掉
+    finally { if (seq === seqRef.current && h === hoursRef.current) setLoading(false); }
   }, [hours]);
   useEffect(() => { loadSug(); }, [loadSug]);
   const applySuggestion = async (s) => {
@@ -103,6 +128,7 @@ export function SuggestionCard({ onApplied }) {
         <Button icon={<SlidersOutlined />} onClick={() => setThOpen(true)}>阈值</Button>
         <Button icon={<ReloadOutlined />} onClick={() => loadSug()}>刷新</Button>
       </Space>}>
+      <Spin spinning={loading}>
       {sug.length === 0
         ? <Alert type="success" showIcon
             message="当前无建议：各指标均在阈值内"
@@ -119,13 +145,11 @@ export function SuggestionCard({ onApplied }) {
               <List.Item
                 actions={s.apply ? [
                   <Popconfirm key="ok"
-                    title={s.apply.kind === 'white' ? `确认将 ${s.key_name || ''} 加入白名单（跳 L2，保留 L1+抽样）？`
-                      : s.apply.kind === 'unwhite' ? '确认撤销该白名单规则？'
-                      : `确认拉黑 ${s.key_name || s.ip || ''}？`}
+                    title={applyUiOf(s).confirm(s)}
                     onConfirm={() => applySuggestion(s)}>
-                    <Button danger={s.apply.kind !== 'white'}
+                    <Button danger={applyUiOf(s).danger}
                       icon={<ThunderboltOutlined />}>
-                      {s.apply.kind === 'white' ? '一键加白' : s.apply.kind === 'unwhite' ? '撤销白名单' : '一键拉黑'}
+                      {applyUiOf(s).label}
                     </Button>
                   </Popconfirm>,
                 ] : []}
@@ -137,6 +161,7 @@ export function SuggestionCard({ onApplied }) {
               </List.Item>
             )}
           />}
+      </Spin>
     </Card>
     <SuggestThresholdsModal open={thOpen} onClose={() => setThOpen(false)} />
     </>
@@ -181,14 +206,15 @@ export default function KeyRulesPage() {
 
   const del = async (id) => { await api(`/keyrules/${id}`, { method: 'DELETE' }); load(); };
 
+  /* 列宽用 % 自适应（灌数轮次表口径） */
   const cols = [
-    { title: '类型', dataIndex: 'kind', width: 90,
+    { title: '类型', dataIndex: 'kind', width: '10%',
       render: (v) => (v === 'black' ? <Tag color="black">黑名单</Tag> : <Tag color="green">白名单</Tag>) },
-    { title: 'KEY', dataIndex: 'key_masked', render: (v) => <Text code>{v}</Text> },
-    { title: '来源', dataIndex: 'source', width: 100,
+    { title: 'KEY', dataIndex: 'key_masked', width: '18%', render: (v) => <Text code>{v}</Text> },
+    { title: '来源', dataIndex: 'source', width: '10%',
       render: (v) => (v === 'auto' ? <Tag color="orange">策略建议</Tag> : v) },
     { title: '备注', dataIndex: 'note', ellipsis: true },
-    { title: '添加时间', dataIndex: 'created_at' },
+    { title: '添加时间', dataIndex: 'created_at', width: '16%' },
     { title: '操作',
       render: (_, rec) => (
         <Popconfirm title="确认移除？" onConfirm={() => del(rec.id)}>
@@ -205,7 +231,9 @@ export default function KeyRulesPage() {
         <Button type="primary" icon={<StopOutlined />} onClick={() => setModalOpen(true)}>添加规则</Button>
         <Button icon={<ReloadOutlined />} onClick={load}>刷新</Button>
       </Space>
+      <Card title="KEY 规则">
       <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small" pagination={{ pageSize: 50, showSizeChanger: false }} />
+      </Card>
       <Modal title="添加 KEY 规则" open={modalOpen} onOk={submit} onCancel={() => setModalOpen(false)}>
         <Form form={form} layout="vertical" initialValues={{ kind: 'black' }}>
           <Form.Item name="kind" label="类型" rules={[{ required: true }]}>

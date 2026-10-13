@@ -579,7 +579,7 @@ def _attach_regression_diff(candidate: str) -> None:
         JOB["report"]["regressions"] = {"against": ids[-1], **_diff_reports(prev, JOB["report"])}
     try:
         with open(os.path.join(REPORTS_DIR, f"v{ver}.json"), "w", encoding="utf-8") as f:
-            json.dump({"version": ver, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            json.dump({"version": ver, "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
                        "report": JOB["report"]}, f, ensure_ascii=False)
     except Exception as e:
         _log("eval", f"报告落盘失败（不影响本次结果）: {e!r}")

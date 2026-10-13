@@ -68,20 +68,22 @@ function ProviderRegistryCard() {
   return (
     <Card title="注册表"
       extra={<Button type="primary" size="small" onClick={() => openModal(null)}>新增 provider</Button>}>
-      <Table size="small" rowKey="name" pagination={false} dataSource={rows} columns={[
-        { title: '名称', dataIndex: 'name' },
-        { title: 'base_url', dataIndex: 'base_url', ellipsis: true },
-        { title: 'api_mode', dataIndex: 'api_mode' },
-        { title: '类型', render: (_, r) => (
+      <Table size="small" rowKey="name" className="tbl-registry" pagination={false} dataSource={rows} columns={[
+        /* 列宽用 % 自适应（灌数轮次表口径）：Key 列 300px 定宽曾撑窄屏横向滚动；
+           操作列是按钮组，保留不定宽 */
+        { title: '名称', dataIndex: 'name', width: '11%', ellipsis: true },
+        { title: 'base_url', dataIndex: 'base_url', width: '22%', ellipsis: true },
+        { title: 'api_mode', dataIndex: 'api_mode', width: '9%' },
+        { title: '类型', width: '9%', render: (_, r) => (
           <Space size={4}>{r.local ? <Tag color="blue">内网</Tag> : <Tag>外网</Tag>}{r.kind === 'embedding' && <Tag color="purple">向量</Tag>}</Space>) },
-        { title: '默认模型', dataIndex: 'default_model' },
-        { title: 'Key', dataIndex: 'api_key_env', width: 300, render: (v, r) => v ? (
+        { title: '默认模型', dataIndex: 'default_model', width: '13%', ellipsis: true },
+        { title: 'Key', dataIndex: 'api_key_env', width: '20%', render: (v, r) => v ? (
           <Space size={4}><code>{v}</code>{r.configured ? <Tag color="green">已配</Tag> : <Tag color="red">缺</Tag>}
             <Button type="link" size="small" onClick={() => { setKeyVal(''); setKeyModal({ row: r }); }}>{r.configured ? '改' : '配'}</Button>
           </Space>
         ) : <Tag>-</Tag> },
-        { title: '超时(s)', dataIndex: 'timeout' },
-        { title: '操作', render: (_, r) => (
+        { title: '超时(s)', dataIndex: 'timeout', width: '8%' },
+        { title: '操作', width: '8%', render: (_, r) => (
           <Space>
             <Button type="link" size="small" onClick={() => openModal(r)}>编辑</Button>
             <Popconfirm title={`删除 ${r.name}？被默认路由/候选/别名/策略引用时会拒绝`} onConfirm={async () => {
@@ -166,16 +168,17 @@ export function ProviderHealthCard({ compact = false }) {
       <Table size="small" rowKey="name" pagination={false} dataSource={rows || []}
         locale={{ emptyText: '尚未检查，点右上角「全部检查」开始' }}
         columns={[
-          { title: 'Provider', dataIndex: 'name' },
-          { title: '状态', render: (_, r) => r.ok ? <Tag color="green">正常</Tag> : <Tag color="red">异常</Tag> },
+          /* 列宽用 % 自适应（灌数轮次表口径）；compact 模式只留前两列+状态 */
+          { title: 'Provider', dataIndex: 'name', width: '16%' },
+          { title: '状态', width: '10%', render: (_, r) => r.ok ? <Tag color="green">正常</Tag> : <Tag color="red">异常</Tag> },
           ...(!compact && [
-            { title: 'HTTP', dataIndex: 'status' },
-            { title: '延迟(ms)', dataIndex: 'latency_ms' },
-            { title: '模型数', dataIndex: 'model_count' },
-            { title: 'Key来源', dataIndex: 'key_source', render: (v) => (
+            { title: 'HTTP', dataIndex: 'status', width: '8%' },
+            { title: '延迟(ms)', dataIndex: 'latency_ms', width: '10%' },
+            { title: '模型数', dataIndex: 'model_count', width: '9%' },
+            { title: 'Key来源', dataIndex: 'key_source', width: '12%', render: (v) => (
               <Tooltip title="header=请求头 / models_list_env=专用拉列表 env / provider_env=provider env key / none=无 key"><Tag>{v}</Tag></Tooltip>) },
-            { title: '说明', dataIndex: 'error', ellipsis: true },
-            { title: '操作', render: (_, r) => (
+            { title: '说明', dataIndex: 'error', width: '17%', ellipsis: true },
+            { title: '操作', width: '17%', render: (_, r) => (
               <Button type="link" size="small" loading={checking} onClick={() => check(r.name)}>检查</Button>) },
           ] || []),
         ]} />
@@ -204,14 +207,15 @@ function CircuitCard() {
   return (
     <Card title="熔断器"
       extra={<Button size="small" icon={<ReloadOutlined />} onClick={load}>刷新</Button>}>
-      <Table size="small" rowKey="name" pagination={false} dataSource={rows}
+      <Table size="small" rowKey="name" className="tbl-circuit" pagination={false} dataSource={rows}
         columns={[
-          { title: 'Provider', dataIndex: 'name' },
-          { title: '状态', dataIndex: 'state', render: (v) => v === 'open'
+          /* 列宽用 % 自适应（灌数轮次表口径） */
+          { title: 'Provider', dataIndex: 'name', width: '24%' },
+          { title: '状态', dataIndex: 'state', width: '16%', render: (v) => v === 'open'
             ? <Tag color="red">OPEN</Tag> : v === 'half_open' ? <Tag color="orange">HALF_OPEN</Tag> : <Tag color="green">CLOSED</Tag> },
-          { title: '窗口内失败', dataIndex: 'failure_count_window' },
-          { title: '冷却剩余(s)', dataIndex: 'cooldown_remaining_s' },
-          { title: '操作', render: (_, r) => (
+          { title: '窗口内失败', dataIndex: 'failure_count_window', width: '16%' },
+          { title: '冷却剩余(s)', dataIndex: 'cooldown_remaining_s', width: '16%' },
+          { title: '操作', width: '28%', render: (_, r) => (
             <Space>
               <Popconfirm title={`手动打开 ${r.name} 熔断？该 provider 上游请求将立即失败并回落本地`}
                 onConfirm={() => setState(r.name, 'open')}>

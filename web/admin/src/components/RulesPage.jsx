@@ -6,6 +6,7 @@ import { api, errText } from '../api.js';
 const { Text } = Typography;
 import { ruleZh } from '../ruleNames.jsx';
 import { L2PromptsSection } from './ModelPolicyPage.jsx';
+import RouteInspectCard from './DiagnosePage.jsx';
 // ---------------- 5.1/5.2/5.3 规则管理 ----------------
 // ---------------- L2 拦截配置（scope 两档 + 判密阈值；持久化 model_policy.yaml，热重载生效） ----------------
 const L2_SCOPE_META = [
@@ -326,22 +327,24 @@ export default function RulesPage() {
   };
 
   const cols = [
-    { title: '优先级', dataIndex: 'priority', width: 80, sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
-    { title: '名称', dataIndex: 'name', width: 190, ellipsis: true, render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
-    { title: '动作', dataIndex: 'action', width: 110,
+    /* 列宽用 % 自适应（灌数轮次表口径）：原 tableLayout=fixed + scroll.x=1070 定宽
+       在窄屏撑出横向滚动，% 宽自适应后两者都不再需要 */
+    { title: '优先级', dataIndex: 'priority', width: '8%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
+    { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
+    { title: '动作', dataIndex: 'action', width: '10%',
       render: (v) => <Tag color={v === 'block' ? 'red' : v === 'route_local' ? 'orange' : 'green'}>{v}</Tag> },
-    { title: '条件', dataIndex: 'when', ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
-    { title: <Tooltip title="近 7 天命中次数（审计库口径，排除 default_allow）">7d 命中</Tooltip>, width: 100,
+    { title: '条件', dataIndex: 'when', width: '35%', ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
+    { title: <Tooltip title="近 7 天命中次数（审计库口径，排除 default_allow）">7d 命中</Tooltip>, width: '9%',
       render: (_, r) => {
         const h = hits[r.name];
         if (!h) return <Text type="secondary">0</Text>;
         return (
-          <Tooltip title={`动作分布：${Object.entries(h.actions).map(([k, v]) => `${k}×${v}`).join(' ')}；最后命中 ${h.last_seen} UTC`}>
+          <Tooltip title={`动作分布：${Object.entries(h.actions).map(([k, v]) => `${k}×${v}`).join(' ')}；最后命中 ${h.last_seen} 北京时间`}>
             <Text strong={h.count >= 50} style={{ color: h.count >= 50 ? '#fa8c16' : undefined }}>{h.count}</Text>
           </Tooltip>
         );
       } },
-    { title: '说明', dataIndex: 'description', width: 150, ellipsis: true },
+    { title: '说明', dataIndex: 'description', width: '12%', ellipsis: true },
     // 操作列要装下 编辑+删除 两个默认尺寸按钮 + 24/24 cell padding，
     // 150 会撑出 wrapper 右缘（2026-10 实测）
     { title: '操作', width: 180,
@@ -365,8 +368,8 @@ export default function RulesPage() {
             <Button aria-label="刷新" icon={<ReloadOutlined />} onClick={load} />
         </Space>
       }>
-        <Table rowKey="name" columns={cols} dataSource={items} loading={loading} size="small"
-          tableLayout="fixed" scroll={{ x: 1070 }} pagination={{ pageSize: 50, showSizeChanger: false }}
+        <Table rowKey="name" className="tbl-l1" columns={cols} dataSource={items} loading={loading} size="small"
+          pagination={{ pageSize: 50, showSizeChanger: false }}
           onChange={(_p, _f, sorter, extra) => {
             // antd 默认三态 升→降→取消(null)；把 null 映射回升序 ⇒ 只有升/降两态，点击直接切换
             if (extra.action === 'sort') setPrioSort(sorter.order === 'descend' ? 'descend' : 'ascend');
@@ -414,16 +417,21 @@ export default function RulesPage() {
         </Col>
       </Row>
 
+      <div style={{ marginTop: 12 }}>
+        <RouteInspectCard />
+      </div>
+
       <Card title="历史版本（每次保存前快照；回滚走校验+原子落盘）" style={{ marginTop: 12 }}
         extra={<Button size="small" type="text" onClick={loadVersions}>刷新</Button>}>
         {versions.length ? (
           <Table rowKey="id" size="small" pagination={false} dataSource={versions} columns={[
-            { title: '时间', dataIndex: 'ts', width: 170 },
-            { title: '操作者', dataIndex: 'operator', width: 140, ellipsis: true },
-            { title: '来源', dataIndex: 'source', width: 90,
+            /* 列宽用 % 自适应（灌数轮次表口径）；操作列是按钮组，保留定宽 */
+            { title: '时间', dataIndex: 'ts', width: '16%' },
+            { title: '操作者', dataIndex: 'operator', width: '12%', ellipsis: true },
+            { title: '来源', dataIndex: 'source', width: '10%',
               render: (s) => (s === 'rollback' ? <Tag color="orange">rollback</Tag> : <Tag>save</Tag>) },
-            { title: '规则数', dataIndex: 'rule_count', width: 80 },
-            { title: '预览', dataIndex: 'yaml_text', ellipsis: true },
+            { title: '规则数', dataIndex: 'rule_count', width: '8%' },
+            { title: '预览', dataIndex: 'yaml_text', width: '45%', ellipsis: true },
             { title: '操作', width: 150, render: (_, r) => (
               <Space size={4}>
                 <Button size="small" type="link" onClick={() => viewVersion(r.id)}>查看</Button>

@@ -724,6 +724,23 @@ def test_stats_summary_equivalent_to_individual_funcs():
     assert _ss._price_billing(d["billing"], d["billing_daily"], 168) == \
         _ss._price_billing(store.stats_billing(s, u), store.stats_billing_daily(s, u), 168)
 
+def test_real_model_label_normalizes_dirty_rows():
+    # 2026-10-12 生产实测计费页 model 脏行：空 model → "vllm_local/"、客户端斜杠式
+    # model → "vllm_local/vllm_local/qwen2.5:7b"（双前缀行在外网 provider 上还会让
+    # _price_billing 按首个 / 拆名漏定价）。_real_model_label 是 key_model/billing/
+    # billing_daily/summary 四个口径的唯一汇聚点，在读取侧归一、不动历史数据。
+    from src.gateway.admin_store import _real_model_label
+    assert _real_model_label({}, "vllm_local", "") == "vllm_local"
+    assert _real_model_label({}, "deepseek", "   ") == "deepseek"
+    assert _real_model_label({}, "vllm_local", "vllm_local/qwen2.5:7b") == "vllm_local/qwen2.5:7b"
+    assert _real_model_label({}, "vllm_local", "qwen2.5:7b") == "vllm_local/qwen2.5:7b"
+    assert _real_model_label({}, "vllm_local", "deepseek/deepseek-flash") == \
+        "vllm_local/deepseek/deepseek-flash"  # 前缀不匹配 provider，不敢猜、原样保留
+    assert _real_model_label({}, "", "") == "(unknown)"
+    assert _real_model_label({}, "deepseek", "ext-flash") == "deepseek/ext-flash"
+    routes = {"ext-flash": {"candidates": [{"provider": "deepseek", "model": "deepseek-flash"}]}}
+    assert _real_model_label(routes, "deepseek", "ext-flash") == "deepseek/deepseek-flash"
+
 def test_stats_timeseries_counts_overlapping_local_and_block_separately():
     # 回归 2026-10-09：loc/blk 曾用 elif 互斥，而 stats_overview 的 SQL 侧是两条
     # 独立 sum(case) —— 一行同时命中两种口径时趋势图少算一笔，与概览打架。
@@ -827,6 +844,12 @@ def test_admin_metrics_timeseries_shape():
     d = r.json()
     assert {"interval_s", "ticks", "panel"} <= set(d)
     assert "l2_up" in d["panel"] and "ring" in d["panel"]
+    # recent>0 只回环尾 N 个 tick（总览页 30s 轮询用，省 24h 全环体积）
+    r2 = client.get("/admin/metrics/timeseries", params={"recent": 3})
+    assert r2.status_code == 200
+    d2 = r2.json()
+    assert {"interval_s", "ticks", "panel"} <= set(d2)
+    assert len(d2["ticks"]) <= 3
 
 
 def test_l2_divergences_shape():

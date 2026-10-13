@@ -1,11 +1,18 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Button, Input, Select, Tag, Space, message, Typography, Alert, Card } from 'antd';
 import { api, errText } from '../api.js';
 
 const { Text } = Typography;
 // ---------------- 运维诊断：路由检查器（L1→L2→路由 全链干跑） ----------------
 export default function RouteInspectCard() {
-  const [model, setModel] = useState('ext-flash');
+  // 默认模型取内部模型登记第一个（不写死 'ext-flash'：改名/换模型后自动跟）
+  const [model, setModel] = useState('');
+  useEffect(() => {
+    api('/model-policy').then((d) => {
+      const first = (d.policy?.internal_models || [])[0];
+      if (first?.model) setModel(first.model);
+    }).catch(() => {});
+  }, []);
   const [text, setText] = useState('');
   const [channel, setChannel] = useState('check');
   const [picked, setPicked] = useState([]);
@@ -40,7 +47,7 @@ export default function RouteInspectCard() {
       <Space direction="vertical" style={{ width: '100%' }} size="small">
         <Input placeholder="model（如 ext-flash 或 deepseek/deepseek-v4-pro）"
           value={model} onChange={(e) => setModel(e.target.value)} style={{ maxWidth: 380 }} />
-        <Input.TextArea rows={5} placeholder="待审查文本（L1 命中即返回；L1 放行且 >30 字或灰区才触发 L2）"
+          <Input.TextArea rows={5} placeholder="待审查文本（L1 命中即返回；L1 放行且风险分 ≥20 才触发 L2，灰区强制 L2）"
           value={text} onChange={(e) => setText(e.target.value)} />
         <Space size="middle" wrap>
           <Select style={{ width: 300 }} value={channel} onChange={setChannel} options={[

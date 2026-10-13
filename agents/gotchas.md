@@ -4,6 +4,18 @@
 > 完整版在 git 历史里），压事故叙事留结论，规则一条未删。
 > 按时间倒序读也行，按主题扫也行。
 
+- **2026-10-12 — 宿主 TZ 切 Asia/Shanghai，时基全量锚定 UTC**：起因是"系统展示时间
+  全部北京时间"。改法 = 写入侧 16 处裸 `strftime`/`now()`/`localtime` 全部显式化
+  （审计 `main.log_entry`、request_log 兜底、admin 元数据 8 表、`stats_service._window`/
+  purge、`/logs/cleanup`、`metrics_ring` P99 cutoff、`l2_retrain` 报告 ts），展示侧统一
+  `to_beijing +8h`（keys/keyrules/policy·prompt 版本/规则命中 last_seen + 前端图表 x 轴
+  `bjAxis`、降级事件流表格），`_parse_window_ts` 重构：存储值按 UTC 原样、用户朴素日期
+  按北京（`naive_as_utc=False`）、ISO 带偏移精确换算；删死码 `to_local_naive`。**回归
+  测试**：`tests/test_tz_explicit_utc.py` 在 `TZ=Asia/Shanghai` 下断言锚定（全量
+  155 passed）。**crontab 已转北京墙钟保绝对时刻**（vllm 日报 `16:00 UTC` → `0 0`）。
+  坑：切 TZ 后**已跑进程要重启才吃新 TZ**；
+  MySQL 在 docker 自带 `TZ=Asia/Shanghai`，`NOW()` 口径不变、与宿主切换无关。
+
 - **2026-10-08 — 审计数据谱系**（「一共多少条 / 为什么数字对不上」类问题查这条，别重新考古）：
   `audit_logs`（90 天留存）是唯一持久审计库；Redis 热窗 ltrim 封顶 5000（进新出旧，窗口滑动，
   被裁的行只存在于 audit_logs）。**09-01~09-11 静默丢失时代**：writer 启动无重试（MySQL 离线
@@ -138,6 +150,9 @@
   main，避免循环）。**别动写路径**（`log_entry` 打 time / `log_request_async` 打 ts）。
   MySQL `NOW()` 是北京时间，ad-hoc SQL 用 `ts > NOW() - INTERVAL n` 恒空 ⇒ cutoff 用
   Python `utcnow()`，或显式写 `NOW() - INTERVAL 8 HOUR`。
+   **2026-10-12 更新**：宿主已切 `Asia/Shanghai`，"UTC 落库"从今起靠**显式 gmtime/utcnow**
+   维持、不再靠"宿主=UTC"巧合；用户朴素日期输入改按北京解释（`_parse_window_ts` 加
+   `naive_as_utc` 参数），细节见 2026-10-12 条。
 
 - **2026-09-20 — 桥接 responses 曾恒发静态 `resp_gateway` id**：`routing._responses_from_chat_stream`
   构造 `ResponsesSSEAssembler` 时不传 `resp_id` ⇒ 回落 `"resp_gateway"`，同会话每轮共用

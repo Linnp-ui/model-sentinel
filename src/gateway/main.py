@@ -41,7 +41,7 @@ import random
 
 import uuid
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from urllib.parse import parse_qs, quote
 
@@ -103,7 +103,7 @@ from .metrics import get_current_status, get_metrics, set_current_status, GATEWA
 from .redaction import redact_audit_entry
 from .responses_filectx import extract_responses_filectx, responses_should_mark
 
-from .stat_scope import is_blocked, is_local_route, resolve_action, to_beijing, to_local_naive
+from .stat_scope import is_blocked, is_local_route, resolve_action, to_beijing
 
 from .rate_limit import get_limiter, extract_client_key as _rl_key
 from .identity import (
@@ -178,6 +178,13 @@ async def _capture_response_status(request, call_next):
 async def _ring_startup():
     from .metrics_ring import get_ring
     get_ring().start()
+
+@app.on_event("startup")
+async def _provider_probe_startup():
+    # 后台周期探测 provider 存活（/models，零 token）；/health 与状态条读缓存，
+    # 模型挂了状态条能亮红——补齐「configured 只报配置、不报连通」的观测缺口。
+    from .provider_probe import start as _probe_start
+    _probe_start()
 
 @app.on_event("startup")
 async def _l2_overrides_startup():
@@ -1567,7 +1574,8 @@ def log_entry(entry: dict, *, count: bool = True):
         except Exception:
             pass
 
-    entry["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    # 显式 UTC 落库，不依赖宿主 TZ（展示层 to_beijing +8h）
+    entry["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     entry["id"] = str(uuid.uuid4())[:8]
     if not entry.get("token_masked"):
         _ck = _CURRENT_CLIENT_KEY.get()
@@ -1818,11 +1826,15 @@ async def health():
 def _health_payload() -> dict:
     """状态条 SSE（admin_api.status_stream）复用同一份逻辑，故拆成同步函数。"""
     cfg = load_routing()
+    from .provider_probe import get_liveness
     return {
 
         "status": "ok",
         "policy_count": len(load_policy()),
         "providers": {n: {"local": p.local, "kind": p.kind, "configured": p.configured} for n, p in cfg.providers.items()},
+        # 主动探测缓存（provider_probe 后台每 30s 打一轮 /models）：up/latency/error。
+        # 只读缓存不主动打网络，/health 保持快。模型挂了这里 ok=false → 状态条亮红。
+        "provider_liveness": get_liveness(),
         "default_external": cfg.default_external,
         "default_local": cfg.default_local,
         "on_block": cfg.on_block,
@@ -3164,8 +3176,9 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
             entries = [e for e in entries if (e.get("rule") or "") == rule]
 
     # 时间范围：since/until 支持 1h/24h/7d/30d 或 YYYY-MM-DD 或 ISO
-    since_dt = _parse_window_ts(since)
-    until_dt = _parse_window_ts(until, is_until=True)
+    # 朴素日期串按用户口径（北京）解释，内部换算 UTC 与存储比较
+    since_dt = _parse_window_ts(since, naive_as_utc=False)
+    until_dt = _parse_window_ts(until, is_until=True, naive_as_utc=False)
     if since_dt or until_dt:
         tmp = []
         for e in all_entries:
@@ -3349,8 +3362,8 @@ async def export_csv(
     w = csv.DictWriter(buf, fieldnames=cols)
     w.writeheader()
     if since or until:
-        since_dt = _parse_window_ts(since)
-        until_dt = _parse_window_ts(until, default=datetime.now(), is_until=True)
+        since_dt = _parse_window_ts(since, naive_as_utc=False)
+        until_dt = _parse_window_ts(until, default=datetime.utcnow(), is_until=True, naive_as_utc=False)
         rows = store.query_mysql(since=since_dt, until=until_dt, action=action, rule=rule, type_=type, limit=limit)
         if ip:
 
@@ -3419,7 +3432,9 @@ async def metrics_endpoint(_ip: str = Depends(admin_auth)):
 
 
 @app.get("/admin/metrics/timeseries", dependencies=[Depends(admin_page_auth)])
-async def metrics_timeseries():
+async def metrics_timeseries(recent: int = 0):
+    """recent>0 只回环尾最近 N 个 tick（总览页 KPI 用，免 30s 轮询拉 24h 全环 ~3.4MB）；
+    缺省 0 = 全环（统计页运行指标段消费）。"""
     from .metrics_ring import get_ring
     ring = get_ring()
     panel = get_metrics().export_panel()
@@ -3439,7 +3454,10 @@ async def metrics_timeseries():
     _last = next((p for p in reversed(ring.points) if "l2_up" in p), None)
     panel["l2_up"] = _last["l2_up"] if _last else None
     panel["ring"] = ring.status()
-    return JSONResponse({"interval_s": ring.tick_s, "ticks": list(ring.points), "panel": panel})
+    ticks = list(ring.points)
+    if recent > 0:
+        ticks = ticks[-recent:]
+    return JSONResponse({"interval_s": ring.tick_s, "ticks": ticks, "panel": panel})
 
 
 @app.get("/admin/audit/status")
@@ -3463,20 +3481,29 @@ async def audit_status(_ip: str = Depends(admin_auth)):
     }
 
 
-def _parse_window_ts(v, now=None, is_until=False, default=None):
-    """时间窗参数 -> 本地墙钟朴素 datetime（唯一实现）。
+def _parse_window_ts(v, now=None, is_until=False, default=None, naive_as_utc=True):
+    """时间窗参数 -> UTC 时基朴素 datetime（唯一实现）。
 
-    支持 datetime 实例、"1h"/"7d" 相对窗与 ISO/日期串。ISO 一律先解析成 aware
-    再 to_local_naive() 落本地：审计明细的 time 是 time.strftime 本地墙钟，
-    两侧必须同一时基（原实现把 UTC 串直接当本地用，窗口整体偏一个时区）。
-    is_until + 纯日期 = 当日 23:59:59.999999。解析失败/空 = default。
+    存储侧一律显式 UTC 落库（gmtime/utcnow，不依赖宿主 TZ），比较两侧必须同基：
+    - datetime 实例 / ISO 带显式偏移（Z、+08:00）：精确换算到 UTC
+    - "1h"/"7d" 相对窗：以 utcnow() 为基准
+    - 朴素串（无偏移）：naive_as_utc=True（解析存储值）按 UTC 墙钟原样；
+      naive_as_utc=False（用户输入）按北京墙钟解释（-8h），与展示口径一致
+    - is_until + 纯日期 = 当日 23:59:59.999999（对应时基）。解析失败/空 = default
     """
     if v is None or (isinstance(v, str) and not v.strip()):
         return default
+
+    def _naive(dt):
+        return dt if naive_as_utc else dt - timedelta(hours=8)
+
+    def _aware(dt):
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
     if isinstance(v, datetime):
-        return to_local_naive(v)
+        return _aware(v) if v.tzinfo is not None else _naive(v)
     v = str(v).strip()
-    now = now or datetime.now()
+    now = now or datetime.utcnow()
     if v.endswith("h") or v.endswith("d"):
         try:
             n_ = int(v[:-1])
@@ -3485,13 +3512,17 @@ def _parse_window_ts(v, now=None, is_until=False, default=None):
             pass
     try:
         if "T" in v:
-            return to_local_naive(datetime.fromisoformat(v.replace("Z", "+00:00")))
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return _aware(dt) if dt.tzinfo is not None else _naive(dt)
         if len(v) == 10:
             dt = datetime.strptime(v, "%Y-%m-%d")
             if is_until:
-                return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-            return dt
-        return to_local_naive(datetime.fromisoformat(v)) if " " in v else datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return _naive(dt)
+        if " " in v:
+            dt = datetime.fromisoformat(v)
+            return _aware(dt) if dt.tzinfo is not None else _naive(dt)
+        return _naive(datetime.strptime(v, "%Y-%m-%d %H:%M:%S"))
     except Exception:
         return default
 

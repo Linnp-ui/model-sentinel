@@ -4,16 +4,42 @@ import {
 } from 'antd';
 import { DownloadOutlined } from '@ant-design/icons';
 import { api, errText } from '../api';
-import { DonutChart } from '../StatsPage';
+import WheelGate from './WheelGate.jsx';
 
 const { Text } = Typography;
 
-// UTC 字符串 → 北京时间显示（sv-SE 输出 "YYYY-MM-DD HH:mm:ss"，无逗号）
+// 2×2 混淆矩阵：行=主判、列=影判。环图把矩阵结构抹平（且实测 nc=0 一格是 0 缝），
+// 矩阵让"漏报嫌疑/误报嫌疑"结构性突出；格色与下方分歧表四列一致
+function CellsMatrix({ cells, agreeRate, testid }) {
+  const cell = (v, bg, label) => (
+    <div style={{ background: bg, borderRadius: 6, padding: '12px 8px', textAlign: 'center' }}>
+      <div style={{ fontSize: 22, fontWeight: 700, color: '#fff' }}>{v}</div>
+      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.85)' }}>{label}</div>
+    </div>
+  );
+  return (
+    <div data-testid={testid} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr', gap: 6, maxWidth: 360 }}>
+      <div style={{ fontSize: 14, color: '#666', alignSelf: 'center', paddingRight: 4 }}>一致率 {agreeRate}</div>
+      <div style={{ textAlign: 'center', fontSize: 14, color: '#666' }}>影判 密</div>
+      <div style={{ textAlign: 'center', fontSize: 14, color: '#666' }}>影判 放</div>
+      <div style={{ fontSize: 14, color: '#666', alignSelf: 'center' }}>主判 密</div>
+      {cell(cells.cc, '#52c41a', '一致')}
+      {cell(cells.cn, '#faad14', '漏报嫌疑')}
+      <div style={{ fontSize: 14, color: '#666', alignSelf: 'center' }}>主判 放</div>
+      {cell(cells.nc, '#ff4d4f', '误报嫌疑')}
+      {cell(cells.nn, '#1677ff', '一致')}
+    </div>
+  );
+}
+
+// UTC 字符串 → 北京时间显示（sv-SE 输出 "YYYY-MM-DD HH:mm:ss"，无逗号）。
+// 格式化器只建一次：Intl.DateTimeFormat 构造是 ms 级，表格逐行新建会卡渲染。
+const _bjFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai',
+  dateStyle: 'short', timeStyle: 'medium', hour12: false });
 const bj = (ts) => {
   const t = Date.parse(String(ts).replace(' ', 'T').slice(0, 19) + 'Z');
   if (Number.isNaN(t)) return String(ts || '');
-  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai',
-    dateStyle: 'short', timeStyle: 'medium', hour12: false }).format(t);
+  return _bjFmt.format(t);
 };
 
 const labelTag = (l) => (l === 'CONFIDENTIAL'
@@ -45,6 +71,13 @@ export default function L2Page() {
   const [cellF, setCellF] = useState('');
   const [labeledF, setLabeledF] = useState('all');
   const [q, setQ] = useState('');
+  /* 权威后端取运行时真值（/l2-config 的 AI_GATEWAY_L2_BACKEND，默认 qwen）：
+     顶栏按它动态显示，切到 laya 后不再谎称 qwen 权威（backend=laya 时影子自动停） */
+  const [backend, setBackend] = useState('qwen');
+  useEffect(() => {
+    api('/l2-config').then((d) => setBackend(String(d.AI_GATEWAY_L2_BACKEND || 'qwen').toLowerCase())).catch(() => {});
+  }, []);
+  const isLaya = backend === 'laya';
 
   /* roundReady：/l2-round 返回前 win 只能是占位的 hours=1，等它回来 win 变成
      since=...&hours=24 会让下面两个 useCallback 换身份、useEffect 重跑 → 首屏把
@@ -199,7 +232,9 @@ export default function L2Page() {
               {String(vers.current) === candVer
                 ? <Tag color="blue">v{candVer} 已是当前影子</Tag>
                 : (
-                  <Popconfirm title={`晋升 v${candVer} 为影子模型？（仅影子打标，权威仍 qwen）`} onConfirm={() => promote(candVer)}>
+                  <Popconfirm title={isLaya
+                    ? `已切 laya 权威、影子管道不适用（backend=laya 时 laya 即主判，无独立影子可晋升）`
+                    : `晋升 v${candVer} 为影子模型？（仅影子打标，权威仍 ${backend}）`} onConfirm={() => !isLaya && promote(candVer)}>
                     <Button type="primary" size="small">晋升影子 v{candVer}</Button>
                   </Popconfirm>
                 )}
@@ -245,17 +280,21 @@ export default function L2Page() {
               options={vers.versions.map((v) => ({
                 value: String(v), label: `v${v}${v === vers.current ? '（现影子）' : ''}`,
               }))} />
-            <Popconfirm title={`晋升 v${promVer || '?'} 为影子模型？（仅影子打标，权威仍 qwen）`}
-              onConfirm={() => promVer && promote(promVer)}>
+            <Popconfirm title={isLaya
+              ? `已切 laya 权威、影子管道不适用（backend=laya 时 laya 即主判，无独立影子可晋升）`
+              : `晋升 v${promVer || '?'} 为影子模型？（仅影子打标，权威仍 ${backend}）`}
+              onConfirm={() => promVer && !isLaya && promote(promVer)}>
               <Button size="small" disabled={!promVer}>晋升指定版本</Button>
             </Popconfirm>
           </Space>
         )}
       </Space>
       {job?.state === 'running' && job.log_tail?.length > 0 && (
+        <WheelGate>
         <pre style={{ maxHeight: 320, overflow: 'auto', overscrollBehavior: 'contain', fontSize: 13, lineHeight: 1.6, marginTop: 8, marginBottom: 0 }}>
           {job.log_tail.join('\n')}
         </pre>
+        </WheelGate>
       )}
     </Card>
   );
@@ -271,12 +310,12 @@ export default function L2Page() {
     }
   };
   const doLabel = (req_id, label) => {
-    // 反向标注确认：与 qwen 主判相反时弹确认（人工最高优先级，标错即投毒，4aa937b4 实测）
+    // 反向标注确认：与主判（backend，qwen 或 laya）相反时弹确认（人工最高优先级，标错即投毒，4aa937b4 实测）
     const row = divs.find((x) => x.req_id === req_id);
     if (row && label != null
         && ((label === 0 && row.main === 'CONFIDENTIAL') || (label === 1 && row.main === 'NORMAL'))) {
       Modal.confirm({
-        title: `qwen 判${row.main === 'CONFIDENTIAL' ? '密' : '放行'}，你标${label === 1 ? '机密' : '非密'}，确认吗？`,
+        title: `${backend} 判${row.main === 'CONFIDENTIAL' ? '密' : '放行'}，你标${label === 1 ? '机密' : '非密'}，确认吗？`,
         content: '人工标注会覆盖规则进训练集，标错往后每版都带毒。',
         okText: '确认标注',
         cancelText: '取消',
@@ -298,17 +337,19 @@ export default function L2Page() {
     return divs;
   }, [divs, labeledF]);
 
+  /* 列宽用 % 自适应（与本页灌数轮次表同口径）；标注列是按钮组，保留定宽 */
   const cols = [
-    { title: '时间 (北京)', dataIndex: 'ts', width: 165, render: (v) => bj(v) },
-    { title: '方向', dataIndex: 'cell', width: 120,
+    /* 时间是纯文本无省略号：窄列溢出到邻列，加 ellipsis 裁切 */
+    { title: '时间 (北京)', dataIndex: 'ts', width: '15%', ellipsis: true, render: (v) => bj(v) },
+    { title: '方向', dataIndex: 'cell', width: '10%',
       render: (c) => (c === 'nc'
         ? <Tag color="red" style={{ marginInlineEnd: 0 }}>主放·影密</Tag>
         : <Tag color="orange" style={{ marginInlineEnd: 0 }}>主密·影放</Tag>) },
-    { title: '主 → 影', width: 260,
+    { title: '主 → 影', width: '22%',
       render: (_, x) => <Space size={4}>{labelTag(x.main)}<span>→</span>{labelTag(x.shadow)}</Space> },
-    { title: '影 p', dataIndex: 'shadow_prob', width: 70,
+    { title: '影 p', dataIndex: 'shadow_prob', width: '8%',
       render: (v) => (v == null ? '-' : Number(v).toFixed(3)) },
-    { title: '内容', dataIndex: 'text_preview', ellipsis: true,
+    { title: '内容', dataIndex: 'text_preview', width: '34%', ellipsis: true,
       render: (t, x) => (
         <div>
           <Space size={4}>
@@ -318,7 +359,7 @@ export default function L2Page() {
           {x.filename && <div><Text type="secondary" style={{ fontSize: 12 }}>{x.filename}</Text></div>}
         </div>
       ) },
-    { title: '标注', width: 200,
+    { title: '标注', width: 190,
       render: (_, x) => (
         <Space size={4} wrap>
           <Button size="small" type={x.label === 1 ? 'primary' : 'default'}
@@ -341,15 +382,18 @@ export default function L2Page() {
 
   return (
     <div>
-      <Alert type="info" showIcon style={{ marginBottom: 12 }}
-        message="权威判定 = qwen（真正决定请求是否出境）；本页的 laya 只是影子，并行打标、不改路由 —— 影子调优 ≠ 已切权威" />
+      <Alert type={isLaya ? 'warning' : 'info'} showIcon style={{ marginBottom: 12 }}
+        message={isLaya
+          ? '权威判定 = laya（本地 /classify 直判）；影子已停、不并行打标 —— 已切权威，不是影子调优'
+          : '权威判定 = qwen（真正决定请求是否出境）；本页的 laya 只是影子，并行打标、不改路由 —— 影子调优 ≠ 已切权威'} />
       <Card title={`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`} style={{ marginBottom: 12 }}
         extra={<Text type="secondary" style={{ fontSize: 12 }}>
           {round.since
             ? `本轮灌数 ${bj(round.since).slice(6, 16)} 起${round.sent ? ` · ${round.sent} 条` : ''}`
             : '本轮灌数（暂无记录）'}
         </Text>}>
-        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+        {/* space-evenly + 无 column gap：左、中、右三段空白恒等（center+gap 做不到，中缝总比两边多一个 gap） */}
+        <div style={{ display: 'flex', rowGap: 16, flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-evenly' }}>
         <Space size="large" wrap>
           <Statistic title={<Tooltip title="口径：主影 label 相同 / 可比条数（主判定降级不计入）；数据源审计热缓存（近 5000 条）">主影一致率</Tooltip>}
             value={summary?.agree_rate == null ? '-' : (summary.agree_rate * 100).toFixed(1)} suffix="%"
@@ -362,18 +406,10 @@ export default function L2Page() {
           <Statistic title="影子失败" value={summary?.shadow_degraded ?? '-'} valueStyle={{ fontSize: 24 }} />
         </Space>
         {summary && summary.shadowed ? (
-          <div style={{ flex: 1, minWidth: 340 }}>
-            <DonutChart
-              items={[
-                { label: '主密·影密', count: summary.cells.cc, color: '#52c41a' },
-                { label: '主放·影放', count: summary.cells.nn, color: '#1677ff' },
-                { label: '主密·影放（影子漏报嫌疑）', count: summary.cells.cn, color: '#faad14' },
-                { label: '主放·影密（影子误报嫌疑）', count: summary.cells.nc, color: '#ff4d4f' },
-              ]}
-              labelKey="label" testid="shadow-cells-donut" />
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              主判定降级 {summary.main_degraded} 条未计入一致率；影子样本主判定平均延迟 {summary.avg_main_latency_ms ?? '?'}ms。分歧明细读 MySQL audit_logs.l2 列（2026-09-28 起），更早期的影子数据只在 Redis 热缓存
-            </Text>
+          <div style={{ minWidth: 340 }}>
+            <CellsMatrix cells={summary.cells}
+              agreeRate={summary.agree_rate != null ? (summary.agree_rate * 100).toFixed(1) + '%' : '-'}
+              testid="shadow-cells-matrix" />
           </div>
         ) : (
           <Alert type="info" showIcon style={{ maxWidth: 460 }}
@@ -453,7 +489,7 @@ export default function L2Page() {
           </Space>
         }>
         {shown.length ? (
-          <Table rowKey="req_id" size="small" columns={cols} dataSource={shown}
+          <Table rowKey="req_id" className="tbl-divs" size="small" columns={cols} dataSource={shown}
             pagination={{ pageSize: 20, showSizeChanger: false }} />
         ) : (
           <Alert type="info" showIcon
