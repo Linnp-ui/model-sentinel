@@ -136,8 +136,9 @@ def validate(name: str, base_url: str, api_key: str, api_mode: str) -> Optional[
         return "name 仅允许字母数字/下划线/横线，长度 1-64"
     if get_store().get(name):
         return f"模型名 {name} 已存在"
-    if api_mode not in ("openai", "anthropic"):
-        return "api_mode 仅支持 openai / anthropic"
+    from .llms.registry import SUPPORTED_MODES, _normalize
+    if _normalize(api_mode) not in SUPPORTED_MODES:
+        return "api_mode 仅支持 " + " / ".join(SUPPORTED_MODES)
     if not base_url or not base_url.startswith("https://"):
         return "base_url 必须以 https:// 开头"
     host = urlparse(base_url).hostname or ""

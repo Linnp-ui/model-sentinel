@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert, Button, Card, Input, Modal, Popconfirm, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
-import { DownloadOutlined } from '@ant-design/icons';
 import { api, errText } from '../api';
+import { bj } from '../utils.js';
 import WheelGate from './WheelGate.jsx';
 
 const { Text } = Typography;
@@ -32,16 +32,6 @@ function CellsMatrix({ cells, agreeRate, testid }) {
   );
 }
 
-// UTC 字符串 → 北京时间显示（sv-SE 输出 "YYYY-MM-DD HH:mm:ss"，无逗号）。
-// 格式化器只建一次：Intl.DateTimeFormat 构造是 ms 级，表格逐行新建会卡渲染。
-const _bjFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai',
-  dateStyle: 'short', timeStyle: 'medium', hour12: false });
-const bj = (ts) => {
-  const t = Date.parse(String(ts).replace(' ', 'T').slice(0, 19) + 'Z');
-  if (Number.isNaN(t)) return String(ts || '');
-  return _bjFmt.format(t);
-};
-
 const labelTag = (l) => (l === 'CONFIDENTIAL'
   ? <Tag color="red" style={{ marginInlineEnd: 0 }}>CONFIDENTIAL</Tag>
   : <Tag color="green" style={{ marginInlineEnd: 0 }}>NORMAL</Tag>);
@@ -68,6 +58,23 @@ export default function L2Page() {
   }, []);
   const [summary, setSummary] = useState(null);
   const [divs, setDivs] = useState([]);
+  // qwen 提示词自动修补：自省下方分歧样本里「主判错题（标注与主判相反）」的文本，
+  // 只生成候选 prompt 不应用；应用在规则管理页的 L2 提示词编辑器（带 sessionStorage 跳转）
+  const [proposing, setProposing] = useState(false);
+  const [proposal, setProposal] = useState(null);
+  const propose = async () => {
+    setProposing(true);
+    try {
+      setProposal(await api('/l2/retrain/prompt-propose', { method: 'POST' }));
+    } catch (e) { message.error(errText(e)); }
+    setProposing(false);
+  };
+  // 最近一次候选落盘持久化：切页/重启后恢复显示（不自动应用）
+  useEffect(() => {
+    api('/l2/retrain/prompt-propose')
+      .then((d) => setProposal(d.proposal && d.proposal.candidate ? d.proposal : null))
+      .catch(() => {});
+  }, []);
   const [cellF, setCellF] = useState('');
   const [labeledF, setLabeledF] = useState('all');
   const [q, setQ] = useState('');
@@ -187,7 +194,7 @@ export default function L2Page() {
   const candVer = (job?.candidate || '').match(/v(\d+)$/)?.[1] || '?';
   const canStart = job && job.state !== 'running' && job.labeled_count >= job.min_labels;
   const JobCard = () => (
-    <Card title="优化管道（标注 → 训练 → 候选评测 → 晋升影子）" style={{ marginBottom: 12 }}>
+         <Card title="优化管道" style={{ marginBottom: 12 }}>
       <Space wrap size="middle" align="center">
         <Text>人工标注 <Text strong>{job?.labeled_count ?? '-'}</Text> / 门槛 {job?.min_labels ?? '-'}</Text>
         {job?.state === 'running' && (
@@ -337,19 +344,16 @@ export default function L2Page() {
     return divs;
   }, [divs, labeledF]);
 
-  /* 列宽用 % 自适应（与本页灌数轮次表同口径）；标注列是按钮组，保留定宽 */
+  /* 列宽全 % + tableLayout=fixed（与本页灌数轮次表同口径）：跟随容器、按比例分配；
+     标注列是按钮组，给 20% 定比而不是 px 定宽 */
   const cols = [
     /* 时间是纯文本无省略号：窄列溢出到邻列，加 ellipsis 裁切 */
     { title: '时间 (北京)', dataIndex: 'ts', width: '15%', ellipsis: true, render: (v) => bj(v) },
-    { title: '方向', dataIndex: 'cell', width: '10%',
-      render: (c) => (c === 'nc'
-        ? <Tag color="red" style={{ marginInlineEnd: 0 }}>主放·影密</Tag>
-        : <Tag color="orange" style={{ marginInlineEnd: 0 }}>主密·影放</Tag>) },
-    { title: '主 → 影', width: '22%',
+    { title: '主 → 影', width: '24%',
       render: (_, x) => <Space size={4}>{labelTag(x.main)}<span>→</span>{labelTag(x.shadow)}</Space> },
-    { title: '影 p', dataIndex: 'shadow_prob', width: '8%',
+    { title: '影子置信度', dataIndex: 'shadow_prob', width: '9%',
       render: (v) => (v == null ? '-' : Number(v).toFixed(3)) },
-    { title: '内容', dataIndex: 'text_preview', width: '34%', ellipsis: true,
+    { title: '内容', dataIndex: 'text_preview', width: '32%', ellipsis: true,
       render: (t, x) => (
         <div>
           <Space size={4}>
@@ -359,12 +363,12 @@ export default function L2Page() {
           {x.filename && <div><Text type="secondary" style={{ fontSize: 12 }}>{x.filename}</Text></div>}
         </div>
       ) },
-    { title: '标注', width: 190,
+    { title: '标注', width: '20%',
       render: (_, x) => (
         <Space size={4} wrap>
           <Button size="small" type={x.label === 1 ? 'primary' : 'default'}
             danger={x.label === 1} onClick={() => doLabel(x.req_id, 1)}>机密</Button>
-          <Button size="small" type={x.label === 0 ? 'primary' : 'default'}
+          <Button size="small" type={x.label === 0 ? 'primary' : 'default'} className="btn-green"
             onClick={() => doLabel(x.req_id, 0)}>非密</Button>
           {x.label != null && (
             <Button size="small" type="text" onClick={() => doLabel(x.req_id, null)}>取消</Button>
@@ -382,16 +386,7 @@ export default function L2Page() {
 
   return (
     <div>
-      <Alert type={isLaya ? 'warning' : 'info'} showIcon style={{ marginBottom: 12 }}
-        message={isLaya
-          ? '权威判定 = laya（本地 /classify 直判）；影子已停、不并行打标 —— 已切权威，不是影子调优'
-          : '权威判定 = qwen（真正决定请求是否出境）；本页的 laya 只是影子，并行打标、不改路由 —— 影子调优 ≠ 已切权威'} />
-      <Card title={`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`} style={{ marginBottom: 12 }}
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>
-          {round.since
-            ? `本轮灌数 ${bj(round.since).slice(6, 16)} 起${round.sent ? ` · ${round.sent} 条` : ''}`
-            : '本轮灌数（暂无记录）'}
-        </Text>}>
+       <Card title={`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`} style={{ marginBottom: 12 }}>
         {/* space-evenly + 无 column gap：左、中、右三段空白恒等（center+gap 做不到，中缝总比两边多一个 gap） */}
         <div style={{ display: 'flex', rowGap: 16, flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-evenly' }}>
         <Space size="large" wrap>
@@ -417,11 +412,8 @@ export default function L2Page() {
         )}
         </div>
       </Card>
-      <Card title="灌数轮次" style={{ marginBottom: 12 }}
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>
-          轮次时间为北京时区；一轮 ~50 条集中在 40 秒内，其余时间零流量 ⇒ 按小时窗看会误读
-        </Text>}>
-        <Table size="small" rowKey={(r) => r.started} dataSource={rounds}
+       <Card title="灌数轮次" style={{ marginBottom: 12 }}>
+        <Table size="small" rowKey={(r) => r.started} dataSource={rounds} tableLayout="fixed"
           pagination={false} locale={{ emptyText: '还没跑过 scripts/gray_flood.py' }}
           /* 百分比铺满卡片（antd 表格默认 width:100%）。不设 width 会被 auto 布局
              均分，实测「轮次」内容 75px 却分到 666px（占 55%）；钉死 px 又在窄屏溢出 */
@@ -464,12 +456,36 @@ export default function L2Page() {
           action={<Button size="small" type="primary"
             onClick={() => { setPendingNew(0); loadDivs(); }}>查看</Button>} />
       )}
+      <Card title="Qwen 提示词自动修补" style={{ marginBottom: 12 }}
+        extra={<Button type="primary" size="small" loading={proposing} onClick={propose}>自动修补（~2min）</Button>}>
+        <Alert type="info" showIcon
+          message={<span style={{ fontSize: 14 }}>语料 = 下方「分歧样本」里已标注且与 qwen 主判相反的错题（筛「主判错的（改prompt）」可只看这批）。结果已持久化到 ~/models（重启/切页不丢）；「填入编辑器」跳规则管理页的 L2 提示词编辑器，人工确认后才保存生效。</span>} />
+        {proposal && (
+          <Alert type={proposal.candidate.correct >= proposal.baseline.correct ? 'success' : 'warning'}
+            showIcon style={{ marginTop: 8 }}
+            message={`候选 ${proposal.candidate.correct}/${proposal.candidate.total}（基线 ${proposal.baseline.correct}/${proposal.baseline.total}，${proposal.cases_used} 条主判错题自省）`}
+            description={
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <div>补丁：{proposal.patch}</div>
+                {proposal.rationale && <div>理由：{proposal.rationale}</div>}
+                {proposal.candidate.wrong.length > 0
+                  && <div>候选仍错：{proposal.candidate.wrong.map((w) => w.name).join('；')}</div>}
+                <Space>
+                  <Button size="small" type="primary" onClick={() => {
+                    sessionStorage.setItem('gw-l2-propose-prompt', proposal.candidate_prompt);
+                    window.location.hash = '/rules';
+                  }}>填入编辑器（人工确认后保存）</Button>
+                  <Button size="small" onClick={() => setProposal(null)}>放弃</Button>
+                </Space>
+              </Space>} />
+        )}
+      </Card>
       <Card title="分歧样本"
         extra={
           <Space wrap>
             <Select size="small" value={cellF} onChange={setCellF} style={{ width: 150 }}
               options={[
-                { value: '', label: '全部方向' },
+                { value: '', label: '全部分歧类型' },
                 { value: 'nc', label: 'nc 主放·影密' },
                 { value: 'cn', label: 'cn 主密·影放' },
               ]} />
@@ -482,14 +498,10 @@ export default function L2Page() {
               ]} />
             <Input.Search size="small" allowClear placeholder="搜内容/文件名" style={{ width: 200 }}
               onSearch={(v) => setQ(v)} />
-            <Button size="small" icon={<DownloadOutlined />}
-              onClick={() => window.open(`/admin/api/l2-divergences/export?${win}&cell=${encodeURIComponent(cellF)}&labeled=${labeledF === 'qwenwrong' ? 'labeled' : labeledF}`)}>
-              导出 JSONL
-            </Button>
           </Space>
         }>
         {shown.length ? (
-          <Table rowKey="req_id" className="tbl-divs" size="small" columns={cols} dataSource={shown}
+          <Table rowKey="req_id" className="tbl-divs" size="small" tableLayout="fixed" columns={cols} dataSource={shown}
             pagination={{ pageSize: 20, showSizeChanger: false }} />
         ) : (
           <Alert type="info" showIcon

@@ -1,7 +1,7 @@
 """
 File Inspector v2 — 复杂文档增强版
 src/gateway/file_inspector.py:1
-- PDF: pypdf 全量 + OCR 兜底 + 水印
+- PDF: pymupdf 全量 + OCR 兜底 + 水印
 - XLSX: 多Sheet + 合并单元格展开 + Markdown 表格 + 全量表头
 - DOCX/PPT/TXT: 基础支持
 - CAD: ezdxf 文本提取占位，失败则靠文件名
@@ -161,13 +161,16 @@ def inspect_pdf(data: bytes, filename: str) -> Dict[str, Any]:
     pages = 0
     has_ocr = False
     try:
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(data))
-        pages = len(reader.pages)
+        try:
+            import pymupdf
+        except ImportError:
+            import fitz as pymupdf
+        doc = pymupdf.open(stream=data, filetype="pdf")
+        pages = len(doc)
         # 全量提取（限50页防大文件）
-        for idx, p in enumerate(reader.pages[:50]):
+        for idx in range(min(50, pages)):
             try:
-                t = p.extract_text() or ""
+                t = doc[idx].get_text() or ""
                 text += t + f"\n\n[PAGE {idx+1}]\n"
             except Exception:
                 continue
@@ -435,7 +438,7 @@ def inspect_image(data: bytes, filename: str) -> Dict[str, Any]:
     #   - Image is corrupted / not really an image
     #   - Image is HEIC/AVIF/etc not in our supported set
     #   - OCR mis-read all chars
-    # In all cases policy.yaml will route_local via ocr_empty_image_route_local.
+    # In all cases policy.yaml will route_local via 「空图转内网」规则.
     ocr_empty = (text == "")
     findings = {
         "text_preview": text[:500],
@@ -611,7 +614,7 @@ def inspect_file(data: bytes, filename: str) -> Dict[str, Any]:
          ext_mismatch/magic_ext/claimed_ext 痕迹；
       2. 任何分支解析失败 ⇒ findings.parse_failed（不再静默）；
       3. 未知二进制不许 dump 成文本 ⇒ findings.unparsed_binary；
-      4. 2/3 由 policy.yaml 的 unparsed_binary_route_local(priority 13) 接住。
+      4. 2/3 由 policy.yaml 的「未解析二进制转内网」(priority 13) 接住。
     """
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     file_type = ext

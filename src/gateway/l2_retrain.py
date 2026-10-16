@@ -7,7 +7,7 @@ stages: dataset → finetune → eval → done/failed。
   base=~/models/laya/multilingual。
 - 候选评测 = 临时起 laya_l2_server 在 8004（与生产同一推理路径，防渲染漂移）：
   battery（评测集）+ 人工标注全量回归（标过什么就该判什么）+ 历史分歧回归（分歧过的题就该判对）。
-- promote = 写 var/laya-l2.env（unit 的 EnvironmentFile，服务用户可写）+
+- promote = 写 var/laya-l2.env（unit 的 EnvironmentFile，your-user 可写）+
   `sudo -n systemctl restart laya-l2.service`（sudoers 只放行这一条命令）+
   /health 核对 model 身份。权威 backend 切换（qwen→laya）永不走这里，仍人工拍板。
 """
@@ -19,6 +19,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -29,6 +30,7 @@ LAYA_PY = os.path.expanduser("~/venvs/laya/bin/python")
 VENV_PY = os.path.join(ROOT, ".venv", "bin", "python")
 BASE_MODEL = os.path.join(MODELS, "laya", "multilingual")
 DATASET_DIR = os.path.join(MODELS, "laya-dataset")
+PROMPT_PROPOSAL_FILE = os.path.join(DATASET_DIR, "prompt-proposals.jsonl")
 ENV_FILE = os.path.join(ROOT, "var", "laya-l2.env")
 REPORTS_DIR = os.path.join(ROOT, "var", "l2-reports")  # 训练报告落盘（vN.json），重启不丢，供回归diff
 EVAL_URL = f"http://127.0.0.1:{int(os.getenv('AI_GATEWAY_L2_RETRAIN_EVAL_PORT', '8004'))}"
@@ -171,12 +173,23 @@ def _classify(url: str, text: str, filename: str = "") -> float:
     return float(json.load(urllib.request.urlopen(req, timeout=120))["probabilities"]["CONFIDENTIAL"])
 
 
+def _load_script_module(mod_name: str, filename: str):
+    """importlib 直载 scripts/ 下的独立脚本。脚本内的 sibling import
+    （如 laya_eval_common）要求 scripts/ 在 sys.path 上，运行脚本时自动有、
+    被 exec 时没有——这里补一次（幂等），两处 loader 共用。"""
+    scripts = os.path.join(ROOT, "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    spec = importlib.util.spec_from_file_location(mod_name, os.path.join(scripts, filename))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def _collect_cases() -> list:
     """评测电池（与 scripts/eval_laya_live.py 同一电池）：(cat, name, text, filename, want)。
     cat=probe 灰区探针 / real 真实留出 / reg 历史回归。"""
-    spec = importlib.util.spec_from_file_location("eval_laya_live", os.path.join(ROOT, "scripts", "eval_laya_live.py"))
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
+    m = _load_script_module("eval_laya_live", "eval_laya_live.py")
     cases = [("probe", n, t, "", w) for n, t, w in m.PROBES]
     with open(os.path.expanduser("~/models/laya-dataset/real_eval.jsonl"), encoding="utf-8") as f:
         for line in f:
@@ -333,9 +346,24 @@ async def _call_qwen_free(system: str, user: str) -> str:
     return resp.json()["choices"][0]["message"]["content"] or ""
 
 
+def latest_prompt_fix() -> dict:
+    """最近一次候选 prompt 修补：盘上持久化，重启/切页不丢。无记录返回 {}。"""
+    try:
+        with open(PROMPT_PROPOSAL_FILE, encoding="utf-8") as f:
+            last = None
+            for line in f:
+                line = line.strip()
+                if line:
+                    last = line
+        return json.loads(last) if last else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def propose_prompt_fix() -> dict:
     """qwen 自省修 prompt：主判错题 → qwen 自己提追加补丁 → 同 battery 打基线+候选。
-    只生成不应用（~2min，两次 battery）；应用仍走 PUT /l2-prompts 人工确认。"""
+    只生成不应用（~2min，两次 battery）；应用仍走 PUT /l2-prompts 人工确认。
+    结果追加落盘 PROMPT_PROPOSAL_FILE（~/models 不入库）后返回。"""
     import asyncio as _aio
     from src.gateway import small_model as _sm
     _ensure_overrides()
@@ -362,7 +390,7 @@ def propose_prompt_fix() -> dict:
     candidate = _apply_patch(current, patch)
     base = prompt_test(current)
     cand = prompt_test(candidate)
-    return {
+    record = {
         "patch": patch,
         "rationale": str(obj.get("rationale") or "")[:200],
         "cases_used": len(cases),
@@ -372,7 +400,16 @@ def propose_prompt_fix() -> dict:
                        "sha1": cand.get("prompt_sha1"),
                        "wrong": [{k: w[k] for k in ("name", "want", "got", "p")} for w in cand["wrong"]]},
         "candidate_prompt": candidate,
+        "ts": int(time.time()),
     }
+    # 持久化失败不能吞掉已生成的候选：落盘异常只附加在返回里，不阻断人工应用
+    try:
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        with open(PROMPT_PROPOSAL_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        record["persist_error"] = repr(e)[:200]
+    return record
 
 
 def add_hard(items) -> dict:
@@ -464,11 +501,7 @@ def _labeled_regression(url: str) -> dict:
 def _candidate_wants() -> list:
     """灌数候选表 [(text, want)]：分歧过的题判没判对的唯一外部标准。
     灌数脚本模块级只有常量 + load_dotenv，import 无副作用。"""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "_gray_flood", os.path.join(ROOT, "scripts", "gray_flood.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _load_script_module("_gray_flood", "gray_flood.py")
     return list(mod.CANDIDATES)
 
 

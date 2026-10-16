@@ -107,7 +107,7 @@ def idcard_valid(card: str) -> bool:
     A bare 17-digit-plus-check-char match is NOT enough: random 18-digit runs
     (millisecond timestamps / order ids / encoded blobs) almost never carry both
     a calendar-valid birth date and a correct check digit, so requiring both
-    removes the pii_weighted_route_local false positive that mis-routed benign
+    removes the 「隐私加权转内网」false positive that mis-routed benign
     Codex/tool payloads to the local model -- WITHOUT digit-boundaries (which
     would create false negatives once separators are stripped). Genuine IDs, even
     ones split by separators / zero-width (reassembled before this check), still pass.
@@ -168,8 +168,18 @@ def _strip_pii_separators(text: str) -> str:
 _B64_RUN_RE = re.compile(r"[A-Za-z0-9+/=\s]{24,}")
 _HEX_RUN_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])")
 _DECODE_MAX_BLOBS = 8
+# F1(2026-10-14)：原始 break 条件是 `len(layers) >= 8`——只要候选**全部解码失败**
+# （等长非 4 倍数 base64 串 / 奇数长 hex 串），layers 永不增长、break 永不触发，
+# finditer 遍历全部分-match 且每次进 Python 层 re.sub/fullmatch/b64decode：
+# 512KB 对抗文本 ≈ 2 万次 × ~10µs ≈ 200ms，5MB ≈ 2s，全在事件循环。改成
+# 「尝试次数」硬顶，与成功与否解耦；良性请求候选数远小于 256。
+_DECODE_MAX_ATTEMPTS = 256
 _DECODE_MIN_B64_LEN = 16  # real guard is utf-8+PII match (phone removed)
 _DECODE_MIN_HEX_LEN = 20
+# 每 pattern 每层最多处理的 match 数：bankcard/idcard 每个候选都要 luhn_valid/
+# idcard_valid Python 校验，18 位数字串重复排列可产出百万候选（PII 权重在
+# 60 即满，权重新增不改变判决）⇒ 良性远小于 256，对抗线性可算。
+_PATTERN_MATCH_CAP = 256
 
 
 def _try_b64_decode(blob: str):
@@ -222,19 +232,22 @@ def _decode_layers(pii_text: str):
     layers = []
     if not pii_text:
         return layers
+    attempts = 0
     for m in _B64_RUN_RE.finditer(pii_text):
-        if len(layers) >= _DECODE_MAX_BLOBS:
+        if len(layers) >= _DECODE_MAX_BLOBS or attempts >= _DECODE_MAX_ATTEMPTS:
             break
         for cand in _b64_candidates(m.group(0)):
-            if len(layers) >= _DECODE_MAX_BLOBS:
+            if len(layers) >= _DECODE_MAX_BLOBS or attempts >= _DECODE_MAX_ATTEMPTS:
                 break
+            attempts += 1
             dec = _try_b64_decode(cand)
             if dec is not None and all(dec != l for l, _ in layers):
                 layers.append((dec, "base64"))
     if len(layers) < _DECODE_MAX_BLOBS:
         for m in _HEX_RUN_RE.finditer(pii_text):
-            if len(layers) >= _DECODE_MAX_BLOBS:
+            if len(layers) >= _DECODE_MAX_BLOBS or attempts >= _DECODE_MAX_ATTEMPTS:
                 break
+            attempts += 1
             dec = _try_hex_decode(m.group(0))
             if dec is not None and all(dec != l for l, _ in layers):
                 layers.append((dec, "hex"))
@@ -259,7 +272,6 @@ def inspect_text(text: str) -> Dict:
             "value_preview": val[:6] + "***",
             "start": start,
             "end": start + len(val),
-            "severity": "L3" if w >= 70 else ("L2" if w >= 40 else "L1"),
             "weight": w,
             "via": via,
         })
@@ -271,7 +283,11 @@ def inspect_text(text: str) -> Dict:
         layer_digits = _strip_pii_separators(layer_text)
         for name, pat in PATTERNS.items():
             match_text = layer_digits if name in ("idcard", "bankcard", "phone") else layer_text
+            n = 0
             for m in pat.finditer(match_text):
+                if n >= _PATTERN_MATCH_CAP:
+                    break
+                n += 1
                 val = m.group(0)
                 if name == "bankcard" and not luhn_valid(val):
                     continue

@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip, Spin } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
+import { bj, avg } from './utils.js';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './components/DailyHeatmap.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
@@ -14,15 +15,6 @@ const EV_META = [
   ['route_local', '本地路由', '#fa8c16'],
   ['l2_unavailable', 'L2 不可用', '#faad14'],
 ];
-
-// UTC 字符串 → 北京时间显示（同 L2Page bj 范式：ts 存 UTC，展示 +8）
-const _bjFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai',
-  dateStyle: 'short', timeStyle: 'medium', hour12: false });
-const bj = (ts) => {
-  const t = Date.parse(String(ts).replace(' ', 'T').slice(0, 19) + 'Z');
-  if (Number.isNaN(t)) return String(ts || '');
-  return _bjFmt.format(t);
-};
 
 function EventStreamCard({ events }) {
   // 三计数（金丝雀：今天外发链路/安全降级正不正常）+ 明细表（预筛的最近事件）。
@@ -59,7 +51,7 @@ function EventStreamCard({ events }) {
       {(events.recent || []).length === 0 ? (
         <Alert type="success" showIcon message="本窗口无降级事件（外发链路全绿：无流式降级、无本地路由、L2 正常）" />
       ) : (
-        <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" columns={cols} dataSource={events.recent}
+        <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" tableLayout="fixed" columns={cols} dataSource={events.recent}
           pagination={false} scroll={{ y: 300 }} />
       )}
       </WheelGate>
@@ -74,30 +66,28 @@ const { Text: T } = Typography;
 // 与统计页 MetricsSection 的重复是有意保留（落地页密度优先，详情点「详情 →」跳统计页）
 // KEY 规则 → 调节策略建议（SuggestionCard 同卡）；熔断/外网key 由全局 StatusBar 灯覆盖，不重复做卡
 
-const avg = (vs) => {
-  const v = vs.filter((x) => x != null);
-  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
-};
-
 // KPI tile：固定 104px 等高（不带 Card head，避免 56px head 撑出参差）
-function Kpi({ testid, title, value, suffix, color, go, goLabel }) {
-  return (
-    <Card data-testid={testid} hoverable onClick={() => { window.location.hash = go; }}
-      styles={{ body: { height: 112, padding: '12px 16px', display: 'flex', flexDirection: 'column' } }}>
-      <T type="secondary" style={{ fontSize: 12 }}>{title}</T>
-      {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看。body 112px
-          （12px 标题 + 32×1.3 数值 + 12px 后缀 + 11px 详情）仍有余量，不撑高卡片 */}
-      <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
-      {suffix && <T type="secondary" style={{ fontSize: 12 }}>{suffix}</T>}
-      <div style={{ marginTop: 'auto', fontSize: 11, color: '#bbb', textAlign: 'right' }}>{goLabel || '详情 →'}</div>
+function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {
+  const card = (
+    <Card data-testid={testid} hoverable={!!go} onClick={go ? () => { window.location.hash = go; } : undefined}
+      style={{ borderLeft: `3px solid ${bar ?? color ?? '#e2e4ea'}`, cursor: go ? 'pointer' : 'default' }}
+      styles={{ body: { height: 96, padding: '12px 16px', display: 'flex', flexDirection: 'column' } }}>
+      <T type="secondary" style={{ fontSize: 14, height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 4, fontSize: 20, lineHeight: 1, position: 'relative', top: -1, color: '#1677ff' }}>→</span>}</T>
+      {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看 */}
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+        <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
+        {suffix && <T type="secondary" style={{ fontSize: 12 }}>{suffix}</T>}
+      </div>
     </Card>
   );
+  // 可跳的卡：hover 明示跳转（光标+阴影只是暗示，Tooltip 说清点哪去哪）；每卡口径不同，文案按卡给
+  return go ? <Tooltip title={hint}>{card}</Tooltip> : card;
 }
 
 function ChartPanel({ title, go, children }) {
   return (
-    <Card title={title} style={{ height: '100%' }} extra={
-      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>}>
+    <Card title={title} style={{ height: '100%' }} extra={go ? (
+      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>) : null}>
       {children}
     </Card>
   );
@@ -187,8 +177,6 @@ export default function OverviewPage() {
     { name: 'P50', color: '#52c41a', dots: true, n: nArr, points: pts(ch.p50, false) },
     { name: 'P95', color: '#fa8c16', dots: true, n: nArr, points: pts(ch.p95, false) },
     { name: 'P99', color: '#ff4d4f', dots: true, n: nArr, points: pts(ch.p99, false) },
-    // Min 用中性灰：#b7eb8f 浅绿与 P50 #52c41a 同色系难分辨，白底上对比度仅 ~1.9:1
-    { name: 'Min', color: '#8c8c8c', dots: true, n: nArr, points: pts(ch.lat_min, false) },
   ] : [];
   const errColor = d && d.err != null
     ? (d.err >= 0.05 ? '#ff4d4f' : d.err > 0 ? '#fa8c16' : '#52c41a') : undefined;
@@ -220,40 +208,39 @@ export default function OverviewPage() {
       <Spin spinning={loading}>
       <Row gutter={[16, 16]}>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-qps" title="当前 QPS"
+          <Kpi testid="ov-qps" title="当前 QPS" bar="#1677ff"
             value={d && d.qps != null ? d.qps.toFixed(1) : '-'} suffix="req/s"
-            go="/stats" goLabel="统计 →" />
+            go="/stats" hint="跳统计页：QPS 趋势 / 分位延迟 / 运行指标" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-err" title="错误率 5xx+429（近10tick）"
             value={d && d.err != null ? (d.err * 100).toFixed(1) + '%' : '-'}
-            color={errColor} go="/stats" goLabel="统计 →" />
+            color={errColor} bar="#722ed1" go="/stats"
+            hint="跳统计页：错误率趋势（5xx+429 近 10 tick 口径）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-block" title="拦截率"
             value={d && d.total > 0 ? (100 * d.blocked / d.total).toFixed(1) + '%' : '-'}
-            suffix={d ? `${d.blocked} 次 / 总 ${d.total}` : ''}
-            color={d && d.blocked > 0 ? '#ff4d4f' : '#52c41a'}
-            go="/audit?action=block" goLabel="审计：拦截 →" />
+            color="#ff4d4f"
+            go="/audit?action=block" hint="跳审计页：拦截明细（动作=block）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-route" title="本地路由率"
             value={d && d.total > 0 ? (100 * d.routeLocal / d.total).toFixed(1) + '%' : d ? '0.0%' : '-'}
-            suffix={d ? `${d.routeLocal} 次 / 总 ${d.total}` : ''}
             color={d && d.routeLocal > 0 ? '#fa8c16' : undefined}
-            go="/audit?action=route_local" goLabel="审计：本地路由 →" />
+            go="/audit?action=route_local" hint="跳审计页：本地路由明细（机密内容降级，不出境）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-tokens" title="Token 用量"
-            value={d && d.tokens ? d.tokens.toLocaleString() : '-'}
-            go="/stats" goLabel="统计可视化 →" />
+          <Kpi testid="ov-tokens" title="Token 用量" bar="#13c2c2"
+            value={d && d.tokens ? d.tokens.toLocaleString() : '-'} go="/stats?focus=billing"
+            hint="跳统计页并定位：Token 计费（KEY × 金额 / 每日金额）" />
         </Col>
       </Row>
       </Spin>
       <Spin spinning={loading}>
       <Row gutter={[16, 16]}>
         <Col span={12} style={{ minWidth: 0 }}>
-          <ChartPanel title="QPS" go="/stats">
+          <ChartPanel title="QPS">
             {qpsEmpty ? (
               <Alert type="info" showIcon message={qpsEmpty} />
             ) : hours <= 24 ? (
@@ -269,7 +256,7 @@ export default function OverviewPage() {
           </ChartPanel>
         </Col>
         <Col span={12} style={{ minWidth: 0 }}>
-          <ChartPanel title="网关延迟分位 P50/P95/P99" go="/stats">
+          <ChartPanel title="网关延迟分位 P50/P95/P99">
             {latEmpty ? (
               <Alert type="info" showIcon message={latEmpty} />
             ) : (

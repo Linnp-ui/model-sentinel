@@ -24,9 +24,12 @@ from .policy import PolicyDoc, decide, invalidate_policy_cache, load_policy, DEF
 
 # 5.2 表单的"内容类型" -> when 条件字段的映射（下拉框语义）
 CONTENT_TYPE_FIELD = {
-    "prompt": "text",           # 提示词
+    "prompt": "text",           # 用户query
     "filename": "file.filename",  # 文件名
     "file": "file.text",        # 文件内容（含 OCR 抽取文本）
+    "sheet_names": "file.sheet_names",  # 工作表名（list，仅文件分支注入）
+    "headers": "file.headers",  # 表头行（list，仅文件分支注入）
+    "watermark": "file.watermark",      # 水印文字（str，仅文件分支注入）
     "ocr": "file.text",         # OCR 同样落在 file.text（文件分支抽取）
     "model": "model",           # 请求模型名（别名或真实名，三条入口都传 model=）
     "client": "client.key",     # 客户端登记名（api_key_map.name，不是密钥本身）
@@ -47,40 +50,35 @@ MATCH_TYPE_OP = {
 }
 _TRUTHY = ("1", "true", "yes", "on", "是", "开")
 
-# 构造器可选项：真实有效的 (内容类型, 匹配类型, 标签)，前端下拉直接吃这份表。
+# 构造器可选项：真实有效的 (内容类型, 匹配类型, 标签, 悬停说明)，前端下拉直接吃这份表。
+# 说明的口径：大白话 2-4 句，讲清四件事——匹配的是什么数据（从哪来）、匹配项怎么写、
+# 怎么算命中（含大小写/整段相等这类非显然语义）、什么时候生效（纯文本/附件/图片的
+# 适用范围）。不堆引擎术语；实现细节（NFKC/零宽剥离）不进说明，但真实行为
+# （如 in 运算符的包含回退、watermark 实为解析文字前 500 字）必须如实写。
 # 不给「内容类型 × 匹配类型」的笛卡尔积（66 种）：其中 10 种布尔字段配
 # 正则/包含会产出永不命中的规则——保存成功、干跑通过、线上永不触发，
 # 静默失效比报错难查得多；余下的无意义组合只是让用户猜。
+# 表内只留现网 policy.yaml 实际在用的组合（2026-10-13 精简）：in/not_in、
+# 非用户query regex、模型名/客户端登记名/OCR 字段已从下拉移除——引擎支持不变，
+# policy.yaml 手写照样生效（hour_range 同理只走手写），构造器不再提供。
 # size / hour_range 自带字段（不绑内容类型，见 build_when），故不在表内。
-MATCH_CHOICES: List[Tuple[str, str, str]] = [
-    ("prompt", "regex", "提示词 · 正则"),
-    ("prompt", "contains", "提示词 · 包含任一"),
-    ("prompt", "in", "提示词 · 枚举任一"),
-    ("prompt", "not_in", "提示词 · 枚举皆非"),
-    ("filename", "regex", "文件名 · 正则"),
-    ("filename", "contains", "文件名 · 包含任一"),
-    ("filename", "in", "文件名 · 枚举任一"),
-    ("filename", "not_in", "文件名 · 枚举皆非"),
-    ("file", "regex", "文件内容 · 正则"),
-    ("file", "contains", "文件内容 · 包含任一"),
-    ("file", "in", "文件内容 · 枚举任一"),
-    ("file", "not_in", "文件内容 · 枚举皆非"),
-    ("ocr", "regex", "OCR · 正则"),
-    ("ocr", "contains", "OCR · 包含任一"),
-    ("model", "contains", "模型名 · 包含任一"),
-    ("model", "in", "模型名 · 枚举任一"),
-    ("model", "not_in", "模型名 · 枚举皆非"),
-    ("client", "in", "客户端登记名 · 枚举任一"),
-    ("client", "not_in", "客户端登记名 · 枚举皆非"),
-    ("session_confidential", "bool", "开关 · 会话涉密 = 是"),
-    ("tainted_file", "bool", "开关 · 文件名污染 = 是"),
-    ("unparsed_binary", "bool", "开关 · 二进制未解析 = 是"),
-    ("parse_failed", "bool", "开关 · 解析失败 = 是"),
-    ("ocr_empty", "bool", "开关 · OCR 空 = 是"),
+MATCH_CHOICES: List[Tuple[str, str, str, str]] = [
+    ("prompt", "regex", "用户query · 正则", "匹配项=正则表达式（Python re 语法）：请求文本里任何位置匹配到就算命中。例：AKIA[0-9A-Z]{16} 圈 AWS 密钥、[0-9]{17}[0-9Xx] 圈身份证号。适合格式固定、要精确圈定的内容；写不好正则建议改用「包含任一」。请求文本=chat 的提示词正文、文件预检的解析文字"),
+    ("prompt", "contains", "用户query · 包含任一", "匹配项=逗号分隔的关键词：请求文本包含任意一个词就算命中（多词之间是「或」，例：工资表, 薪资）。不区分大小写，词在句子中间也算（「查看工资表」命中「工资表」）。要所有词都出现：拆成多行并在下方选「全部命中」"),
+    ("filename", "contains", "文件名 · 包含任一", "匹配项=逗号分隔的关键词：文件名包含任意一个词就算命中（例：报表, 财务）。不区分大小写，salary_2024.xlsx 命中 salary。只对带附件的请求生效"),
+    ("file", "contains", "文件内容 · 包含任一", "匹配项=逗号分隔的关键词：附件解析出的正文文字包含任意一个词就算命中（例：财务报表, 资产负债）。不区分大小写；图片 OCR 识别出的文字也落在这里"),
+    ("sheet_names", "contains", "工作表名 · 包含任一", "匹配项=逗号分隔的关键词：任何一张工作表的名字包含任意一个词就算命中（例：工资, 预算）。只对能解析出表格的文件生效（xlsx/csv）"),
+    ("headers", "contains", "表头 · 包含任一", "匹配项=逗号分隔的关键词：表头（表格第一行的列名）包含任意一个词就算命中（例：姓名, 身份证, 金额）。不区分大小写；只对能解析出表格的文件生效（xlsx/csv）"),
+    ("watermark", "contains", "水印 · 包含任一", "匹配项=逗号分隔的关键词：文件解析文字的前 500 字包含任意一个词就算命中（例：机密, 保密, confidential）。注意：实际匹配的是解析文字开头 500 字（水印若在文字层会被带出），不是独立水印检测；全文匹配请用「文件内容」"),
+    ("session_confidential", "bool", "开关 · 会话涉密 = 是", "匹配项=是/否：同一会话内曾有请求被判定涉密时（会话按 X-Session-ID 识别，标记 7 天有效），填「是」命中、填「否」在未涉密时命中。会话级联动：一次文件判密，同会话后续的纯文本请求也跟着转本地"),
+    ("tainted_file", "bool", "开关 · 文件名污染 = 是", "匹配项=是/否：同一 KEY 下曾判定机密的文件名再次出现在请求里时（污染标记按 KEY 隔离、7 天有效），填「是」命中。防「换个会话提一句机密文件名」的绕过"),
+    ("unparsed_binary", "bool", "开关 · 二进制未解析 = 是", "匹配项=是/否：文件是二进制但没解析出任何文字（扩展名伪装、未知格式、文件损坏）时，填「是」命中。fail-closed 兜底：认不出的文件宁可转本地，不直接放行出境"),
+    ("parse_failed", "bool", "开关 · 解析失败 = 是", "匹配项=是/否：文件解析过程失败（格式损坏/内容异常）时，填「是」命中。fail-closed 兜底，同上"),
+    ("ocr_empty", "bool", "开关 · OCR 空 = 是", "匹配项=是/否：图片走了 OCR 但没识别出任何文字（纯扫描件、图里无字、OCR 引擎缺失）时，填「是」命中。fail-closed 兜底，同上"),
 ]
-MATCH_PAIRS = {(ct, mt) for ct, mt, _ in MATCH_CHOICES}
+MATCH_PAIRS = {(ct, mt) for ct, mt, *_ in MATCH_CHOICES}
 # 自带字段的匹配类型：内容类型对它们无意义（build_when 直接忽略该参数）
-SELF_FIELD_MATCH = ("size", "hour_range")
+SELF_FIELD_MATCH = ("size", "hour_range", "pii_score")
 # 字段 -> 内容类型（parse_when 反查用）。一个字段可能对应多个 content_type
 # （file.text 同时是 file 和 ocr），取 CONTENT_TYPE_FIELD 里的首个，结果确定。
 _CONTENT_TYPE_BY_FIELD = {f: ct for ct, f in reversed(list(CONTENT_TYPE_FIELD.items()))}
@@ -107,25 +105,54 @@ def _fmt_value(v: Any) -> Any:
 def _fmt_bool(v: Any) -> str:
     return "true" if v else "false"
 
+def _hour_bound(cond: Any) -> Optional[int]:
+    """hour_range 壳的单条边界识别（time.hour >= / <= 整数）。"""
+    if not isinstance(cond, Mapping) or len(cond) != 1:
+        return None
+    m = _COND_RE.fullmatch(str(next(iter(cond))).strip())
+    if not m or m.group("field") != "time.hour" or m.group("op") not in (">=", "<="):
+        return None
+    v = next(iter(cond.values()))
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
 
 def parse_when(when: Any) -> Optional[Dict[str, Any]]:
-    """build_when 的逆：把已有 when 还原成构造器的 content_type/match_type/match_value。
+    """build_when / build_when_group 的逆：把已有 when 还原成构造器控件值。
 
-    用于「编辑已存在的规则」时预填控件。认不出的形状（多条件 any/all、
-    手写 when、!= 这类无构造器等价物的运算符）返回 None，调用方保持构造器
-    空白——绝不用默认值去覆盖用户已经写好的 when。
+    用于「编辑已存在的规则」时预填控件。返回形状：
+    - 单条件：{"content_type", "match_type", "match_value"}
+    - 条件组（any/all 多行，每行都能逆解析）：{"combiner": "any"|"all", "rows": [...]}
+    认不出的形状（嵌套 any/all、手写 when、!= 这类无构造器等价物的运算符）
+    返回 None，调用方保持构造器空白——绝不用默认值去覆盖用户已经写好的 when。
 
     注：policy.yaml 里的开关规则把值写进了 key（`session.confidential == true: true`），
     引擎只取 dict value（policy._eval_cond 按 == 切 key 后比 v），照此解析。
     """
     if not isinstance(when, Mapping):
         return None
-    # 单层 any/all 只是包壳，剥掉再看
+    # 单层 any/all：一条=包壳剥掉再看；多条=条件组逐行逆解析（组内再嵌套认不出）
     if len(when) == 1 and next(iter(when)) in ("any", "all"):
-        items = when[next(iter(when))]
-        if not isinstance(items, list) or len(items) != 1:
+        combiner = next(iter(when))
+        items = when[combiner]
+        if not isinstance(items, list):
             return None
-        return parse_when(items[0])
+        if len(items) == 1:
+            return parse_when(items[0])
+        # hour_range 自身就是 any/all 壳（22-6 跨午夜 -> any, 9-18 同日 -> all），
+        # 优先识别为时段构造器，避免被当成无法逆解析的组。
+        if len(items) == 2:
+            bounds = [_hour_bound(c) for c in items]
+            if all(b is not None for b in bounds):
+                return {"content_type": "hour_range", "match_type": "hour_range",
+                        "match_value": f"{bounds[0]}-{bounds[1]}"}
+        if len(items) >= 2:
+            rows = [parse_when(c) for c in items]
+            if all(isinstance(r, Mapping) and "combiner" not in r for r in rows):
+                return {"combiner": combiner, "rows": rows}
+        return None
     if len(when) != 1:
         return None
     k, v = next(iter(when.items()))
@@ -140,6 +167,8 @@ def parse_when(when: Any) -> Optional[Dict[str, Any]]:
         return {"content_type": ct, "match_type": "bool", "match_value": _fmt_bool(v)}
     if op == ">=" and field == "file.size":
         return {"content_type": "size", "match_type": "size", "match_value": v}
+    if op == ">=" and field == "findings.weighted_pii_score":
+        return {"content_type": "pii_score", "match_type": "pii_score", "match_value": v}
     mt = {"matches_regex": "regex", "contains_any": "contains", "in": "in", "not_in": "not_in"}.get(op)
     if not mt:
         return None  # != / <= 在构造器里没有对应项
@@ -244,6 +273,9 @@ def build_when(content_type: str, match_type: str, match_value: Any) -> Dict[str
     if match_type == "size":
         # 文件大小：自带字段，仅对文件分支有意义
         return {"file.size >=": int(match_value)}
+    if match_type == "pii_score":
+        # 加权 PII 评分：自带字段，仅对 findings.weighted_pii_score 生效
+        return {"findings.weighted_pii_score >=": int(match_value)}
     if match_type == "hour_range":
         # 本地时段区间，自带字段（对齐 size 的做法）："9-18" 同日 -> all；"22-6" 跨午夜 -> any
         m = re.fullmatch(r"\s*(\d{1,2})\s*[-~]\s*(\d{1,2})\s*", str(match_value))
@@ -276,6 +308,32 @@ def build_when(content_type: str, match_type: str, match_value: Any) -> Dict[str
     raise ValueError(f"unsupported match_type: {match_type}")
 
 
+def build_when_group(combiner: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """条件组（多行 字段+匹配方式+匹配项，any/all 组合）-> when。
+
+    单行退化为 build_when（不加壳，与单条件规则同形状，老 match 兼容）；
+    多行 -> {"any"/"all": [每行条件]}，每行各走一遍 build_when 的校验
+    （组合合法性/正则/至少一个值）。hour_range 自身产出 any/all 壳，
+    展不平进组内列表，直接拒。
+    """
+    if combiner not in ("any", "all"):
+        raise ValueError("combiner 必须是 any 或 all")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("条件组至少要一行条件")
+    if len(rows) == 1:
+        r = rows[0] if isinstance(rows[0], Mapping) else {}
+        return build_when(r.get("content_type", ""), r.get("match_type", ""), r.get("match_value"))
+    conds = []
+    for r in rows:
+        if not isinstance(r, Mapping) or r.get("match_type") == "hour_range":
+            raise ValueError("hour_range 不能进条件组（它自身就是 any/all 壳）")
+        w = build_when(r.get("content_type", ""), r.get("match_type", ""), r.get("match_value"))
+        if len(w) != 1:
+            raise ValueError("条件组每行必须是单条件")
+        conds.append(w)
+    return {combiner: conds}
+
+
 def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = "",
               client_key: str = "", hour: Optional[int] = None) -> Dict[str, Any]:
     """L1 规则测试（5.3 的 L1 半边）：构造 ctx 跑 decide()，返回命中详情。
@@ -303,7 +361,7 @@ def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = ""
     }
     hit = decide(load_policy(_policy_path()), ctx)
     return {
-        "matched": hit.get("name") != "default_allow" or hit.get("action") != "allow",
+        "matched": hit.get("name") != "默认放行" or hit.get("action") != "allow",
         "rule": hit.get("name"),
         "action": hit.get("action"),
         "target": hit.get("target"),

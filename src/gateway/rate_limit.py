@@ -103,10 +103,13 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._buckets: dict[tuple[str, str], _Bucket] = {}
 
-    def _scope_limits(self, scope: str) -> Tuple[float, float, str]:
+    def _scope_limits(self, scope: str, rpm_override: Optional[int] = None) -> Tuple[float, float, str]:
         """Return (capacity, refill_per_sec, reason_label) for a given scope."""
         if scope == "files":
             return float(self.files_rpm), self.files_rpm / 60.0, "files_rpm"
+        if rpm_override and int(rpm_override) > 0:
+            v = float(int(rpm_override))
+            return v, v / 60.0, "rpm"
         if self.rpm > 0:
             return float(self.rpm), self.rpm / 60.0, "rpm"
         if self.rps > 0:
@@ -131,10 +134,10 @@ class RateLimiter:
         self.files_rpm = _env_int("AI_GATEWAY_RATE_LIMIT_FILES_RPM", self.files_rpm)
         self.enabled = _env_bool("AI_GATEWAY_RATE_LIMIT_ENABLED", self.enabled)
 
-    def check(self, key: str, scope: str = "default") -> Tuple[bool, int, str]:
+    def check(self, key: str, scope: str = "default", rpm_override: Optional[int] = None) -> Tuple[bool, int, str]:
         if not self.enabled:
             return True, 0, ""
-        capacity, refill, reason = self._scope_limits(scope)
+        capacity, refill, reason = self._scope_limits(scope, rpm_override)
         if capacity <= 0 or refill <= 0:
             return True, 0, ""
         b = self._get_bucket(key, scope, capacity)
@@ -146,7 +149,7 @@ class RateLimiter:
     def check_model(self, full_model: str, rpm: int) -> Tuple[bool, int]:
         """模型级全局限流（全客户端共享一个桶）。rpm<=0 = 不限。
 
-        full_model 形如 "vllm_local/qwen2.5:7b"，作桶键。
+        full_model 形如 "vllm_local/Qwen3.8-AB"，作桶键。
         同一请求内 resolve() 会被预检/实际转发调用多次 —— ContextVar 去重，
         每请求每模型只扣一次（fallback 换候选 = 不同 full_model，各自计）。
         """

@@ -1,6 +1,18 @@
-// 管理台共享工具：fetch 样板 / 错误文案 / 复制兜底 / 面板时间窗
+// 管理台共享工具：fetch 样板 / 错误文案 / 复制兜底 / 面板时间窗 / 静默轮询
 // 注意：管理台走 HTTP（局域网 IP）= 非安全上下文，无 navigator.clipboard，复制必须带 execCommand 兜底。
 import { message } from 'antd';
+import { useEffect, useRef } from 'react';
+
+// 30s 静默轮询（刷新按钮的统一替代，口径同总览页 30s 轮询）：fn 经 ref 恒取最新闭包；
+// 调用方传 silent load（不点 loading），轮询不闪 Spin。
+export function usePoll(fn, ms = 30000) {
+  const ref = useRef(fn);
+  ref.current = fn;
+  useEffect(() => {
+    const t = setInterval(() => ref.current(), ms);
+    return () => clearInterval(t);
+  }, [ms]);
+}
 
 export const fetchJson = async (path, opts = {}) => {
   // 浏览器 fetch 发 string body 默认 Content-Type: text/plain，FastAPI 遇到非 JSON

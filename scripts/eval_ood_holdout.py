@@ -18,28 +18,24 @@ import json
 import os
 import sys
 import time
-import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
+
+from laya_eval_common import THRESH, classify_p
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 # 打哪台：默认现役影子 8003；量候选版就 OOD_L2_URL=http://127.0.0.1:8004/classify
 # （8004 是 l2_retrain 候选评测用的临时端口，别长期占着）
 L2_URL = os.environ.get("OOD_L2_URL", "http://127.0.0.1:8003/classify")
-THRESH = 0.7
+
+
+def _laya_p(text: str, filename: str = ""):
+    return classify_p(text, filename, url=L2_URL, timeout=30)
 
 PAD = ("\n另外补充一下，上周的会议纪要已经同步到知识库，相关文档编号和负责人名单"
        "在 wiki 上都有记录，如果需要可以自行查阅。\n"
        "再说明一次，本段文字只是为了让上下文更长一些，不包含任何需要判断的信息。")
-
-
-def _laya_p(text: str, filename: str = ""):
-    body = json.dumps({"text": text, "filename": filename}).encode()
-    req = urllib.request.Request(L2_URL, data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return float(json.load(r)["probabilities"]["CONFIDENTIAL"])
 
 
 def _perturb(name: str, text: str) -> str:

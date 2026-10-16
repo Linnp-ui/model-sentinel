@@ -1,4 +1,4 @@
-"""对外模型别名（ext-flash / ext-pro）动态路由。
+"""对外模型别名（AB-flash / AB-pro）动态路由。
 
 - /v1/models 只暴露别名组；客户端 model=别名 时按组内候选链路由。
 - 候选链来自 Admin Console 配置（admin_store.alias_group/alias_member，5s TTL 缓存）。
@@ -27,7 +27,8 @@ def ctx_record_failover(from_ref: str) -> None:
         c["failover"].append(from_ref)
 
 
-def ctx_get() -> Optional[dict]:
+def ctx_now() -> Optional[dict]:
+    """模块级封装（main.py / routing.py 共用，避免重复定义）。"""
     return _alias_ctx.get()
 
 

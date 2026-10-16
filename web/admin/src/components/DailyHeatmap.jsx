@@ -16,8 +16,11 @@ export const dailyPointsFromChart = (ch) => {
 export default function DailyHeatmap({ points, unit = '次', testid }) {
   if (!points || !points.length) return null;
   const maxV = Math.max(...points.map((p) => p.v));
+  const columns = points.length > 14
+    ? `repeat(${Math.ceil(points.length / 2)}, minmax(0, 1fr))`
+    : 'repeat(auto-fit, minmax(64px, 1fr))';
   return (
-    <div data-testid={testid} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(64px, 1fr))', gap: 8 }}>
+    <div data-testid={testid} style={{ display: 'grid', gridTemplateColumns: columns, gap: 8 }}>
       {points.map((p) => {
         // sqrt 映射：低流量下个别主导日（灌数/压测）会把线性映射的其他日全压成最浅色
         const f = maxV > 0 ? Math.sqrt(p.v / maxV) : 0;

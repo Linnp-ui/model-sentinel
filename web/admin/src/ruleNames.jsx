@@ -1,18 +1,30 @@
-// L1 规则名 -> 中文显示（只改显示：后端 name/action 保持英文标识，审计历史与接口不受影响）。
-// 未收录的新增规则回退显示原名。
+// 2026-10-14 起 policy.yaml 规则名本身即中文，旧英文→中文映射作废；
+// 本文件只剩内部系统规则 + 历史旧名 + 空值兜底的映射。
 export const RULE_ZH = {
-  session_route_local: '\u4f1a\u8bdd\u673a\u5bc6\u8f6c\u5185\u7f51',
-  financial_local_only: '\u8d22\u52a1\u8868\u8f6c\u5185\u7f51',
-  ocr_empty_image_route_local: '\u7a7a\u56fe\u8f6c\u5185\u7f51',
-  drawing_local_only: '\u56fe\u7eb8\u8f6c\u5185\u7f51',
-  block_secrets: '\u62e6\u622a\u5bc6\u94a5',
-  pii_critical_block: '\u9ad8\u5371\u9690\u79c1\u62e6\u622a',
-  pii_weighted_route_local: '\u9690\u79c1\u52a0\u6743\u8f6c\u5185\u7f51',
-  unparsed_binary_route_local: '\u672a\u89e3\u6790\u4e8c\u8fdb\u5236\u8f6c\u5185\u7f51',
-  default_allow: '\u9ed8\u8ba4\u653e\u884c',
+  default_allow: '默认放行',
+  allow: '放行',
+  route_local: '本地路由',
+  block: '阻断',
+  l2_confidential: 'L2 判密',
+  l2_unavailable: 'L2 不可用',
+  first_chunk_fallback: '首块转内网',
+  prompt_too_long_fallback: '长提示转内网',
+  key_blacklist: '密钥黑名单',
+  // 历史旧规则名→现名
+  financial_local_only: '财务表转内网',
+  drawing_local_only: '图纸转内网',
+  pii_weighted_route_local: '隐私加权转内网',
+  pii_critical_block: '高危隐私拦截',
+  block_secrets: '拦截密钥',
+  session_route_local: '会话机密转内网',
+  tainted_file_ref: '文件名转内网',
+  '未解析二进制转内网': '二进制转内网',
+  '文件名污染转内网': '文件名转内网',
+  empty_image: '空图转内网',
 };
 
 export function ruleZh(name) {
-  if (!name) return '\u2014';
+  if (!name) return '—';
   return RULE_ZH[name] || name;
 }
+

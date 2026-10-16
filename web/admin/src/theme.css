@@ -1,6 +1,10 @@
+html { scrollbar-gutter: stable; }
+body.ant-scrolling-effect { width: auto !important; }
+
 /* 顶部常驻块：状态条在上 + 标题在下。真 fixed（sticky 在 body 滚动 + flex 下每帧重算会抖，
-   与侧边栏同因）；left:200 让出侧边栏，高度由 App.jsx 实测后内容区 paddingTop 让位 */
-.app-topbar { position: fixed; top: 0; left: 200px; right: 0; z-index: 10; background: #fff; }
+   与侧边栏同因）；left:180 只是兜底，实际由 App.jsx 内联覆盖随侧栏收起/展开联动，
+   高度由 App.jsx 实测后内容区 paddingTop 让位 */
+.app-topbar { position: fixed; top: 0; left: 180px; right: 0; z-index: 10; background: #fff; }
 /* 注：页面工具栏统一用 Portal 挂标题右侧（#page-toolbar-slot），不跟内容滚动，无需吸顶 */
 
 /* 状态灯异常：红色 Tag 脉冲提示（系统偏好减动效时关闭） */
@@ -13,14 +17,14 @@
   .status-critical { animation: none; }
 }
 
-/* 页面 Content padding=16；统一所有卡片（含 size=small）head 为同一格式：
+/* 页面 Content 上下 padding=8（App.jsx 内联）；统一所有卡片（含 size=small）head 为同一格式：
    antd small 卡默认 head min-height=38px/font=14px/body=12px，
    normal 卡 min-height=56px/font=16px/body=24px —— 全部对齐到 normal 值 */
 .ant-card-head {
   padding-inline-start: 24px !important;
   padding-inline-end: 24px !important;
   min-height: 56px !important;
-  font-size: 16px !important;
+  font-size: 18px !important;
 }
 .ant-card-head-title { padding: 0 !important; }
 /* 单元格不换行：fixed 布局缩宽时 % 列等比缩小，压到最窄列宽后表内横向滚动而不是
@@ -31,12 +35,14 @@
    （2026-10 实测；auto 布局也不行——Blink 把 nowrap 全文宽当硬下限，长文本列
    直接撑爆容器）。fixed 下 <col> 的 min-width 才生效（探针验证）：全部列 96px
    兜底，列宽 = max(指定宽, 96px)，总和放不下时表内横滚——「灌数轮次」表的行为，
-   全部表同口径 */
-.ant-table col { min-width: 96px; }
+   全部表同口径。展开图标列不是数据列，排除在外（不排会把 24px 宽度抬回 96px，
+   2026-10 浏览器实测） */
+.ant-table col:not(.ant-table-expand-icon-col) { min-width: 96px; }
 /* 逐列下限：内容宽于 96 的 Tag/按钮列不能 ellipsis 裁切（切 Tag/切按钮会坏），
    按列给足。rc-table 只在 auto 布局反映 column.minWidth，fixed 只能 col nth-child
    （2026-10 实测内容宽：主→影双 Tag≈300 / 方向 Tag≈130 / 动作 Tag≈152 / 类型双 Tag≈155 /
-   keys 操作 3 按钮≈255 / 外部候选·限流 操作双链接≈150 / 熔断 操作 2 按钮≈170 /
+   keys 操作 2 按钮≈175（启用/停用按钮 2026-10-14 已删，原 3 按钮≈255）/
+   外部候选·限流 操作双链接≈150 / 熔断 操作 2 按钮≈170 /
    注册表 操作≈145 / 注册表 Key 列 code+Tag+按钮≈305） */
 .tbl-divs col:nth-child(2) { min-width: 130px; }
 .tbl-divs col:nth-child(3) { min-width: 310px; }
@@ -44,7 +50,7 @@
 .tbl-registry col:nth-child(4) { min-width: 160px; }
 .tbl-registry col:nth-child(6) { min-width: 310px; }
 .tbl-registry col:nth-child(8) { min-width: 150px; }
-.tbl-keys col:nth-child(6) { min-width: 275px; }
+.tbl-keys col:nth-child(5) { min-width: 180px; }
 .tbl-ext col:nth-child(8) { min-width: 150px; }
 .tbl-limits col:nth-child(5) { min-width: 150px; }
 .tbl-circuit col:nth-child(5) { min-width: 170px; }
@@ -71,6 +77,13 @@
 /* 审计表 10 列且窄（最小 110px），表头挤在左边认不出对应哪列：左右留白对称。
    只审计表需要，用组件根 class 限定作用域，别改全局 .ant-table-cell。 */
 .audit-table .ant-table-cell { padding-left: 12px !important; padding-right: 12px !important; }
+/* 展开列（仅审计表有 expandable）：antd 默认 48px 太宽，收到 24px（箭头 icon 14px 够放）。
+   宽度在 rc-table 注入的 <col class="ant-table-expand-icon-col"> 上（fixed 布局 col 压过 th，
+   选 th 的 .ant-table-row-expand-icon-cell 不生效，2026-10 实测） */
+.audit-table .ant-table-expand-icon-col { width: 24px !important; }
+/* 审计表 L2 展开详情：单 td 横跨整表，全局居中会让它悬浮在宽屏空带中间。
+   宽度由组件侧 maxWidth+margin:auto 收口，这里把文字翻回左对齐（散文左对齐更好读，同省略列例外口径）。 */
+.audit-l2detail { text-align: left !important; }
 /* L2 运行配置块（审查模型卡片内）垂直居中 */
 .ant-card-body:has(> [data-testid="l2cfg-section"]) {
   display: flex;
@@ -83,3 +96,77 @@
    all 0.3s）都带 300ms 淡入（motionDurationSlow），切时间窗时遮罩"慢半拍"。
    transition 置 none 挂载即满遮罩；管理台其余 Spin/Table loading 同口径即时。 */
 .ant-spin-container, .ant-spin-blur::after { transition: none !important; }
+
+/* 微动效（只动 transform/opacity，走 GPU；时长 ≤200ms，效率工具不抢戏）。
+   可点 KPI 卡悬停上浮 2px + 阴影；按钮/表格行 hover 有过渡；全局禁用动画偏好时全关。 */
+[data-testid^="ov-"].ant-card { transition: transform .16s ease-out, box-shadow .16s ease-out !important; }
+[data-testid^="ov-"].ant-card-hoverable:hover { transform: translateY(-2px); }
+.ant-btn, .ant-table tbody > tr > td { transition: background-color .16s ease-out, box-shadow .16s ease-out !important; }
+@media (prefers-reduced-motion: reduce) {
+  [data-testid^="ov-"].ant-card, .ant-btn, .ant-table tbody > tr > td { transition: none !important; }
+  [data-testid^="ov-"].ant-card-hoverable:hover { transform: none; }
+}
+
+/* 页面切换入场（路由级：Page 随 page key 重挂，动画自动重播；180ms 内只动 opacity/位移） */
+@keyframes page-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.page-enter { animation: page-in .18s ease-out; }
+/* 状态条节点色随 SSE 推送变：颜色硬切改渐变，critical 脉冲保留 */
+.app-statusbar .ant-tag { transition: background-color .3s ease-out, border-color .3s ease-out, color .3s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .page-enter { animation: none; }
+  .app-statusbar .ant-tag { transition: none; }
+}
+
+/* default（outlined）按钮视觉口径统一 = type="link" danger（红字无底无边）。
+   按 antd 的 variant/color 类一次性收口全局，不必逐个源码改 type；border 置透明
+   而非置 0，按钮占位不变、不引发布局跳动。hover/active/禁用态与 antd 红链接对齐。 */
+.ant-btn-variant-outlined.ant-btn-color-default,
+.ant-btn-variant-outlined.ant-btn-color-default:hover,
+.ant-btn-variant-outlined.ant-btn-color-default:focus {
+  color: #ff4d4f !important;
+  background-color: transparent !important;
+  border-color: transparent !important;
+}
+.ant-btn-variant-outlined.ant-btn-color-default:hover { color: #ff7872 !important; }
+.ant-btn-variant-outlined.ant-btn-color-default:active { color: #d9363e !important; }
+.ant-btn-variant-outlined.ant-btn-color-default:disabled,
+.ant-btn-variant-outlined.ant-btn-color-default.ant-btn-disabled {
+  color: rgba(0, 0, 0, 0.25) !important;
+  background-color: transparent !important;
+  border-color: transparent !important;
+}
+/* danger 描边按钮去掉边框/底色（视觉口径 = type="link" danger）；layout 不变 */
+.ant-btn-variant-outlined.ant-btn-color-dangerous {
+  background-color: transparent !important;
+  border-color: transparent !important;
+}
+/* 中性描边按钮例外（如阈值）：恢复 antd 默认描边，不走全局红色口径 */
+.ant-btn.btn-neutral.ant-btn-color-default,
+.ant-btn.btn-neutral.ant-btn-color-default:hover,
+.ant-btn.btn-neutral.ant-btn-color-default:focus {
+  color: rgba(0, 0, 0, 0.88) !important;
+  background-color: #ffffff !important;
+  border-color: #d9d9d9 !important;
+}
+.ant-btn.btn-neutral.ant-btn-color-default:hover {
+  color: #4096ff !important;
+  border-color: #4096ff !important;
+}
+.ant-btn.btn-neutral.ant-btn-color-default:active {
+  color: #0958d9 !important;
+  border-color: #0958d9 !important;
+}
+/* 「非密」标注按钮：绿色（默认红→绿，覆盖 default 按钮红色口径） */
+.ant-btn.btn-green { color: #52c41a !important; }
+.ant-btn.btn-green:hover { color: #95de64 !important; }
+.ant-btn.btn-green:active { color: #389e0d !important; }
+.ant-table-column-sorter { display: none !important; }
+/* 原生文件选择器伪装成 antd primary 按钮（selected files 走 Tag 展示，原生文本置透明） */
+.file-pick { color: transparent; background: transparent; border: 0; padding: 0; }
+.file-pick::file-selector-button {
+  height: 32px; padding: 0 15px; border: 1px solid transparent; border-radius: 8px;
+  background: #2f54eb; color: #fff; font-size: 14px; line-height: 1.5714; cursor: pointer;
+  box-shadow: 0 2px 0 rgba(5, 5, 5, 0.06);
+}
+.file-pick::file-selector-button:hover { background: #597ef7; color: #fff; }
+.file-pick::file-selector-button:active { background: #1d39c4; color: #fff; }

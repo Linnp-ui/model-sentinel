@@ -1,10 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Button, Space, message, Card, Statistic, Select, Popconfirm, Alert, Tooltip, Typography, Row, Col, Spin } from 'antd';
-import { ReloadOutlined, DeleteOutlined } from '@ant-design/icons';
+import { Space, Tag, message, Card, Statistic, Select, Alert, Tooltip, Typography, Row, Col, Spin } from 'antd';
 import { ruleZh } from './ruleNames.jsx';
 import MetricsSection from './components/MetricsSection.jsx';
-import { api, errText, RANGES } from './api.js';
+import { api, errText, RANGES, usePoll } from './api.js';
 
 const { Text } = Typography;
 
@@ -100,6 +99,12 @@ function KeyCallBars({ keyModels, keyCalls, ov, testid }) {
   const SEG = [['allow', '#1677ff', '放行'], ['local', '#faad14', '本地路由'], ['blocked', '#ff4d4f', '拦截']];
   return (
     <div data-testid={testid}>
+      <Space size={4} wrap style={{ marginBottom: 12 }}>
+        <Text type="secondary" style={{ fontSize: 12 }}>行宽 ∝ 调用量 · 段色：</Text>
+        {SEG.map(([key, color, name]) => (
+          <Tag key={key} color={color === '#1677ff' ? 'blue' : color === '#faad14' ? 'orange' : 'red'}>{name}</Tag>
+        ))}
+      </Space>
       {keys.map((k) => {
         const g = keyActions[k] || { calls: 0, blocked: 0, local: 0, allow: 0 };
         return (
@@ -114,12 +119,11 @@ function KeyCallBars({ keyModels, keyCalls, ov, testid }) {
               </div>
             </div>
             <span style={{ width: 190, flex: '0 0 auto', textAlign: 'right', color: '#666' }}>
-              {g.calls} 次 · {(keyTokens[k] || 0).toLocaleString()} tokens
+              {g.calls} 次
             </span>
           </div>
         );
       })}
-      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>行宽 ∝ 调用量 · 段色：蓝=放行 橙=本地路由 红=拦截</Text>
       <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
         Token 用量（总计 {totalTokens ? totalTokens.toLocaleString() : 0}）
       </Text>
@@ -140,6 +144,8 @@ function KeyCallBars({ keyModels, keyCalls, ov, testid }) {
 
 
 export default function StatsPage() {
+  const billingRef = useRef(null);
+  const focus = new URLSearchParams((window.location.hash.split('?')[1]||'')).get('focus');
   const [hours, setHours] = useState(168);
   const [ov, setOv] = useState(null);
   const [provTop, setProvTop] = useState([]);
@@ -147,14 +153,16 @@ export default function StatsPage() {
   const [keyModels, setKeyModels] = useState([]);
   const [keyCalls, setKeyCalls] = useState([]);
   const [billing, setBilling] = useState(null);
-  // 规则命中（audit_logs 窗口聚合，排除 default_allow）：比 group_rule 的 26 个 label
+  useEffect(() => { if (focus === 'billing') billingRef.current?.scrollIntoView({behavior:'smooth',block:'start'}); }, [billing]);
+  // 规则命中（audit_logs 窗口聚合，排除 默认放行）：比 group_rule 的 26 个 label
   // （top=「(unknown)」57.5%）信息量大——只有真实 firing 的规则 + 次数 + 最后命中
   const [ruleHits, setRuleHits] = useState(undefined);
 
   // 单一数据源 request_log：KPI 卡 / 趋势 / Top 榜同窗口同口径，页面数字不再打架
   // 单端点 /stats/summary 单遍聚合（后端 7 端点合并，口径与各自端点逐字段一致）
-  const loadAll = useCallback(async (h = hours) => {
-    setLoading(true);
+  // silent=true：30s 轮询用，不点 loading（不闪 Spin）、不弹错误（后台刷新失败静默）
+  const loadAll = useCallback(async (h = hours, silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [d, rh] = await Promise.all([
         api(`/stats/summary?hours=${h}&top=20`),
@@ -165,11 +173,12 @@ export default function StatsPage() {
       setProvTop((pg.items || []).slice(0, 8).map((g) => ({ label: g.label, count: g.calls, tokens: g.tokens })));
       setRuleHits(rh);
       setKeyModels(m.items || []); setKeyCalls(k.items || []); setBilling(b);
-    } catch (e) { message.error(errText(e)); }
-    finally { setLoading(false); }
+    } catch (e) { if (!silent) message.error(errText(e)); }
+    finally { if (!silent) setLoading(false); }
   }, [hours]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
+  usePoll(() => loadAll(hours, true)); // 替代原刷新按钮
 
   // KEY × 金额占比环图数据（仅已定价金额>0 的 KEY，降序）
   const billKeyCosts = (() => {
@@ -185,13 +194,7 @@ export default function StatsPage() {
 
 
 
-  const cleanup = async () => {
-    try {
-      const r = await api('/logs/cleanup', { method: 'POST', body: JSON.stringify({}) });
-      message.success(`已清理 ${r.deleted} 条过期明细（默认保留 90 天）`);
-      loadAll();
-    } catch (e) { message.error(errText(e)); }
-  };
+
 
 
 
@@ -206,11 +209,7 @@ export default function StatsPage() {
         ? createPortal((
           <Space size="middle">
             <Select size="small" value={hours} onChange={(v) => setHours(v)} style={{ width: 130 }}
-              options={RANGES.map(r => ({ value: r.hours, label: r.label }))} />
-            <Button size="small" icon={<ReloadOutlined />} onClick={() => loadAll()} loading={loading}>刷新</Button>
-            <Popconfirm title="清理 90 天前的明细？" onConfirm={cleanup}>
-              <Button size="small" icon={<DeleteOutlined />}>清理过期明细</Button>
-            </Popconfirm>
+              options={RANGES.map((r) => ({ value: r.hours, label: r.label }))} />
           </Space>
         ), document.getElementById('page-toolbar-slot'))
         : null}
@@ -262,7 +261,6 @@ export default function StatsPage() {
                 : <Alert type="info" showIcon message="窗口内无调用" />}
             </Card>
             <Card title="规则命中 Top10"
-              extra={<Text type="secondary" style={{ fontSize: 12 }}>audit_logs 窗口聚合 · 排除 default_allow</Text>}
               style={{ minWidth: 380, flex: 1, display: 'flex', flexDirection: 'column' }}
               styles={{ body: { flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' } }}>
               {ruleHits === null
@@ -282,7 +280,7 @@ export default function StatsPage() {
             styles={{ body: { flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' } }}>
             <KeyCallBars keyModels={keyModels} keyCalls={keyCalls} ov={ov} testid="stats-key-bars" />
           </Card>
-          <Card title={`Token 计费${billing ? `（合计 ¥${billing.total_cost}）` : ''}`} style={{ marginTop: 12 }}
+          <Card ref={billingRef} title={`Token 计费${billing ? `（合计 ¥${billing.total_cost}）` : ''}`} style={{ marginTop: 12, minHeight: 220 }}
             extra={<Text type="secondary" style={{ fontSize: 12 }}>内部分摊口径≠上游账单；缓存单价未配按全价（高估）；上游不回用量记0（少计）</Text>}>
             <div style={{ marginBottom: 12, display: 'flex', gap: 24, flexWrap: 'wrap' }}>
               <div style={{ flex: '0 0 420px' }}>

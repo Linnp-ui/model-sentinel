@@ -8,7 +8,8 @@
 import json
 import os
 import sys
-import urllib.request
+
+from laya_eval_common import THRESH, classify_p
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -17,19 +18,12 @@ from gateway.inspection import inspect_text  # noqa: E402
 DATA = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     ROOT, "tests", "fixtures", "security_testset.jsonl")
 L2_URL = os.environ.get("AI_GATEWAY_L2_SHADOW_URL", "http://127.0.0.1:8003/classify")
-L2_TH = 0.7
 
 
 def l2_classify(text):
     try:
-        req = urllib.request.Request(
-            L2_URL, data=json.dumps({"text": text}).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            d = json.loads(r.read())
-        probs = d.get("probabilities", {})
-        p = probs.get("CONFIDENTIAL", 0.0)
-        return p >= L2_TH, p
+        p = classify_p(text, url=L2_URL, timeout=10)
+        return p >= THRESH, p
     except Exception as e:
         return None, "ERR:%s" % e
 

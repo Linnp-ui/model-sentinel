@@ -3,6 +3,7 @@ import { Alert, Card, Segmented, Space, Typography } from 'antd';
 import UPlotChart, { msAxis, qpsAxis } from '../UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './DailyHeatmap.jsx';
 import { fetchJson as api } from '../api.js';
+import { avg } from '../utils.js';
 
 const { Text } = Typography;
 const pct = (v) => v == null ? '-' : (v * 100).toFixed(1) + '%';
@@ -39,12 +40,8 @@ export default function MetricsSection({ hours = 24 }) {
   const CHART_TABS = ['qps', 'err', 'lat', 'l2'];
   if (err) return <Alert type="error" message={`运行指标刷新失败：${err}（显示上次数据）`} style={{ marginTop: 12 }} />;
   if (!data) return <Card title="运行指标" style={{ marginTop: 12 }} loading />;
-  const { ticks, panel } = data;
+  const { ticks } = data;
 
-  const avg = (points) => {
-    const vs = points.filter((p) => p.v != null);
-    return vs.length ? vs.reduce((a, p) => a + p.v, 0) / vs.length : null;
-  };
   const msFmt = (v) => Math.round(v).toLocaleString('en-US');
   const qpsFmt = (v) => v.toFixed(2);
 
@@ -60,8 +57,6 @@ export default function MetricsSection({ hours = 24 }) {
     { name: 'P50', color: '#52c41a', dots: true, n: nArr, points: cpts(ch.p50, false) },
     { name: 'P95', color: '#fa8c16', dots: true, n: nArr, points: cpts(ch.p95, false) },
     { name: 'P99', color: '#ff4d4f', dots: true, n: nArr, points: cpts(ch.p99, false) },
-    // Min 用中性灰：#b7eb8f 浅绿与 P50 #52c41a 同色系难分辨，白底上对比度仅 ~1.9:1
-    { name: 'Min', color: '#8c8c8c', dots: true, n: nArr, points: cpts(ch.lat_min, false) },
   ];
   // 空态：窗口内真没数据时画平 0 线会读成"正常运行"，显式空态替代
   const winQps = bigWin ? (ch.counts || []).reduce((a, b) => a + (b || 0), 0) : null; // 小窗空态在环分支算
@@ -135,12 +130,11 @@ export default function MetricsSection({ hours = 24 }) {
     };
   }
   const cur = (bigWin && chartTab === 'l2') ? null : (chartDefs[CHART_TABS.includes(chartTab) ? chartTab : 'qps']);
-  const uptime = `v${panel.version} · uptime ${Math.floor((panel.uptime_s || 0) / 3600)}h${Math.floor((panel.uptime_s || 0) % 3600 / 60)}m`;
+
   return (
     <Card title="运行指标" style={{ marginTop: 12 }}
-      extra={<Space>
-        {bigWin && <Text type="secondary" style={{ fontSize: 11 }}>超 24h 走 request_log 分桶快照（L2 序列仅环内）</Text>}
-        <Segmented size="small" value={chartTab} onChange={setChartTab}
+       extra={<Space>
+         <Segmented size="small" value={chartTab} onChange={setChartTab}
           options={[
             { label: 'QPS', value: 'qps' },
             { label: '错误率', value: 'err' },
@@ -158,21 +152,20 @@ export default function MetricsSection({ hours = 24 }) {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
             {cur.tags && (
               <span style={{ fontSize: 11, fontWeight: 400 }}>
-                {cur.tags.map((s) => { const n = avg(s.points); return (
-                  <Text key={s.name} type="secondary" style={{ marginLeft: 10, fontSize: 11 }}>
-                    {s.name} 均值 {n == null ? '-' : (s.fmt || cur.fmt)(n)}
-                  </Text>); })}
+                    {cur.tags.map((s) => { if (s.name === 'qps_total') return null; const n = avg(s.points.map((p) => p?.v)); return (
+                      <Text key={s.name} type="secondary" style={{ marginLeft: 10, fontSize: 14 }}>
+                        {s.name} 均值 {n == null ? '-' : (s.fmt || cur.fmt)(n)}
+                      </Text>); })}
               </span>
             )}
-            <Text type="secondary" style={{ fontSize: 11 }}>
-              {cur.hint ? `${cur.hint} · ` : ''}{bigWin ? 'request_log 分桶快照' : '环数据（延迟分位走分桶）'} · 10s 刷新 · 滚轮缩放 · 拖拽框选放大 · 双击回到全景 · {uptime}
+            <Text type="secondary" style={{ fontSize: 14 }}>
+              {cur.hint ? `${cur.hint} · ` : ''}{bigWin ? '' : '环数据（延迟分位走分桶） · 滚轮缩放 · 拖拽框选放大 · 双击回到全景'}
             </Text>
           </div>
-          {cur.heatmap ? (
-            <div>
-              {cur.heatmapNote && <Text type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 8 }}>{cur.heatmapNote}</Text>}
-              <DailyHeatmap points={cur.heatmap} testid="metrics-qps-daily" />
-            </div>
+            {cur.heatmap ? (
+              <div>
+                <DailyHeatmap points={cur.heatmap} testid="metrics-qps-daily" />
+              </div>
           ) : (
             <UPlotChart height={380} yVal={cur.yVal} series={cur.series} />
           )}

@@ -10,7 +10,7 @@ Redis (热缓存 5k) / MySQL (90 天) / admin 页面.
     Anthropic key / OpenAI sk- 模式时整段 mask 成 [REDACTED:aws-key] / 类似。
   - redact_audit_entry(entry: dict) -> dict: 把 text_preview / l2 result 等
     字段走过 _scrub_secrets。**就地修改**。调用方 log_entry() 用。
-  - 模式与 policy.yaml block_secrets / pii_critical_block 同步, 避免两套
+  - 模式与 policy.yaml 拦截密钥 / 高危隐私拦截 同步, 避免两套
     regex 漂移。
 
 不在本文件覆盖 (诚实声明):
@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
-# 与 policy.yaml block_secrets / pii_critical_block 对齐 (P2 fail-fast 时同步)
+# 与 policy.yaml 拦截密钥 / 高危隐私拦截 对齐 (P2 fail-fast 时同步)
 _PATTERNS = [
     # AWS access key: AKIA[0-9A-Z]{16} (官方固定 20 字符)
     (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED:aws-access-key]"),

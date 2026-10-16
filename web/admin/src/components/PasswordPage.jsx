@@ -1,13 +1,10 @@
-import { useEffect, useState } from 'react';
-import { Button, Input, Form, message, Alert, Card } from 'antd';
+import { Button, Input, Form, message, Card } from 'antd';
 import { LockOutlined } from '@ant-design/icons';
 import { api, errText } from '../api.js';
 
 // ---------------- 1.4 管理员密码 ----------------
 export default function PasswordPage() {
   const [form] = Form.useForm();
-  const [meta, setMeta] = useState(null);
-  useEffect(() => { api('/meta').then(setMeta).catch(() => {}); }, []);
 
   const submit = async () => {
     try {
@@ -20,13 +17,6 @@ export default function PasswordPage() {
 
   return (
     <Card title="修改管理员密码" style={{ maxWidth: 480, margin: '0 auto' }}>
-      {meta && (
-        <Alert style={{ marginBottom: 16 }} showIcon
-          type={meta.credential_set ? 'success' : 'warning'}
-          message={meta.credential_set
-            ? '当前凭据存于数据库（修改后所有已登录会话立即失效）'
-            : '尚未设置数据库凭据：当前使用环境变量密码，修改后将自动迁移入库'} />
-      )}
       <Form form={form} layout="vertical" onFinish={submit}>
         <Form.Item name="old_password" label="当前密码" rules={[{ required: true }]}>
           <Input.Password />

@@ -1,7 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Tooltip, Row, Col } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
-import { api, errText } from '../api.js';
+import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Row, Col } from 'antd';
+import { api, errText, usePoll } from '../api.js';
 
 const { Text } = Typography;
 // ---------------- Provider 注册表（routing.yaml 读写；密钥仍只走 env） ----------------
@@ -19,19 +18,41 @@ function ProviderRegistryCard() {
   const openModal = (row) => {
     setModal(row ? { row } : {});
     form.setFieldsValue(row ? {
-      name: row.name, base_url: row.base_url || '', api_key_env: row.api_key_env || '',
-      api_mode: row.api_mode || 'openai', kind: row.kind || 'chat',
-      default_model: row.default_model || '', embedding_model: row.embedding_model || '',
+      name: row.name, base_url: row.base_url || '',
+      api_key: '', api_mode: row.api_mode || 'openai', kind: row.kind || 'chat',
+      default_model: row.default_model || '',
       timeout: row.timeout ?? 60, local: !!row.local,
-    } : { api_mode: 'openai', kind: 'chat', timeout: 60 });
+    } : { api_mode: 'openai', kind: 'chat', timeout: 60, api_key: '' });
   };
 
+  // 点确定必过本地模型确认：local 模型跳过 L1/L2 直接 allow，标错即安全边界错
   const save = async () => {
     const v = await form.validateFields();
+    Modal.confirm({
+      title: '确认本地模型属性',
+      content: `「${v.name}」是否为本地模型（内容不出境）= ${v.local ? '是（内网）' : '否（外网）'}；本地模型跳过 L1/L2 直接放行。设错请点取消回去改开关。`,
+      okText: '确认无误，保存',
+      onOk: () => doSave(v),
+    });
+  };
+  const doSave = async (v) => {
+    const keyVal = (v.api_key || '').trim();
+    const body = { ...v };
+    delete body.api_key;
     setSaving(true);
     try {
-      if (modal?.row) await api(`/providers/${encodeURIComponent(modal.row.name)}`, { method: 'PUT', body: JSON.stringify(v) });
-      else await api('/providers', { method: 'POST', body: JSON.stringify(v) });
+      const oldName = modal?.row ? modal.row.name : body.name;
+      if (modal?.row) {
+        if (body.name && body.name !== oldName) body.new_name = body.name;
+        delete body.name;
+      }
+      const name = modal?.row ? (body.new_name || oldName) : body.name;
+      if (modal?.row) await api(`/providers/${encodeURIComponent(oldName)}`, { method: 'PUT', body: JSON.stringify(body) });
+      else await api('/providers', { method: 'POST', body: JSON.stringify(body) });
+      if (keyVal) {
+        try { await api(`/providers/${encodeURIComponent(name)}/key`, { method: 'PUT', body: JSON.stringify({ value: keyVal }) }); }
+        catch (e) { message.warning(`provider 已保存，但 key 写入失败：${errText(e)}`); }
+      }
       message.success('已保存，热重载即时生效');
       setModal(null);
       load();
@@ -68,23 +89,23 @@ function ProviderRegistryCard() {
   return (
     <Card title="注册表"
       extra={<Button type="primary" size="small" onClick={() => openModal(null)}>新增 provider</Button>}>
-      <Table size="small" rowKey="name" className="tbl-registry" pagination={false} dataSource={rows} columns={[
-        /* 列宽用 % 自适应（灌数轮次表口径）：Key 列 300px 定宽曾撑窄屏横向滚动；
-           操作列是按钮组，保留不定宽 */
-        { title: '名称', dataIndex: 'name', width: '11%', ellipsis: true },
-        { title: 'base_url', dataIndex: 'base_url', width: '22%', ellipsis: true },
-        { title: 'api_mode', dataIndex: 'api_mode', width: '9%' },
-        { title: '类型', width: '9%', render: (_, r) => (
+      <Table size="small" rowKey="name" className="tbl-registry" pagination={false} tableLayout="fixed" dataSource={rows} columns={[
+        /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。Key 列已删（2026-10-16）：
+           环境变量名+已配/缺 信息密度低，配/改 入口并入操作列 */
+        { title: '名称', dataIndex: 'name', width: '14%', ellipsis: true },
+        { title: 'base_url', dataIndex: 'base_url', width: '38%', ellipsis: true },
+        { title: '类型', width: '12%', render: (_, r) => (
           <Space size={4}>{r.local ? <Tag color="blue">内网</Tag> : <Tag>外网</Tag>}{r.kind === 'embedding' && <Tag color="purple">向量</Tag>}</Space>) },
-        { title: '默认模型', dataIndex: 'default_model', width: '13%', ellipsis: true },
-        { title: 'Key', dataIndex: 'api_key_env', width: '20%', render: (v, r) => v ? (
-          <Space size={4}><code>{v}</code>{r.configured ? <Tag color="green">已配</Tag> : <Tag color="red">缺</Tag>}
-            <Button type="link" size="small" onClick={() => { setKeyVal(''); setKeyModal({ row: r }); }}>{r.configured ? '改' : '配'}</Button>
-          </Space>
-        ) : <Tag>-</Tag> },
-        { title: '超时(s)', dataIndex: 'timeout', width: '8%' },
-        { title: '操作', width: '8%', render: (_, r) => (
+        { title: '操作', width: '36%', render: (_, r) => (
           <Space>
+            <Button type="link" size="small" onClick={async () => {
+              try {
+                const d = await api('/providers/check', { method: 'POST', body: JSON.stringify({ name: r.name }) });
+                const one = (d.results || [])[0] || {};
+                if (one.ok) message.success(`健康检查：${r.name} 可达（${one.latency_ms}ms，${one.model_count} 个模型）`);
+                else message.warning(`健康检查：${r.name} 仍失败 — ${one.error || 'HTTP ' + one.status}（key 可能无效）`);
+              } catch (e) { message.error(errText(e)); }
+            }}>检查</Button>
             <Button type="link" size="small" onClick={() => openModal(r)}>编辑</Button>
             <Popconfirm title={`删除 ${r.name}？被默认路由/候选/别名/策略引用时会拒绝`} onConfirm={async () => {
               try { await api(`/providers/${encodeURIComponent(r.name)}`, { method: 'DELETE' }); message.success('已删除'); load(); }
@@ -96,15 +117,21 @@ function ProviderRegistryCard() {
         onOk={save} confirmLoading={saving} onCancel={() => setModal(null)} destroyOnClose width={560}>
         <Form form={form} layout="vertical" size="small">
           <Form.Item name="name" label="名称" rules={[{ required: true, pattern: /^[A-Za-z0-9_-]+$/, message: '仅字母/数字/_/-' }]}>
-            <Input disabled={!!modal?.row} placeholder="如 oneapi" />
+            <Input placeholder="如 oneapi" />
           </Form.Item>
           <Form.Item name="base_url" label="base_url" rules={[{ required: true }]}>
             <Input placeholder="https://api.example.com/v1" />
           </Form.Item>
           <Row gutter={8}>
             <Col span={12}>
-              <Form.Item name="api_mode" label="api_mode">
-                <Select options={(data?.api_modes || ['openai', 'anthropic']).map((m) => ({ value: m, label: m }))} />
+              <Form.Item name="api_mode" label="接口类型">
+                <Select options={(data?.api_modes || ['openai']).map((m) => ({ value: m, label: ({
+                  openai: 'OpenAI Compatible',
+                  openai_responses: 'OpenAI Responses',
+                  anthropic: 'Anthropic',
+                  bedrock: 'Amazon Bedrock',
+                  gemini: 'Google (Gemini)',
+                }[m] || m) }))} />
               </Form.Item>
             </Col>
             <Col span={12}>
@@ -113,13 +140,9 @@ function ProviderRegistryCard() {
               </Form.Item>
             </Col>
           </Row>
-          <Form.Item name="api_key_env" label="api_key_env（env 变量名）"
-            tooltip="只填变量名；值在列表的「配/改」按钮里填（即时生效，免重启）；内网 provider 可留空"
-            extra="外网 provider 对应 env 未配值时真实转发会 503（保存后自动健康检查验证）">
-            <Input placeholder="如 OPENAI_API_KEY；内网留空" />
+          <Form.Item name="api_key" label="API Key（可选，仅写不回显）">
+            <Input.Password placeholder={modal?.row?.configured ? '留空=不修改' : '留空=不配置'} autoComplete="new-password" />
           </Form.Item>
-          <Form.Item name="default_model" label="默认模型"><Input placeholder="如 gpt-4o-mini" /></Form.Item>
-          <Form.Item name="embedding_model" label="向量模型（可选）"><Input /></Form.Item>
           <Form.Item name="timeout" label="超时（秒）" rules={[{ required: true }]}>
             <InputNumber min={1} max={600} style={{ width: '100%' }} />
           </Form.Item>
@@ -165,20 +188,17 @@ export function ProviderHealthCard({ compact = false }) {
         {compact && <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/provider'; }}>Provider 管理 →</Button>}
         <Button size="small" loading={checking} onClick={() => check('')}>全部检查</Button>
       </Space>}>
-      <Table size="small" rowKey="name" pagination={false} dataSource={rows || []}
+      <Table size="small" rowKey="name" pagination={false} tableLayout="fixed" dataSource={rows || []}
         locale={{ emptyText: '尚未检查，点右上角「全部检查」开始' }}
         columns={[
-          /* 列宽用 % 自适应（灌数轮次表口径）；compact 模式只留前两列+状态 */
-          { title: 'Provider', dataIndex: 'name', width: '16%' },
-          { title: '状态', width: '10%', render: (_, r) => r.ok ? <Tag color="green">正常</Tag> : <Tag color="red">异常</Tag> },
+          /* 列宽 % + tableLayout=fixed：全量模式占比合计 100；compact 只留前两列，
+             fixed 布局会把剩余宽度按列均分，两列同样铺满卡片 */
+          { title: 'Provider', dataIndex: 'name', width: '24%' },
+          { title: '状态', width: '12%', render: (_, r) => r.ok ? <Tag color="green">正常</Tag> : <Tag color="red">异常</Tag> },
           ...(!compact && [
-            { title: 'HTTP', dataIndex: 'status', width: '8%' },
-            { title: '延迟(ms)', dataIndex: 'latency_ms', width: '10%' },
-            { title: '模型数', dataIndex: 'model_count', width: '9%' },
-            { title: 'Key来源', dataIndex: 'key_source', width: '12%', render: (v) => (
-              <Tooltip title="header=请求头 / models_list_env=专用拉列表 env / provider_env=provider env key / none=无 key"><Tag>{v}</Tag></Tooltip>) },
-            { title: '说明', dataIndex: 'error', width: '17%', ellipsis: true },
-            { title: '操作', width: '17%', render: (_, r) => (
+            { title: '延迟(ms)', dataIndex: 'latency_ms', width: '16%' },
+            { title: '模型数', dataIndex: 'model_count', width: '16%' },
+            { title: '操作', width: '32%', render: (_, r) => (
               <Button type="link" size="small" loading={checking} onClick={() => check(r.name)}>检查</Button>) },
           ] || []),
         ]} />
@@ -190,10 +210,11 @@ export function ProviderHealthCard({ compact = false }) {
 function CircuitCard() {
   const [data, setData] = useState(null);
   const [busy, setBusy] = useState('');
-  const load = useCallback(async () => {
-    try { setData(await api('/circuit')); } catch (e) { message.error(errText(e)); }
+  const load = useCallback(async (silent = false) => {
+    try { setData(await api('/circuit')); } catch (e) { if (!silent) message.error(errText(e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
+  usePoll(() => load(true)); // 替代原刷新按钮（熔断状态含冷却倒计时，30s 自动跟进）
   const setState = async (name, state) => {
     setBusy(name);
     try {
@@ -205,9 +226,8 @@ function CircuitCard() {
   };
   const rows = Object.entries(data?.providers || {}).map(([name, p]) => ({ name, ...p }));
   return (
-    <Card title="熔断器"
-      extra={<Button size="small" icon={<ReloadOutlined />} onClick={load}>刷新</Button>}>
-      <Table size="small" rowKey="name" className="tbl-circuit" pagination={false} dataSource={rows}
+    <Card title={<>熔断器 <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>（连续失败达阈值后短暂拒绝流量，防止故障扩散）</Text></>}>
+      <Table size="small" rowKey="name" className="tbl-circuit" pagination={false} tableLayout="fixed" dataSource={rows}
         columns={[
           /* 列宽用 % 自适应（灌数轮次表口径） */
           { title: 'Provider', dataIndex: 'name', width: '24%' },
@@ -217,7 +237,7 @@ function CircuitCard() {
           { title: '冷却剩余(s)', dataIndex: 'cooldown_remaining_s', width: '16%' },
           { title: '操作', width: '28%', render: (_, r) => (
             <Space>
-              <Popconfirm title={`手动打开 ${r.name} 熔断？该 provider 上游请求将立即失败并回落本地`}
+              <Popconfirm title={`手动打开 ${r.name} 熔断？该 provider 请求将 fail-fast（不真实出境）：别名组切链内下一候选（跳过内网候选），点名请求直接 503；整组不可用即 503，不会静默转本地`}
                 onConfirm={() => setState(r.name, 'open')}>
                 <Button type="link" size="small" danger loading={busy === r.name}>打开</Button>
               </Popconfirm>

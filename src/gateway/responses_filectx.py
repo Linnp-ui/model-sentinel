@@ -3,7 +3,7 @@
 Codex \u8d70 /v1/responses \u4e0a\u4f20\u6587\u4ef6\u65f6\uff0c\u6587\u4ef6\u4ee5 input_file \u5757\u643a\u5e26
 `filename` (+ \u53ef\u9009 `file_data` data-URL) \u5230\u8fbe\u3002main._review_text \u7ed9
 decide() \u7684 ctx \u91cc file \u5b57\u6bb5\u6052\u4e3a\u7a7a\uff0c\u5bfc\u81f4\u4f9d\u8d56 file.*
-\u7684\u89c4\u5219\uff08financial_local_only / drawing_local_only\uff09\u5728 Codex \u8def\u5f84\u4e0b
+\u7684\u89c4\u5219\uff08\u8d22\u52a1\u8868\u8f6c\u5185\u7f51 / \u56fe\u7eb8\u8f6c\u5185\u7f51\uff09\u5728 Codex \u8def\u5f84\u4e0b
 \u6c38\u8fdc\u6253\u4e0d\u4e2d\u3002\u672c\u6a21\u5757\u53ea\u505a\u7eaf\u63d0\u53d6\uff08\u65e0副\u4f5c\u7528\uff09\uff0c
 \u63a5\u7ebf\u7531 wb \u5728 main.py \u843d\u4e24\u4e2a\u53f7\u53e3\uff08\u89c1\u672c\u6587\u4ef6\u5c3e\u90e8 PATCH \u8bf4\u660e\uff09\u3002
 """
@@ -120,8 +120,8 @@ def extract_responses_filectx(body: Any, text: str = "") -> dict:
 
 
 _FILE_MARK_RULES = frozenset({
-    "financial_local_only", "drawing_local_only",
-    "ocr_empty_image_route_local", "AB\u6587\u4ef6",
+    "财务表转内网", "图纸转内网",
+    "空图转内网", "AB文件",
 })
 
 

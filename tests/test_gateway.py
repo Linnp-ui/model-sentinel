@@ -80,7 +80,7 @@ def test_rule_priority_suggestion_and_reorder(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"policies": [
         {"name": "rule_lo", "priority": 10, "action": "route_local",
           "when": {"any": [{"text contains_any": ["lo"]}]},
-          "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+          "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
         {"name": "rule_mid", "priority": 20, "action": "block",
           "when": {"any": [{"text contains_any": ["mid"]}]}},
         {"name": "rule_hi", "priority": 30, "action": "block",
@@ -118,7 +118,7 @@ def test_silent_rule_suggests_removal(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"policies": [
         {"name": "rule_busy", "priority": 10, "action": "route_local",
          "when": {"any": [{"text contains_any": ["busy"]}]},
-         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
         {"name": "rule_ghost", "priority": 20, "action": "block",
           "when": {"any": [{"text contains_any": ["ghost"]}]}},
      ]}, allow_unicode=True), encoding="utf-8")
@@ -158,7 +158,7 @@ def test_silent_rule_new_rule_grace(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"policies": [
         {"name": "rule_newbie", "priority": 10, "action": "route_local",
          "when": {"any": [{"text contains_any": ["newbie"]}]},
-         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
         {"name": "rule_oldquiet", "priority": 20, "action": "block",
          "when": {"any": [{"text contains_any": ["oldquiet"]}]}},
     ]}, allow_unicode=True), encoding="utf-8")
@@ -490,6 +490,46 @@ def test_l2_config_suggest_window_roundtrip(tmp_path, monkeypatch):
             else:
                 os.environ[k] = v
 
+def test_l2_config_suggest_all_thresholds_roundtrip(tmp_path, monkeypatch):
+    # /l2-config：建议引擎其余 10 项阈值也可读写并落盘（2026-10 补齐，原只能改 env 文件）
+    import os
+    import yaml
+    monkeypatch.setenv("AI_GATEWAY_L2_OVERRIDES_PATH", str(tmp_path / "ov.yaml"))
+    keys = ("AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS", "AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK",
+            "AI_GATEWAY_KEYTIER_MIN_VIOLATIONS", "AI_GATEWAY_KEYTIER_VIOLATION_RATE",
+            "AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE", "AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS",
+            "AI_GATEWAY_KEYTIER_WINDOW_HOURS", "AI_GATEWAY_SUGGEST_REORDER_MIN_HITS",
+            "AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", "AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS")
+    body = {"AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS": 50, "AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK": 30,
+            "AI_GATEWAY_KEYTIER_MIN_VIOLATIONS": 7, "AI_GATEWAY_KEYTIER_VIOLATION_RATE": 0.4,
+            "AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE": 200, "AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS": 3,
+            "AI_GATEWAY_KEYTIER_WINDOW_HOURS": 240, "AI_GATEWAY_SUGGEST_REORDER_MIN_HITS": 15,
+            "AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS": 500, "AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS": 7}
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        r = client.put("/admin/api/l2-config", json=body)
+        assert r.status_code == 200, r.text
+        assert os.environ["AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS"] == "50"
+        assert os.environ["AI_GATEWAY_KEYTIER_VIOLATION_RATE"] == "0.4"
+        d = client.get("/admin/api/l2-config").json()
+        for k, v in body.items():
+            assert d[k] == v, (k, d[k], v)
+        # 落盘走 l2_overrides 白名单（ALLOWED_KEYS 已同步），重启后由 apply_overrides 回灌
+        data = yaml.safe_load((tmp_path / "ov.yaml").read_text(encoding="utf-8"))
+        assert data["AI_GATEWAY_KEYTIER_WINDOW_HOURS"] == 240
+        assert data["AI_GATEWAY_KEYTIER_VIOLATION_RATE"] == 0.4
+        # 越界 422
+        assert client.put("/admin/api/l2-config",
+                          json={"AI_GATEWAY_KEYTIER_VIOLATION_RATE": 2}).status_code == 422
+        assert client.put("/admin/api/l2-config",
+                          json={"AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS": 0}).status_code == 422
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
 def test_normalize_usage_cached():
     # cached/creation 提取：OpenAI details / Anthropic / 缺失 / 超 prompt 钳制
     from src.gateway.main import _normalize_usage as nu
@@ -538,6 +578,38 @@ def test_billing_endpoint(tmp_path, monkeypatch):
         u = by[("pytest-bill", "noprov/nomodel")]
         assert not u["priced"] and u["cost"] == 0, u
         assert d["total_cost"] == 6.3, d
+    finally:
+        _mp.invalidate_model_policy_cache()
+
+def test_model_spend_endpoint(tmp_path, monkeypatch):
+    # 推荐等级数据源：/model-policy/spend 按模型实际花费（计费口径，KEY×模型行按模型求和）
+    import yaml
+    from src.gateway import model_policy as _mp
+    from src.gateway.admin_store import get_admin_store
+    mp_path = tmp_path / "model_policy.yaml"
+    mp_path.write_text(yaml.safe_dump({"model_policy": {
+        "external_candidates": [
+            {"provider": "spend-prov", "model": "spend-model",
+             "price_per_1m_in": 2.0, "price_per_1m_out": 8.0},
+        ],
+        "internal_models": [], "model_limits": [],
+        "review_model": {"threshold": 0.7}}}, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
+    _mp.invalidate_model_policy_cache()
+    store = get_admin_store()
+    try:
+        # 唯一 key/model：同 session 共享 memory store，防其他测试种子行串扰
+        store.insert_request_log({"key_name": "pytest-spend-unique", "action": "allow",
+                                  "model": "spend-model", "provider": "spend-prov",
+                                  "client_ip": "9.9.9.9",
+                                  "prompt_tokens": 1000000, "completion_tokens": 500000,
+                                  "cached_tokens": 0, "cache_creation_tokens": 0})
+        d = client.get("/admin/api/model-policy/spend").json()
+        assert d["hours"] == 168
+        m = d["models"]["spend-prov/spend-model"]
+        # 1M×2 + 0.5M×8 = ¥6；有效费率 = 6/1.5M×1e6 = 4.0
+        assert m["tokens"] == 1500000 and m["cost"] == 6.0, m
+        assert m["rate_per_1m"] == 4.0, m
     finally:
         _mp.invalidate_model_policy_cache()
 
@@ -726,20 +798,20 @@ def test_stats_summary_equivalent_to_individual_funcs():
 
 def test_real_model_label_normalizes_dirty_rows():
     # 2026-10-12 生产实测计费页 model 脏行：空 model → "vllm_local/"、客户端斜杠式
-    # model → "vllm_local/vllm_local/qwen2.5:7b"（双前缀行在外网 provider 上还会让
+    # model → "vllm_local/vllm_local/Qwen3.8-AB"（双前缀行在外网 provider 上还会让
     # _price_billing 按首个 / 拆名漏定价）。_real_model_label 是 key_model/billing/
     # billing_daily/summary 四个口径的唯一汇聚点，在读取侧归一、不动历史数据。
     from src.gateway.admin_store import _real_model_label
     assert _real_model_label({}, "vllm_local", "") == "vllm_local"
     assert _real_model_label({}, "deepseek", "   ") == "deepseek"
-    assert _real_model_label({}, "vllm_local", "vllm_local/qwen2.5:7b") == "vllm_local/qwen2.5:7b"
-    assert _real_model_label({}, "vllm_local", "qwen2.5:7b") == "vllm_local/qwen2.5:7b"
+    assert _real_model_label({}, "vllm_local", "vllm_local/Qwen3.8-AB") == "vllm_local/Qwen3.8-AB"
+    assert _real_model_label({}, "vllm_local", "Qwen3.8-AB") == "vllm_local/Qwen3.8-AB"
     assert _real_model_label({}, "vllm_local", "deepseek/deepseek-flash") == \
         "vllm_local/deepseek/deepseek-flash"  # 前缀不匹配 provider，不敢猜、原样保留
     assert _real_model_label({}, "", "") == "(unknown)"
-    assert _real_model_label({}, "deepseek", "ext-flash") == "deepseek/ext-flash"
-    routes = {"ext-flash": {"candidates": [{"provider": "deepseek", "model": "deepseek-flash"}]}}
-    assert _real_model_label(routes, "deepseek", "ext-flash") == "deepseek/deepseek-flash"
+    assert _real_model_label({}, "deepseek", "ab-flash") == "deepseek/ab-flash"
+    routes = {"ab-flash": {"candidates": [{"provider": "deepseek", "model": "deepseek-flash"}]}}
+    assert _real_model_label(routes, "deepseek", "ab-flash") == "deepseek/deepseek-flash"
 
 def test_stats_timeseries_counts_overlapping_local_and_block_separately():
     # 回归 2026-10-09：loc/blk 曾用 elif 互斥，而 stats_overview 的 SQL 侧是两条
@@ -1024,6 +1096,23 @@ def test_l2_retrain_versions_api():
     assert "versions" in d and "current" in d and isinstance(d["versions"], list)
 
 
+def test_l2_retrain_latest_prompt_fix_reads_last(monkeypatch, tmp_path):
+    # 候选 prompt 持久化：读最后一行合法 JSON；坏行忽略；无文件返回 {}
+    from src.gateway import l2_retrain
+    p = tmp_path / "prompt-proposals.jsonl"
+    p.write_text('{"candidate": {"correct": 1, "total": 2}}\nbad\n'
+                 '{"candidate": {"correct": 2, "total": 2}}\n', encoding="utf-8")
+    monkeypatch.setattr(l2_retrain, "PROMPT_PROPOSAL_FILE", str(p))
+    assert l2_retrain.latest_prompt_fix()["candidate"]["correct"] == 2
+    monkeypatch.setattr(l2_retrain, "PROMPT_PROPOSAL_FILE", str(tmp_path / "missing.jsonl"))
+    assert l2_retrain.latest_prompt_fix() == {}
+
+
+def test_l2_retrain_prompt_propose_latest_api():
+    r = client.get("/admin/api/l2/retrain/prompt-propose")
+    assert r.status_code == 200 and "proposal" in r.json()
+
+
 def test_laya_balance_and_hard(tmp_path, monkeypatch):
     # 配比：多数类下采样到 0.5，只删不造；真实/人工/难例优先保留
     import importlib.util
@@ -1276,37 +1365,38 @@ def test_l1_match_types_new_ops():
     from src.gateway import policy_admin
 
     ctx = {
-        "model": "ext-flash",
+        "model": "AB-flash",
         "client": {"key": "workbuddy"},
         "time": {"hour": 23},
         "session": {"confidential": False},
         "findings": {"parse_failed": True},
     }
-    # 枚举任一 / 枚举皆非（大小写与空格不敏感）
-    assert _match_when(policy_admin.build_when("model", "in", "ext-flash, qwen3"), ctx)
-    assert not _match_when(policy_admin.build_when("model", "not_in", "ext-flash, qwen3"), ctx)
-    assert _match_when(policy_admin.build_when("client", "not_in", "ccswitch, codex"), ctx)
+    # 枚举任一 / 枚举皆非（大小写与空格不敏感）：引擎保留运算符，
+    # 构造器下拉已精简不提供 model/client 组合，直接手写 when 测
+    assert _match_when({"model in": ["ab-flash", "qwen3"]}, ctx)
+    assert not _match_when({"model not_in": ["AB-flash", "qwen3"]}, ctx)
+    assert _match_when({"client.key not_in": ["ccswitch", "codex"]}, ctx)
     # 布尔开关（文本别名 1/true/是 皆真，其余假）
     assert _match_when(policy_admin.build_when("parse_failed", "bool", "是"), ctx)
     assert not _match_when(policy_admin.build_when("session_confidential", "bool", "true"), ctx)
     # 时段区间：22-6 跨午夜 -> any（23 点命中）；9-18 同日 -> all（23 点不命中）
     assert _match_when(policy_admin.build_when("prompt", "hour_range", "22-6"), ctx)
     assert not _match_when(policy_admin.build_when("prompt", "hour_range", "9-18"), ctx)
-    # 引擎 != （手写 when，UI 造的类型只有 not_in）
+    # 引擎 != （只可手写 when，构造器无等价运算符）
     assert _match_when({"model !=": "ccswitch"}, ctx)
-    assert not _match_when({"model !=": "ext-flash"}, ctx)
+    assert not _match_when({"model !=": "AB-flash"}, ctx)
     # 老运算符不受影响（!= 插入不得抢 ==/>=/contains_any 的匹配）
-    assert _match_when({"model ==": "ext-flash"}, ctx)
+    assert _match_when({"model ==": "AB-flash"}, ctx)
     assert _match_when({"time.hour >=": 22}, ctx)
     assert _match_when({"model contains_any": ["flash"]}, ctx)
     # 非法输入要报出来，不能静默产出永不命中的规则
     import pytest as _pytest
-    for bad in [("model", "in", ""), ("prompt", "hour_range", "22"), ("prompt", "hour_range", "8-8"),
+    for bad in [("prompt", "contains", ""), ("prompt", "hour_range", "22"), ("prompt", "hour_range", "8-8"),
                 ("prompt", "hour_range", "9-99"), ("nope", "in", "x")]:
         with _pytest.raises(ValueError):
             policy_admin.build_when(*bad)
     # 白名单必须跟着映射表走（BuildWhenReq 的 pattern 曾与映射表脱钩 ⇒ 新类型全被 422 挡掉）
-    for ct, mt, mv in [("model", "in", "a,b"), ("client", "not_in", "c"),
+    for ct, mt, mv in [("prompt", "regex", "AKIA[0-9A-Z]{16}"), ("filename", "contains", "salary"),
                        ("parse_failed", "bool", "true"), ("prompt", "hour_range", "22-6")]:
         r = client.post("/admin/api/policies/build-when",
                         json={"content_type": ct, "match_type": mt, "match_value": mv})
@@ -1316,6 +1406,10 @@ def test_l1_match_types_new_ops():
                              "match_value": "x"}).status_code == 422
     assert client.post("/admin/api/policies/build-when",
                        json={"content_type": "model", "match_type": "nope",
+                             "match_value": "x"}).status_code == 422
+    # 精简出下拉的组合：引擎支持不变（手写 yaml 有效），构造器拒
+    assert client.post("/admin/api/policies/build-when",
+                       json={"content_type": "model", "match_type": "in",
                              "match_value": "x"}).status_code == 422
 
 
@@ -1354,8 +1448,9 @@ def test_match_choices_reject_never_matching_combos():
     for c in d["choices"][:4] + d["self_field"]:
         rr = client.post("/admin/api/policies/build-when",
                          json={"content_type": c["content_type"], "match_type": c["match_type"],
-                               "match_value": "1" if c["match_type"] == "size" else
-                                              ("22-6" if c["match_type"] == "hour_range" else "x")})
+                                   "match_value": "1" if c["match_type"] == "size" else
+                                                  ("22-6" if c["match_type"] == "hour_range" else
+                                                   ("60" if c["match_type"] == "pii_score" else "x"))})
         assert rr.status_code == 200, f"{c['key']} 在下拉里但 build-when 报 {rr.status_code}: {rr.text}"
 
 
@@ -1370,15 +1465,15 @@ def test_parse_when_roundtrip_and_switch_rules():
     from src.gateway import policy_admin
 
     # build_when -> parse_when 往返
-    for args in [("model", "in", "a, b"), ("prompt", "regex", "AKIA"),
-                 ("prompt", "contains", "x,y"), ("client", "not_in", "ccswitch, codex"),
+    for args in [("filename", "contains", "a, b"), ("prompt", "regex", "AKIA"),
+                 ("prompt", "contains", "x,y"), ("watermark", "contains", "a,b"),
                  ("session_confidential", "bool", "是"), ("parse_failed", "bool", "false")]:
         w = policy_admin.build_when(*args)
         p = policy_admin.parse_when(w)
         assert p, f"build_when 产物无法逆解析: {w}"
         assert p["content_type"] == args[0] and p["match_type"] == args[1], (args, p)
     # 列表值回成逗号分隔串
-    assert policy_admin.parse_when({"model in": ["a", "b"]})["match_value"] == "a, b"
+    assert policy_admin.parse_when({"text contains_any": ["a", "b"]})["match_value"] == "a, b"
     # policy.yaml 值嵌 key 的开关规则（引擎只取 dict value）
     p = policy_admin.parse_when({"any": [{"session.confidential == true": True}]})
     assert p == {"content_type": "session_confidential", "match_type": "bool", "match_value": "true"}
@@ -1386,11 +1481,20 @@ def test_parse_when_roundtrip_and_switch_rules():
     assert policy_admin.parse_when({"findings.parse_failed == false": False})["match_value"] == "false"
     # self-field：文件大小
     assert policy_admin.parse_when({"file.size >=": 100})["match_type"] == "size"
+    # 多条件 any/all -> 条件组形状（每行都能逆解析才还原，供构造器多行预填）
+    p = policy_admin.parse_when({"any": [{"session.confidential == true": True}, {"tainted_file.hit == true": True}]})
+    assert p == {"combiner": "any", "rows": [
+        {"content_type": "session_confidential", "match_type": "bool", "match_value": "true"},
+        {"content_type": "tainted_file", "match_type": "bool", "match_value": "true"}]}
+    assert policy_admin.parse_when({"all": [{"text contains_any": ["a"]}, {"file.size >=": 100}]})["combiner"] == "all"
     # 认不出 -> None（保持空白，不覆盖）
     for w in (
-        {"any": [{"session.confidential == true": True}, {"tainted_file.hit == true": True}]},  # 多条件
+        {"any": [{"model !=": "x"}, {"prompt contains_any": ["k"]}]},  # 组内有非构造器运算符
+        {"any": [{"any": [{"prompt contains_any": ["k"]}, {"model in": ["a"]}]},
+                 {"file.size >=": 100}]},                               # 组内嵌套条件组
         {"model !=": "x"},        # 无构造器等价物
         {"model ==": "x"},        # 非开关字段的 ==
+        {"model in": ["a"]},      # 精简出构造器的组合（引擎有效，不再预填）
         {"client not_in": ["x"]},  # 裸 client（构造器写的是 client.key）
         "always", None, {"when": 1},
     ):
@@ -1400,6 +1504,148 @@ def test_parse_when_roundtrip_and_switch_rules():
                     json={"when": {"any": [{"tainted_file.hit == true": True}]}})
     assert r.status_code == 200 and r.json()["parsed"]["content_type"] == "tainted_file"
     assert client.post("/admin/api/policies/parse-when", json={"when": "always"}).json()["parsed"] is None
+
+
+def test_build_when_group_multi_conditions():
+    """条件组（多行 any/all）：现网多条件规则（financial_local_only 等）可构造 + 可逆解析。
+
+    回归点：(1) 单行退化为单条件（与老 match 同形状，兼容）；
+            (2) 多行产出 {"any"/"all": [...]} 且被 decide 直接消费；
+            (3) 组内逐行走 build_when 校验（非法组合/hour_range 拒）；
+            (4) build-when-group 端点与 parse-when 组形状往返。
+    """
+    from src.gateway.policy import _match_when
+    from src.gateway import policy_admin
+    import pytest
+
+    # 单行退化：不加 any 壳，与 build_when 同形状
+    assert policy_admin.build_when_group("any", [
+        {"content_type": "prompt", "match_type": "contains", "match_value": "a,b"}]) == {"text contains_any": ["a", "b"]}
+    # 多行 any：现网 financial_local_only 形状（4 行，含 sheet_names/headers 新字段）
+    w = policy_admin.build_when_group("any", [
+        {"content_type": "sheet_names", "match_type": "contains", "match_value": "工资, 财务"},
+        {"content_type": "headers", "match_type": "contains", "match_value": "姓名, 金额"},
+        {"content_type": "filename", "match_type": "contains", "match_value": "salary"},
+        {"content_type": "prompt", "match_type": "contains", "match_value": "财务报表"},
+    ])
+    assert w["any"][0] == {"file.sheet_names contains_any": ["工资", "财务"]}
+    assert w["any"][1] == {"file.headers contains_any": ["姓名", "金额"]}
+    # 引擎直接消费：表名命中 -> True；全不沾 -> False
+    ctx = {"file": {"sheet_names": ["Sheet1", "工资表"], "headers": [], "text": "", "watermark": "", "filename": ""}}
+    assert _match_when(w, ctx)
+    assert not _match_when(w, {"file": {"sheet_names": ["S1"], "headers": [], "text": "", "watermark": "", "filename": "a.txt"}})
+    # all：两行布尔开关（unparsed_binary_route_local 形状）
+    w = policy_admin.build_when_group("all", [
+        {"content_type": "unparsed_binary", "match_type": "bool", "match_value": "true"},
+        {"content_type": "parse_failed", "match_type": "bool", "match_value": "true"},
+    ])
+    assert w == {"all": [{"findings.unparsed_binary ==": True}, {"findings.parse_failed ==": True}]}
+    # hour_range 自身就是 any/all 壳，展不平进组 -> 拒
+    with pytest.raises(ValueError):
+        policy_admin.build_when_group("any", [
+            {"content_type": "prompt", "match_type": "hour_range", "match_value": "9-18"},
+            {"content_type": "prompt", "match_type": "contains", "match_value": "x"}])
+    # 组内非法组合照拒（逐行走 build_when 校验，不放宽）
+    with pytest.raises(ValueError):
+        policy_admin.build_when_group("any", [
+            {"content_type": "session_confidential", "match_type": "regex", "match_value": "x"},
+            {"content_type": "prompt", "match_type": "contains", "match_value": "x"}])
+    # 组 -> parse_when 往返（组形状）
+    g = policy_admin.parse_when(policy_admin.build_when_group("any", [
+        {"content_type": "headers", "match_type": "contains", "match_value": "姓名, 金额"},
+        {"content_type": "watermark", "match_type": "contains", "match_value": "机密"},
+    ]))
+    assert g == {"combiner": "any", "rows": [
+        {"content_type": "headers", "match_type": "contains", "match_value": "姓名, 金额"},
+        {"content_type": "watermark", "match_type": "contains", "match_value": "机密"}]}
+    # 下拉新增三个文件字段，且都能真的构造出 when（match-choices 唯一真源）
+    r = client.get("/admin/api/policies/match-choices")
+    cts = {c["content_type"] for c in r.json()["choices"]}
+    assert {"sheet_names", "headers", "watermark"} <= cts
+    for c in r.json()["choices"]:
+        if c["content_type"] in ("sheet_names", "headers", "watermark"):
+            rr = client.post("/admin/api/policies/build-when",
+                             json={"content_type": c["content_type"], "match_type": c["match_type"],
+                                   "match_value": "工资|salary" if c["match_type"] == "regex" else "工资, 预算"})
+            assert rr.status_code == 200, rr.text
+    # 端点
+        r = client.post("/admin/api/policies/build-when-group", json={
+            "combiner": "any",
+            "rows": [{"content_type": "headers", "match_type": "contains", "match_value": "姓名, 金额"},
+                     {"content_type": "filename", "match_type": "contains", "match_value": "工资, salary"}]})
+    assert r.status_code == 200
+    assert r.json()["when"] == {"any": [{"file.headers contains_any": ["姓名", "金额"]},
+                                        {"file.filename contains_any": ["工资", "salary"]}]}
+    assert client.post("/admin/api/policies/build-when-group", json={
+        "combiner": "nope", "rows": [{"content_type": "prompt", "match_type": "contains", "match_value": "x"}]}).status_code == 422
+    assert client.post("/admin/api/policies/build-when-group", json={"combiner": "any", "rows": []}).status_code == 422
+
+
+def test_rule_ai_parse_suggestion():
+    """AI 生成匹配条件：模型输出是幻觉高危区，parse_suggestion 必须逐行校验。
+
+    回归点：(1) rows/combiner 新格式校验通过并归一化（regex 留串/contains 归列表）；
+            (2) 旧格式 {match_type, value} 按 prompt 单行兜底（提示词升级期兼容）；
+            (3) 幻觉字段/坏正则/布尔配非布尔/空值/空组/坏 combiner 整组拒；
+            (4) 提示词字段表与构造器同源（AI 可选集=构造器可用集）。
+    """
+    from src.gateway import rule_ai
+    from src.gateway import policy_admin
+    import pytest as _pytest
+
+    r = rule_ai.parse_suggestion(
+        '```json\n' + '{"rows": [{"content_type": "sheet_names", "match_type": "contains", "value": ["工资"]},'
+        ' {"content_type": "prompt", "match_type": "regex", "value": "AKIA[0-9A-Z]{16}"}],'
+        ' "combiner": "any", "explanation": "财务"}\n```')
+    assert r["combiner"] == "any" and len(r["rows"]) == 2
+    assert r["rows"][0]["value"] == ["工资"]
+    assert r["rows"][1]["value"] == "AKIA[0-9A-Z]{16}"
+    # 旧格式兼容
+    r = rule_ai.parse_suggestion('{"match_type": "contains", "value": ["机密"], "explanation": "old"}')
+    assert r["rows"] == [{"content_type": "prompt", "match_type": "contains", "value": ["机密"]}]
+    # 字段表与构造器同源
+    for ct in dict.fromkeys(c for c, *_ in policy_admin.MATCH_CHOICES):
+        assert ct in rule_ai._FIELD_TABLE, ct
+    for bad in [
+        '{"rows": [{"content_type": "nope", "match_type": "contains", "value": "x"}], "combiner": "any"}',
+        '{"rows": [{"content_type": "prompt", "match_type": "regex", "value": "AKIA["}], "combiner": "any"}',
+        '{"rows": [{"content_type": "session_confidential", "match_type": "regex", "value": "x"}], "combiner": "any"}',
+        '{"rows": [{"content_type": "prompt", "match_type": "contains", "value": ""}], "combiner": "any"}',
+        '{"rows": [], "combiner": "any"}',
+        '{"rows": [{"content_type": "prompt", "match_type": "contains", "value": "x"}], "combiner": "nope"}',
+        '这不是 JSON',
+    ]:
+        with _pytest.raises(RuntimeError):
+            rule_ai.parse_suggestion(bad)
+
+
+def test_rule_ai_exclude_user_message():
+    """「换一组」：exclude 非空时 user 消息带上要避开的词；空/空白项不产生约束。"""
+    from src.gateway import rule_ai
+
+    assert rule_ai._gen_user_message("工资表") == "工资表"
+    assert rule_ai._gen_user_message("工资表", None) == "工资表"
+    assert rule_ai._gen_user_message("工资表", ["", "  "]) == "工资表"
+    m = rule_ai._gen_user_message("工资表", ["工资", "薪资", " "])
+    assert m.startswith("工资表") and "换一组" in m and "工资、薪资" in m
+    # 超长排除列表截断，不拖爆提示词
+    big = [f"词{i}" for i in range(100)]
+    assert rule_ai._gen_user_message("x", big).count("、") == 39
+
+
+def test_rule_ai_scopes_message_and_check():
+    """覆盖范围：scopes 非空时 user 消息带限定；越界字段整组拒；空=不限。"""
+    import pytest as _pytest
+    from src.gateway import rule_ai
+
+    assert rule_ai._gen_user_message("工资表", scopes=None) == "工资表"
+    m = rule_ai._gen_user_message("工资表", scopes=["filename", "prompt"])
+    assert "覆盖范围限定" in m and "filename、prompt" in m
+    rows = [{"content_type": "filename", "match_type": "contains", "value": ["工资"]}]
+    rule_ai._check_scopes(rows, ["filename"])  # 范围内不抛
+    rule_ai._check_scopes(rows, None)          # 不限不抛
+    with _pytest.raises(RuntimeError):
+        rule_ai._check_scopes(rows, ["prompt"])
 
 
 def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
@@ -1415,7 +1661,7 @@ def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
     pol.write_text(
         "policies:\n"
         "  - name: dryrun-model\n    priority: 5\n    action: block\n"
-        "    when:\n      any:\n      - model in: [ext-flash]\n"
+        "    when:\n      any:\n      - model in: [AB-flash]\n"
         "  - name: dryrun-hour\n    priority: 6\n    action: block\n"
         # 注意必须写 ">=: 22"：裸的 "- time.hour >= 22" 会被 YAML 解析成字符串
         # 列表元素，_eval_cond 拿到 str 会 AttributeError（生产 policy.yaml 同理）
@@ -1426,7 +1672,7 @@ def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
     invalidate_policy_cache()
 
     r = client.post("/admin/api/policies/test",
-                    json={"text": "无关内容", "model": "ext-flash"})
+                    json={"text": "无关内容", "model": "AB-flash"})
     assert r.status_code == 200, r.text
     assert r.json()["rule"] == "dryrun-model", r.text
 

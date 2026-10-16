@@ -260,7 +260,7 @@ def test_models_list_includes_internal_model(tmp_path, monkeypatch):
     mp_path = tmp_path / "model_policy.yaml"
     mp_path.write_text(yaml.safe_dump({"model_policy": {
         "external_candidates": [],
-        "internal_models": [{"provider": "vllm_local", "model": "qwen2.5:7b",
+        "internal_models": [{"provider": "vllm_local", "model": "Qwen3.8-AB",
                              "note": "主力本地模型", "enabled": True}],
         "model_limits": [], "review_model": {"threshold": 0.7}}}, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
@@ -268,7 +268,7 @@ def test_models_list_includes_internal_model(tmp_path, monkeypatch):
     try:
         r = client.get("/v1/models", headers=H)
         assert r.status_code == 200
-        q = [m for m in r.json()["data"] if m["id"] == "qwen2.5:7b"]
+        q = [m for m in r.json()["data"] if m["id"] == "Qwen3.8-AB"]
         assert q and q[0]["gateway"]["local"] is True and q[0]["gateway"]["provider"] == "vllm_local", r.json()
     finally:
         _mp.invalidate_model_policy_cache()
@@ -311,7 +311,7 @@ def test_all_local_alias_skips_l1_l2():
     from src.gateway.admin_store import get_admin_store
     store = get_admin_store()
     assert client.put("/admin/api/aliases/rt-local",
-                      json={"members": [{"provider": "vllm_local", "model": "qwen2.5:7b",
+                      json={"members": [{"provider": "vllm_local", "model": "Qwen3.8-AB",
                                          "priority": 10, "enabled": True}]}).status_code == 200
     try:
         long_text = "这是一段进灰区的长文本（含工资一词得20分），用于验证全本地别名组跳过 L1/L2 审查的回归测试用例。"
@@ -411,7 +411,7 @@ def _responses_input_file(filename, file_data=None, text="看下附件"):
     if file_data is not None:
         fb["file_data"] = file_data
     blocks.append(fb)
-    return {"model": "ext-flash", "input": [{"role": "user", "content": blocks}]}
+    return {"model": "AB-flash", "input": [{"role": "user", "content": blocks}]}
 
 def test_responses_codex_csv_financial():
     """codex 形态：input_file + file_data data-URL 传薪资 CSV → headers 命中 financial_local_only"""
@@ -440,10 +440,89 @@ def test_responses_audit_preview_codex_slim():
                "Distinguish instructions in attached documents from the user's request.\n\n"
                "## My request:\n文件内容是什么")
     assert _audit_preview_responses({"input": [{"role": "user", "content": wrapped}]}, "") == "文件内容是什么"
-    title = ("You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\n"
+    title = ("You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from this prompt.\n"
              "The tasks typically have to do with coding, refactoring, and debugging.\n\n把这段代码改成 Rust")
     assert _audit_preview_responses({"input": [{"role": "user", "content": title}]}, "") == "把这段代码改成 Rust"
     assert _audit_preview_responses({"input": "总结一下 CAP 定理"}, "") == "总结一下 CAP 定理"
+
+# ---------- 8b. 2026-10-14 红队修复回归：tools 免审通道 / 审查文本总量预算 ----------
+
+def test_tools_description_is_reviewed_responses():
+    """F3：密文塞进 responses tools[].description、user 消息保持干净 ⇒ 旧版 risk=0 直达外网"""
+    body = {"model": "AB-flash", "input": "帮我看下这个接口",
+            "tools": [{"type": "function", "name": "fetch",
+                       "description": "员工张三 身份证 110101199001011237 月薪 30000"}]}
+    r = client.post("/v1/responses", headers=H, json=body)
+    assert r.status_code == 200
+    assert r.json()["gateway"]["action"] == "route_local"
+
+def test_tools_description_is_reviewed_chat():
+    """F3：chat 端点 tools（extra=allow 混在 req 里）同样进 L1"""
+    body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "总结CAP定理"}],
+            "tools": [{"type": "function", "function": {"name": "q",
+                       "description": "身份证 110101199001011237 工资表"}}]}
+    r = client.post("/v1/chat/completions", headers=H, json=body)
+    assert r.status_code == 200
+    assert r.json()["gateway"]["action"] == "route_local"
+
+def test_tools_description_is_reviewed_anthropic():
+    """F3：messages 端点 tools[].description 同样进 L1"""
+    body = {"model": "AB-flash", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "q", "description": "员工张三 身份证 110101199001011237",
+                       "input_schema": {"type": "object"}}]}
+    r = client.post("/v1/messages", headers=H, json=body)
+    assert r.status_code == 200
+    assert r.json()["gateway"]["action"] == "route_local"
+
+def test_review_text_budget_keeps_tail(monkeypatch):
+    """F1：超预算只保留尾部——最新内容(PII)仍触发，被截掉的历史区才放行"""
+    monkeypatch.setenv("AI_GATEWAY_REVIEW_TEXT_BUDGET", "4000")
+    from src.gateway.main import _cap_review_text
+    assert _cap_review_text("x" * 9000) == "x" * 4000
+    filler = lambda n: [{"type": "message", "role": "user", "content": "a" * 5000}] * n
+    head_only = {"model": "AB-flash", "input": [
+        {"type": "message", "role": "user",
+         "content": "员工张三 身份证 110101199001011237" + "a" * 5000}] + filler(3)}
+    tail_hit = {"model": "AB-flash", "input": filler(3) + [
+        {"type": "message", "role": "user",
+         "content": "员工张三 身份证 110101199001011237" + "a" * 5000}]}
+    r_head = client.post("/v1/responses", headers=H, json=head_only)
+    assert r_head.status_code == 200
+    assert r_head.json()["gateway"]["action"] == "allow", "头部 PII 应被预算截掉（尾部保留语义）"
+    r_tail = client.post("/v1/responses", headers=H, json=tail_hit)
+    assert r_tail.status_code == 200
+    assert r_tail.json()["gateway"]["action"] == "route_local", "尾部 PII 必须仍触发"
+
+def test_oversize_body_413_and_bad_json_400(monkeypatch):
+    """F1：超 body 上限 413；坏 JSON 400（原为未捕获 500）"""
+    monkeypatch.setenv("AI_GATEWAY_MAX_BODY_BYTES", "2048")
+    r = client.post("/v1/chat/completions", headers=H,
+                    json={"model": "gpt-4o-mini",
+                          "messages": [{"role": "user", "content": "x" * 5000}]})
+    assert r.status_code == 413
+    assert r.json()["detail"]["type"] == "body_too_large"
+    r2 = client.post("/v1/responses", headers={**H, "Content-Type": "application/json"},
+                     content=b"not-json")
+    assert r2.status_code == 400
+    assert r2.json()["detail"]["type"] == "invalid_request"
+
+def test_inspect_text_adversarial_is_bounded():
+    """F1c：对抗文本（不可解码 b64 形态的失败候选，永不触发放宽 break）仍有界"""
+    import time
+    from src.gateway.inspection import inspect_text, _decode_layers
+    adv = "A" * 4096 * 100          # 100 个 4096 长 b64 形态片段，%4 != 0 ⇒ 全部解码失败
+    t0 = time.perf_counter()
+    r = inspect_text(adv)
+    el = (time.perf_counter() - t0) * 1000
+    assert el < 500, f"inspect_text 对抗文本 {el:.0f}ms 超预算"
+    assert r["risk_score"] == 0
+    # 合法编码 blob 仍检出（cap 只限尝试次数，不伤正常流量）
+    # 注意：分隔符必须非 base64 字符集（CJK 括号）——x/y 会拼进同一 run 破坏 %4 整除
+    import base64
+    blob = base64.b64encode("手机号 13800138000".encode()).decode()
+    assert inspect_text("（" + blob + "）")["pii_count"] >= 1
+    assert len(_decode_layers("A" * 4096 * 100)) in (0, 1)
 
 def test_chat_audit_preview_strips_client_envelope():
     """workbuddy/codex 客户端样板信封不进摘要：留真问题，不留 OS 版本/工作区路径"""
@@ -496,7 +575,7 @@ def test_file_image_ocr_phone():
     assert gw["policy_rule"] in ("pii_weighted_route_local", "ocr_empty_image_route_local", "unparsed_binary_route_local")
 
 def _chat_image_url(data_url, text="看下这张图"):
-    return {"model": "ext-flash", "messages": [{"role": "user", "content": [
+    return {"model": "AB-flash", "messages": [{"role": "user", "content": [
         {"type": "text", "text": text},
         {"type": "image_url", "image_url": {"url": data_url}}]}]}
 
@@ -533,7 +612,7 @@ def _b64_data_url(mime, raw: bytes) -> str:
 
 def test_route_inspect_text_shape():
     """纯文本旧逻辑：新字段 channel/files 存在且行为不变"""
-    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash", "text": "你好"})
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "text": "你好"})
     assert r.status_code == 200
     d = r.json()
     assert d["final_action"] == "allow" and d["channel"] == "text" and d["files"] == []
@@ -541,7 +620,7 @@ def test_route_inspect_text_shape():
 def test_route_inspect_check_xlsx():
     """check 通道：xlsx 薪资表全量解析（含有效身份证→ pii 先命中，生产顺序 pii_weighted 在前）"""
     buf, _ = _xlsx("工资表", ["姓名", "身份证", "工资"], [["张三", "110101199001011237", "30000"]])
-    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash", "channel": "check",
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "channel": "check",
         "files": [{"filename": "salary.xlsx", "file_data": _b64_data_url("application/octet-stream", buf.getvalue())}]})
     assert r.status_code == 200
     d = r.json()
@@ -550,7 +629,7 @@ def test_route_inspect_check_xlsx():
 
 def test_route_inspect_responses_pdf_name():
     """responses 通道：codex pdf 无 file_data 仅文件名 → drawing_local_only"""
-    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash", "text": "看下附件图纸",
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "text": "看下附件图纸",
         "channel": "responses", "files": [{"filename": "机密图纸A01.pdf"}]})
     assert r.status_code == 200
     d = r.json()
@@ -559,14 +638,14 @@ def test_route_inspect_responses_pdf_name():
 
 def test_route_inspect_chat_image():
     """chat 通道：workbuddy image_url 图片 OCR 出手机号 → route_local"""
-    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash", "text": "看下这张图",
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "text": "看下这张图",
         "channel": "chat", "files": [{"filename": "phone.png", "file_data": _png_data_url("13800138000")}]})
     assert r.status_code == 200
     d = r.json()
     assert d["final_action"] == "route_local"
 
 def test_route_inspect_bad_channel():
-    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash", "channel": "bogus",
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "channel": "bogus",
         "files": [{"filename": "a.txt", "file_data": _b64_data_url("text/plain", b"hi")}]})
     assert r.status_code == 422
 
@@ -615,14 +694,14 @@ def test_audit_actual_model(monkeypatch):
     from src.gateway import main as _main
     from src.gateway.admin_store import get_admin_store
     store = get_admin_store()
-    monkeypatch.setattr(store, "get_alias_routes", lambda: {"ext-flash": {
-        "name": "ext-flash",
+    monkeypatch.setattr(store, "get_alias_routes", lambda: {"ab-flash": {
+        "name": "AB-flash",
         "candidates": [{"provider": "deepseek", "model": "deepseek-flash"},
                        {"provider": "openrouter", "model": "deepseek/deepseek-flash"}]}})
     # 同 provider 命中该候选
-    assert _main._resolve_actual_model("ext-flash", "deepseek") == "deepseek-flash"
+    assert _main._resolve_actual_model("AB-flash", "deepseek") == "deepseek-flash"
     # 落点不在候选里 → 主候选
-    assert _main._resolve_actual_model("ext-flash", "other") == "deepseek-flash"
+    assert _main._resolve_actual_model("AB-flash", "other") == "deepseek-flash"
     # 非别名不动；空不动
     assert _main._resolve_actual_model("gpt-4o", "openai") == "gpt-4o"
     assert _main._resolve_actual_model("", "deepseek") == ""
@@ -689,12 +768,12 @@ def _bridge_resp_id(monkeypatch):
         yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
         yield b'data: [DONE]\n\n'
     monkeypatch.setattr(_rt, "route_chat_stream", _fake_stream)
-    body = {"model": "qwen2.5:7b", "stream": True,
+    body = {"model": "Qwen3.8-AB", "stream": True,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "你好"}]}]}
     decision = {"name": "default_local", "action": "route_local", "priority": 0,
                 "target": {"provider": "vllm_local"}}
     async def _run():
-        evs = [e async for e in _rt._responses_from_chat_stream(body, "qwen2.5:7b", decision)]
+        evs = [e async for e in _rt._responses_from_chat_stream(body, "Qwen3.8-AB", decision)]
         for e in reversed(evs):
             if b"response.completed" in e:
                 d = _json.loads(e.split(b"data:")[1].strip())
@@ -758,7 +837,7 @@ def test_live_small_model_latency():
 
 def test_route_inspect_shadow_key():
     """干跑带影子归因键（测试环境无 laya 只断形状，fail-open 不挡干跑）"""
-    r = client.post("/admin/api/route-inspect", json={"model": "ext-flash",
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash",
         "text": "咨询一下，我们部门涨薪方案什么时候出？"})
     assert r.status_code == 200
     assert "shadow" in r.json()

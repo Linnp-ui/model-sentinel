@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Table, Button, Input, Modal, Form, Tag, Space, message, Popconfirm, Typography, Alert, Card } from 'antd';
-import { ImportOutlined, KeyOutlined, ReloadOutlined, CopyOutlined } from '@ant-design/icons';
+import { Table, Button, Input, Modal, Form, Space, message, Popconfirm, Typography, Alert, Card } from 'antd';
+import { KeyOutlined, CopyOutlined } from '@ant-design/icons';
 import { api, errText, copyText } from '../api.js';
 
 const { Text } = Typography;
@@ -11,20 +11,14 @@ export default function KeysPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form] = Form.useForm();
-  const [meta, setMeta] = useState(null);
-  const [impOpen, setImpOpen] = useState(false);
   const [genOpen, setGenOpen] = useState(false);
   const [genForm] = Form.useForm();
   const [genResult, setGenResult] = useState(null);
-  const [impText, setImpText] = useState('');
-  const [impResult, setImpResult] = useState(null);
-  const [impLoading, setImpLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       setItems((await api('/keys')).items);
-      setMeta(await api('/meta'));
     } catch (e) { message.error(errText(e)); }
     setLoading(false);
   }, []);
@@ -33,20 +27,15 @@ export default function KeysPage() {
 
   const openEdit = (rec) => {
     setEditing(rec.id);
-    form.setFieldsValue({ name: rec.name, owner: rec.owner || '', note: rec.note || '' });
+    form.setFieldsValue({ name: rec.name, owner: rec.owner || '', note: rec.note || '', weekly_cost_cap: rec.weekly_cost_cap ?? 0 });
     setModalOpen(true);
   };
-  const openCreate = () => { setEditing(null); form.resetFields(); setModalOpen(true); };
   const submit = async () => {
     try {
       const v = await form.validateFields();
-      if (editing) {
-        await api(`/keys/${editing}`, { method: 'PATCH',
-          body: JSON.stringify({ name: v.name, owner: v.owner || '', note: v.note || '' }) });
-      } else {
-        await api('/keys', { method: 'POST', body: JSON.stringify(v) });
-      }
-      message.success('已登记');
+      await api(`/keys/${editing}`, { method: 'PATCH',
+        body: JSON.stringify({ name: v.name, owner: v.owner || '', note: v.note || '', weekly_cost_cap: Number(v.weekly_cost_cap) || 0 }) });
+      message.success('已保存');
       setModalOpen(false);
       setEditing(null);
       form.resetFields();
@@ -66,40 +55,24 @@ export default function KeysPage() {
     } catch (e) { if (e.errorFields) return; message.error(errText(e)); }
   };
 
-  const toggle = async (rec) => {
-    await api(`/keys/${rec.id}`, { method: 'PATCH', body: JSON.stringify({ disabled: !rec.disabled }) });
-    load();
-  };
-
   const del = async (id) => { await api(`/keys/${id}`, { method: 'DELETE' }); message.success('已删除'); load(); };
 
-  const doImport = async () => {
-    setImpLoading(true);
-    try {
-      const d = await api('/keys/import', { method: 'POST', body: JSON.stringify({ text: impText }) });
-      setImpResult(d);
-      load();
-    } catch (e) { message.error(errText(e)); }
-    setImpLoading(false);
-  };
 
-
-  /* 列宽用 % 自适应（灌数轮次表口径）：备注 600px 定宽曾把窄屏表撑出横向滚动 */
+  /* 列宽全 % + tableLayout=fixed：表跟随容器宽度、列按比例分配。
+     备注 600px 定宽曾把窄屏表撑出横向滚动；启用/停用功能已删（2026-10-14） */
   const cols = [
-    { title: '名称（人员）', dataIndex: 'name', width: '14%', ellipsis: true },
-    { title: 'KEY', dataIndex: 'key_masked', width: '16%', ellipsis: true, render: (v) => <Text code>{v}</Text> },
-    { title: '备注', dataIndex: 'note', width: '23%', ellipsis: true },
-    { title: '状态', dataIndex: 'disabled', width: '8%', render: (v, rec) => (<Tag data-testid={`keys-status-${rec.id}`} color={v ? 'red' : 'green'}>{v ? '停用' : '启用'}</Tag>) },
-    { title: '登记时间', dataIndex: 'created_at', width: '16%', ellipsis: true },
+    { title: '名称（人员）', dataIndex: 'name', width: '14%', ellipsis: true, className: 'cell-center' },
+    { title: 'KEY', dataIndex: 'key_masked', width: '16%', ellipsis: true, className: 'cell-center', render: (v) => <Text code>{v}</Text> },
+    { title: '备注', dataIndex: 'note', width: '27%', ellipsis: true },
+    { title: '登记时间', dataIndex: 'created_at', width: '16%', ellipsis: true, className: 'cell-center' },
     {
       title: '操作',
-      width: '23%',
+      width: '27%',
       render: (_, rec) => (
-        <Space>
-          <Button onClick={() => openEdit(rec)}>编辑</Button>
-          <Button onClick={() => toggle(rec)}>{rec.disabled ? '启用' : '停用'}</Button>
+        <Space wrap>
+          <Button type="link" onClick={() => openEdit(rec)}>编辑</Button>
           <Popconfirm title="确认删除该 KEY 映射？" onConfirm={() => del(rec.id)}>
-            <Button data-testid={`keys-del-${rec.id}`} danger>删除</Button>
+            <Button type="link" data-testid={`keys-del-${rec.id}`} danger>删除</Button>
           </Popconfirm>
         </Space>
       ),
@@ -108,30 +81,21 @@ export default function KeysPage() {
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
-      <Space>
-        <Button type="primary" icon={<KeyOutlined />} onClick={openCreate}>登记 KEY</Button>
-        <Button icon={<KeyOutlined />} onClick={openGenerate}>生成 KEY</Button>
-        <Button icon={<ImportOutlined />} onClick={() => { setImpResult(null); setImpOpen(true); }}>批量导入</Button>
-        <Button data-testid="keys-reload" icon={<ReloadOutlined />} onClick={load}>刷新</Button>
-        {meta && <Text data-testid="keys-meta-registered" style={{ marginLeft: 16, fontSize: 16 }}>已登记 <Text strong style={{ fontSize: 18 }}>{meta.api_keys}</Text></Text>}
-      </Space>
+      <Button type="primary" icon={<KeyOutlined />} onClick={openGenerate} style={{ marginLeft: 16 }}>生成 KEY</Button>
       <Card title="已登记 KEY">
       <Table rowKey="id" className="tbl-keys" columns={cols} dataSource={items} loading={loading} size="small"
-        locale={{ emptyText: '暂无已登记 KEY，点上方「登记 KEY」添加' }}
+        tableLayout="fixed"
+        locale={{ emptyText: '暂无已登记 KEY（点「生成 KEY」添加）' }}
         pagination={{ pageSize: 50, showSizeChanger: false }} />
       </Card>
-      <Modal title={editing ? "编辑 API KEY" : "登记 API KEY"} open={modalOpen} onOk={submit} onCancel={() => { setEditing(null); form.resetFields(); setModalOpen(false); }}>
+      <Modal title="编辑 API KEY" open={modalOpen} onOk={submit} onCancel={() => { setEditing(null); form.resetFields(); setModalOpen(false); }}>
         <Form form={form} layout="vertical">
-          {editing ? null : (
-          <Form.Item name="key" label="KEY 明文" rules={editing ? [] : [{ required: true, min: 8 }]}>
-            <Input.Password id="key-secret" placeholder="sk-..." />
-          </Form.Item>
-          )}
           <Form.Item name="name" label="名称（人员标识，统计归因用）" rules={[{ required: true }]}>
             <Input id="key-name" />
           </Form.Item>
           <Form.Item name="owner" label="归属团队"><Input id="key-owner" /></Form.Item>
           <Form.Item name="note" label="备注"><Input.TextArea id="key-note" rows={2} /></Form.Item>
+          <Form.Item name="weekly_cost_cap" label="每周费用上限（元，0=不限）"><Input id="key-cost-cap" type="number" min={0} style={{ width: '100%' }} /></Form.Item>
         </Form>
       </Modal>
       <Modal title="生成 API KEY" open={genOpen}
@@ -162,26 +126,6 @@ export default function KeysPage() {
                 复制
               </Button>
             </Space>
-          </div>
-        )}
-      </Modal>
-      <Modal title="批量导入 KEY（每行一个：名称, key）" open={impOpen} onOk={doImport} onCancel={() => setImpOpen(false)}
-        okText="导入" confirmLoading={impLoading} width={640}>
-        <Input.TextArea rows={8} value={impText} onChange={(e) => setImpText(e.target.value)}
-          placeholder={'张三, sk-xxx-aaaa1111\n李四，sk-xxx-bbbb2222\n# 以 # 开头的行为注释'}
-          style={{ fontFamily: 'monospace' }} />
-        {impResult && (
-          <div style={{ marginTop: 12, maxHeight: 240, overflow: 'auto' }}>
-            <Text strong>已导入 {impResult.added} 个</Text>
-            <Table rowKey="line" size="small" pagination={false} style={{ marginTop: 8 }}
-              dataSource={impResult.results}
-              columns={[
-                { title: '行', dataIndex: 'line', width: 50 },
-                { title: 'KEY', dataIndex: 'key_masked' },
-                { title: '结果', dataIndex: 'status', width: 90,
-                  render: (v) => (v === 'ok' ? <Tag color="green">成功</Tag> : v === 'duplicate' ? <Tag color="orange">已存在</Tag> : <Tag color="red">无效</Tag>) },
-                { title: '说明', dataIndex: 'message' },
-              ]} />
           </div>
         )}
       </Modal>

@@ -14,18 +14,7 @@ os.environ.setdefault("USE_TF", "0")
 
 import laya
 
-Q = {
-    "is_confidential": {
-        "type": "noul",
-        "instructions": (
-            "Is this content enterprise-confidential (engineering drawings, financial data like "
-            "salaries/costs/revenue, personal sensitive data like ID/phone/bank card, or business "
-            "secrets like contracts/bids/internal docs)? A table with employee names and salary "
-            "amounts is confidential."
-        ),
-        "criteria": {"true": "contains confidential content", "false": "public or everyday content"},
-    },
-}
+from laya_eval_common import Q, THRESH
 
 # 与训练脚本不同的名字/句式池（防模板记忆）
 SURN = list("刘张陈杨黄吴周徐孙胡朱高林何郭罗郑梁谢宋唐许韩冯邓曹彭")
@@ -190,7 +179,7 @@ def summarize(label, rows):
         for p, want in lst:
             allp.append(p); allw.append(want)
             n += 1
-            n7, n5 = p >= 0.7, p >= 0.5
+            n7, n5 = p >= THRESH, p >= 0.5
             c7 += n7 == want; c5 += n5 == want
             tot7 += n7 == want; tot5 += n5 == want
             if want and not n7: fn_ += 1

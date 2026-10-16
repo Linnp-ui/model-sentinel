@@ -7,21 +7,11 @@
 """
 import json
 import sys
-import urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8003/classify"
 REAL = "/home/your-user/models/laya-dataset/real_eval.jsonl"
 
-PROBES = [
-    ("工资表(中文)", "文件名: 2026年3月工资表.xlsx\n表头: 姓名,部门,基本工资,奖金\n内容预览:\n张三 研发部 18500 3200\n李四 市场部 12800 2100", 1),
-    ("工资表(英文)", "File: 2026-03-payroll.xlsx\nHeaders: name,department,base_salary,bonus\nContent:\nZhang San R&D 18500 3200\nLi Si Marketing 12800 2100", 1),
-    ("施工图(中文)", "施工图号 S-2026-041，三层框架结构图，梁柱配筋参数与混凝土强度等级 C35，基础开挖深度 3.2 米", 1),
-    ("身份证号(中文)", "客户资料：姓名王五，身份证号 110101199003071234，手机号 13812345678，住址北京市朝阳区", 1),
-    ("报价单(中文)", "报价单：设备采购合同，总价 1,280,000 元，税率13%，含安装费，付款周期 30 天", 1),
-    ("技术文档(中文)", "FastAPI 依赖注入说明：Depends 可复用鉴权逻辑，中间件处理横切关注点，路由函数保持纯粹", 0),
-    ("技术讨论(中文)", "MySQL 索引优化：联合索引遵循最左前缀原则，覆盖索引避免回表，explain 看 type 和 rows", 0),
-    ("闲聊(中文)", "中午吃什么？楼下新开了家面馆，听说牛肉面不错，要不要一起去尝尝", 0),
-]
+from laya_eval_common import PROBES, THRESH, classify_p
 
 REG = [
     ("swap-差评语", "绩效评语：Below Expectations。张三 研发部 18500 3200", 1),
@@ -51,9 +41,7 @@ REG = [
 
 
 def cls(text, filename=""):
-    body = json.dumps({"text": text, "filename": filename}).encode()
-    req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
-    return float(json.load(urllib.request.urlopen(req, timeout=120))["probabilities"]["CONFIDENTIAL"])
+    return classify_p(text, filename, url=URL, timeout=120)
 
 
 def run(cases, title):
@@ -61,7 +49,7 @@ def run(cases, title):
     print(f"\n=== {title} ===")
     for name, text, fn, want in cases:
         p = cls(text, fn)
-        at7 = 1 if p >= 0.7 else 0
+        at7 = 1 if p >= THRESH else 0
         if want and at7:
             tp += 1
         elif not want and at7:

@@ -2,12 +2,13 @@
 Routing — 通用 provider 转发层
 src/gateway/routing.py
 
-安全审查（policy.yaml）决定"外网 vs 本地"，本层只负责"怎么转发到具体端点"。
+安全审查（policy.yaml）决定"外网 vs 本地"，本层负责"怎么转发到具体端点"，
+同时强制执行安全决策（force_local / _pinned_local），避免出现绕过审查的外发通道。
 
 核心规则：安全决策优先于客户端意愿。
   - action = route_local / block 时，强制走 local provider，
     客户端用 model 前缀或 X-Gateway-Provider 指定外网 provider 一律拒绝，
-    记录到 notes["override_denied"]，避免出现绕过审查的外发通道。
+    记录到 notes["override_denied"]。
   - action = allow 时，才允许客户端在外网 provider 之间切换。
 """
 from __future__ import annotations
@@ -60,7 +61,7 @@ _CLIENTS: Dict[Tuple[Optional[asyncio.AbstractEventLoop], bool, Optional[str]], 
 
 _UPSTREAM_PROXY_ENV = "AI_GATEWAY_UPSTREAM_PROXY"
 
-# 默认 max_tokens：本地 thinking 模型（qwen2.5:7b）的思考链会长到吃光 300 token，
+# 默认 max_tokens：本地 thinking 模型（Qwen3.8-AB）的思考链会长到吃光 300 token，
 # 导致 finish_reason=length 且 content=None（客户端显示"无返回内容"）。
 # 取 32768 与 vLLM 侧同量级（`--max-model-len 1010000` 是 prompt+输出**总预算**，
 # 不能把 max_tokens 设成它 —— 实测会被 vLLM 直接 400 拒绝）。
@@ -598,8 +599,8 @@ def _alias_ctx_start(name: str) -> None:
 
 
 def _alias_ctx_now():
-    from .alias_router import ctx_get
-    return ctx_get()
+    from .alias_router import ctx_now
+    return ctx_now()
 
 
 def _alias_context(payload: Dict[str, Any], decision: Dict[str, Any],
@@ -620,7 +621,7 @@ def _alias_resolve(payload: Dict[str, Any], decision: Dict[str, Any],
     抽成公共函数，是为了让**所有**端点共用同一份逻辑。
     2026-09-16 生产事故：`route_responses` / `route_responses_stream` 直接调
     `resolve()`、漏接别名解析。`resolve()` 对未知裸模型名是「原样保留」，
-    于是客户端的 `model="ext-flash"` 被原样发给上游 ⇒ 上游按「模型不存在」4xx。
+    于是客户端的 `model="AB-flash"` 被原样发给上游 ⇒ 上游按「模型不存在」4xx。
     Codex 的 `wire_api = "responses"` 正好命中 ⇒ 表现为「对话无返回内容」。
     chat / chat_stream / messages / messages_stream 四处一直是对的。
 

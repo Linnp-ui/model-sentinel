@@ -69,6 +69,7 @@ api_key_map = Table(
     Column("note", Text, nullable=False, default=""),
     Column("disabled", Integer, nullable=False, default=0),
     Column("created_at", DateTime, nullable=False),
+    Column("weekly_cost_cap", Integer, nullable=False, default=0),
 )
 
 key_rule = Table(
@@ -510,7 +511,7 @@ class AdminStore:
                 rid = conn.execute(
                     insert(api_key_map).values(
                         key_plain=key, name=name, owner=owner, note=note,
-                        disabled=0, created_at=now,
+                        disabled=0, created_at=now, weekly_cost_cap=0,
                     )
                 ).inserted_primary_key[0]
         else:
@@ -522,6 +523,7 @@ class AdminStore:
                 self._keys[rid] = {
                     "id": rid, "key_plain": key, "name": name, "owner": owner,
                     "note": note, "disabled": 0, "created_at": now,
+                    "weekly_cost_cap": 0,
                 }
         self._bump_entry_ver()
         return {"id": rid, "key_masked": (key if "*" in key else mask_key(key)), "name": name, "owner": owner}
@@ -535,8 +537,10 @@ class AdminStore:
         return {**item, "key_plain": key}
 
     def update_api_key(self, kid: int, name: Optional[str] = None,
-                       owner: Optional[str] = None, note: Optional[str] = None,
-                       disabled: Optional[bool] = None) -> None:
+                        owner: Optional[str] = None, note: Optional[str] = None,
+                        weekly_cost_cap: Optional[int] = None) -> None:
+        # 启用/停用管理功能已删（2026-10-14）：disabled 列保留——鉴权 lookup 的
+        # disabled==0 过滤是 fail-closed 安全网（库里若有停用行仍一律 401），只删了管理入口
         vals: dict[str, Any] = {}
         if name is not None:
             vals["name"] = name.strip()
@@ -544,8 +548,8 @@ class AdminStore:
             vals["owner"] = owner
         if note is not None:
             vals["note"] = note
-        if disabled is not None:
-            vals["disabled"] = 1 if disabled else 0
+        if weekly_cost_cap is not None:
+            vals["weekly_cost_cap"] = int(weekly_cost_cap)
         if not vals:
             return
         # 改名只改 api_key_map.name：request_log 存的是 key_id（稳定身份），
@@ -560,6 +564,29 @@ class AdminStore:
                     raise KeyError("not found")
                 self._keys[kid].update(vals)
         self._bump_entry_ver()
+
+    def get_key_weekly_cap(self, kid: int) -> int:
+        if not kid:
+            return 0
+        if self._backend != "memory":
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    select(api_key_map.c.weekly_cost_cap).where(api_key_map.c.id == kid)
+                ).first()
+                if row:
+                    try:
+                        return int(row[0] or 0)
+                    except (TypeError, ValueError):
+                        return 0
+            return 0
+        with self._mem_lock:
+            v = self._keys.get(int(kid))
+            if v is not None:
+                try:
+                    return int(v.get("weekly_cost_cap") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return 0
 
     def delete_api_key(self, kid: int) -> None:
         if self._backend != "memory":
@@ -849,7 +876,7 @@ class AdminStore:
         with self._mem_lock:
             return next((dict(r) for r in self._prompt_versions if r["id"] == int(vid)), None)
 
-    # ---------- 对外模型别名（ext-flash / ext-pro 动态路由；纯 DB/Console 管理，无内置种子） ----------
+    # ---------- 对外模型别名（AB-flash / AB-pro 动态路由；纯 DB/Console 管理，无内置种子） ----------
 
     def _invalidate_alias_cache(self) -> None:
         self._alias_cache = None
@@ -1139,7 +1166,7 @@ class AdminStore:
         KEY 内按 tokens 降序。未登记 KEY 归为“未登记”。ts 统一走 _ts_str 归一（见 _log_rows）。
 
         model 是**实际模型**（`provider/model`，别名按当前别名组主候选解析，
-        如 ext-flash → deepseek/deepseek-flash）；tokens==0 的组直接丢弃
+        如 AB-flash → deepseek/deepseek-flash）；tokens==0 的组直接丢弃
         （被拦截/无用量请求不进 Token 占比）。
         """
         rows = self._log_rows(since, until)
@@ -1189,6 +1216,27 @@ class AdminStore:
             g = agg.setdefault((key, label), {"key": key, "model": label, "prompt": 0,
                                               "completion": 0, "cached": 0,
                                               "creation": 0, "calls": 0})
+            p = int(r.get("prompt_tokens") or 0)
+            g["prompt"] += p
+            g["completion"] += int(r.get("completion_tokens") or 0)
+            g["cached"] += min(int(r.get("cached_tokens") or 0), p)
+            g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
+            g["calls"] += 1
+        return sorted(agg.values(), key=lambda g: -(g["prompt"] + g["completion"]))
+
+    def stats_billing_by_key(self, since: str, until: str, kid: int) -> list:
+        """与 stats_billing 同口径，仅取某个 key_id。"""
+        rows = [r for r in self._log_rows(since, until) if int(r.get("key_id") or 0) == int(kid)]
+        try:
+            _routes = self.get_alias_routes()
+        except Exception:
+            _routes = {}
+        agg: dict = {}
+        for r in rows:
+            label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
+            g = agg.setdefault(label, {"key": r.get("key_name") or "", "model": label,
+                                      "prompt": 0, "completion": 0, "cached": 0,
+                                      "creation": 0, "calls": 0})
             p = int(r.get("prompt_tokens") or 0)
             g["prompt"] += p
             g["completion"] += int(r.get("completion_tokens") or 0)

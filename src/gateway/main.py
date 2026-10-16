@@ -57,7 +57,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 
 from fastapi.staticfiles import StaticFiles
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from starlette.concurrency import run_in_threadpool
 
@@ -65,7 +65,7 @@ from starlette.concurrency import run_in_threadpool
 from .inspection import inspect_text
 
 from .file_inspector import inspect_file, inspect_inline_bytes, collect_inline_blobs_chat, collect_inline_blobs_anthropic, collect_inline_blobs_responses
-from .llms.bridges import clip_audit, clip_audit_url, sse as _sse
+from .llms.bridges import clip_audit, clip_audit_url, sse as _sse, tools_text
 
 from .policy import load_policy, decide
 
@@ -193,6 +193,35 @@ async def _l2_overrides_startup():
     apply_overrides()
 
 
+@app.on_event("startup")
+async def _log_retention_startup():
+    # request_log 明细自动清理：启动时先跑一次（_last_purge_ts=0 立即触发），
+    # 之后每 6h 周期跑；落库写入也会按 _maybe_purge 节流触发，二者互补。
+    import asyncio as _asyncio
+    from .stats_service import _maybe_purge
+    from .admin_store import get_admin_store
+
+    def _once():
+        try:
+            _maybe_purge(get_admin_store())
+        except Exception:
+            pass
+
+    async def _loop():
+        while True:
+            try:
+                await _asyncio.to_thread(_once)
+            except Exception:
+                pass
+            await _asyncio.sleep(6 * 3600)
+
+    _asyncio.create_task(_loop())
+    # 状态条 SSE 停机收尾：unit ExecStop 先 kill -USR1 $MAINPID（见 agents/deploy.md），
+    # status_stream 生成器见 sse_stop 立即正常 return，别让长连接把 stop 拖满 90s 被 SIGKILL。
+    from .admin_api import register_sse_stop
+    register_sse_stop()
+
+
 @app.on_event("shutdown")
 
 async def _shutdown():
@@ -295,6 +324,25 @@ def _make_rate_limit_dep(scope: str, rpm_env: str, rps_env: str = None):
         xak = request.headers.get("x-api-key", "")
         client_ip = _resolve_client_ip(request)
         key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
+        try:
+            if getattr(identity, "key_id", None):
+                from .admin_store import get_admin_store
+                from .stats_service import key_weekly_cost
+                _store = get_admin_store()
+                _cap = _store.get_key_weekly_cap(identity.key_id)
+                if _cap > 0:
+                    _spend = key_weekly_cost(_store, identity.key_id)
+                    if _spend >= _cap:
+                        get_metrics().inc_rate_limited(scope, "weekly_cost_cap")
+                        raise HTTPException(
+                            status_code=429,
+                            detail={"type": "quota_exceeded", "scope": scope,
+                                    "spend": round(_spend, 4), "cap": _cap},
+                        )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         ok, retry, reason = get_limiter().check(key, scope=scope)
         if not ok:
             get_metrics().inc_rate_limited(scope, reason)
@@ -496,6 +544,23 @@ def _mentioned_data_filename(text):
         return m.group(0) if m else ""
     except Exception:
         return ""
+
+
+def _mark_hit_context(session_id, key_id, session_name, taint_name, decision):
+    """命中后双轨标记：会话机密 + key 级文件污染；任一失败不阻断主链。"""
+    try:
+        if (decision or {}).get("action") not in ("route_local", "block"):
+            return
+        if session_id and session_name:
+            get_session_store().mark_confidential(
+                session_id,
+                {"name": session_name, "rule": (decision or {}).get("name"), "action": (decision or {}).get("action")},
+            )
+        _name = _mentioned_data_filename(taint_name or "")
+        if key_id and _name:
+            get_session_store().mark_tainted_file(key_id, _name, (decision or {}).get("name") or "")
+    except Exception:
+        pass
 
 
 def _mark_session_hit(session_id, decision, name=""):
@@ -1211,23 +1276,83 @@ def _all_local_alias(model: str) -> bool:
     return all(getattr(cfg.get(c["provider"]), "local", False) for c in cands)
 
 
+# F1（2026-10-14 红队实测）：审查文本总量无预算——每 input item 截 4000 字但
+# item 数无限、instructions 不截 ⇒ 2 万条 item × 4000 字 = 76MB 审查串，
+# 单请求把 inspect_text/NFKC/正则全跑一遍（阻塞事件循环，别的用户一起停；
+# 生产限流 5 RPS  ⇒ 单 key 可打瘫全网关）。这里只保留**尾部**（最新内容优先，
+# 历史区降覆盖——旧历史曾按请求逐轮审过，且 session 机密标记 TTL 内粘性）。
+# 512KB ≈ 128 个 4000 字段，正常 Codex 会话（数十轮）远够；内联 OCR 追加在
+# 尾部，超预算时优先保留。
+_REVIEW_TEXT_BUDGET_DEFAULT = 512 * 1024
+
+
+def _review_text_budget() -> int:
+    try:
+        return max(1024, int(os.getenv("AI_GATEWAY_REVIEW_TEXT_BUDGET")
+                             or _REVIEW_TEXT_BUDGET_DEFAULT))
+    except ValueError:
+        return _REVIEW_TEXT_BUDGET_DEFAULT
+
+
+def _cap_review_text(text: str) -> str:
+    b = _review_text_budget()
+    return text if len(text) <= b else text[-b:]
+
+
+# F1(2026-10-14)：入站 body 无大小上限、且 request.json()= json.loads 同步跑在
+# 事件循环上。实测 1.17GB body → 2.2s 阻塞（chat 端点还叠一层 ChatReq 校验），
+# 单 key 5 RPS 可把网关打成全线无响应。上限默认 32MB（合法上限：内联媒体 5 件
+# × 20MB 已超此值 ⇒ 多件 20MB 大图走 env 调大 AI_GATEWAY_MAX_BODY_BYTES）。
+_MAX_BODY_BYTES_DEFAULT = 32 * 1024 * 1024
+
+
+def _max_body_bytes() -> int:
+    try:
+        return max(1024, int(os.getenv("AI_GATEWAY_MAX_BODY_BYTES")
+                             or _MAX_BODY_BYTES_DEFAULT))
+    except ValueError:
+        return _MAX_BODY_BYTES_DEFAULT
+
+
+async def _json_body(request: Request) -> Any:
+    """读 JSON body：超限 413 + json.loads 移出事件循环（线程池）。
+
+    抛 HTTPException(400) 替代原 request.json() 的未捕获 500。
+    """
+    raw = await request.body()
+    cap = _max_body_bytes()
+    if len(raw) > cap:
+        raise HTTPException(413, detail={
+            "type": "body_too_large",
+            "message": f"请求体超过 {cap // (1024 * 1024)}MB 上限"})
+    try:
+        return await run_in_threadpool(json.loads, raw)
+    except Exception:
+        raise HTTPException(400, detail={"type": "invalid_request",
+                                         "message": "请求体不是合法 JSON"})
+
+
 async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "") -> tuple[dict, dict, dict | None]:
     """
 
     纯文本审查（chat / messages / responses 共用）：
 
-    L1 规则 -> 命中即返回；L1 放行且 risk_score 进灰区[20,60) 时触发 L2 小模型语义判定
-    （2026-09-23 起取消字数触发：长短文本一视同仁，只看风险分）。
+    L1 规则 -> 命中即返回；L1 放行且 risk_score >= 灰区下限(默认20) 时触发 L2 小模型语义判定
+    （2026-09-23 起取消字数触发；2026-09-30 起灰区无上界，关键词堆到 risk_score>=60 也转内网）。
 
     全本地别名组（_all_local_alias，候选全内网）跳过 L1/L2 直接 allow。
 
     返回 (decision, text_findings, l2_result)
 
     """
+    text = _cap_review_text(text)
     if model and _all_local_alias(model):
         return {"action": "allow", "name": "local_alias_bypass"}, {}, None
 
-    text_findings = inspect_text(text)
+    # F1: inspect_text 也走线程池——512KB 预算内的对抗文本（海量 b64/hex 候选、
+    # 数字簇）单次仍有 ~150ms 纯 CPU，同步跑会阻塞事件循环（其他用户一起停）。
+    # 预算(上) + 线程池(本行) 双保险：单请求 CPU 有界，loop 永不被审查堵住。
+    text_findings = await run_in_threadpool(inspect_text, text)
     if extra_findings:
         text_findings.update(extra_findings)
     _note_risk(text_findings)
@@ -1263,7 +1388,7 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
     # 注：/v1/embeddings 未复用本函数（内联 L1 副本，且不跑 L2），
     #     行为差异见 docs/gateway-hidden-issues-2026-09-15.md「范围外」一节。
-    # 2026-09-23 起取消字数触发：只看灰区，不计长（短文本灰区同样进 L2）。
+    # files_check 的 L2 路径（下方）与本函数不同：不检查灰区门槛，L1 allow 即跑 L2。
     _dec_blocks = l2_chunks or [(_L2_SCOPE_LAST_USER, l2_text or text)]
     if (decision.get("action") == "allow" and _l2_gray_trigger(text_findings)
             and (session_conf or not _wl_l2_skip(request))):
@@ -1307,6 +1432,16 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
                 request.state.gw_block_reason = f"l2:{_hit}:{(l2_result or {}).get('reason') or 'confidential'}"
 
     return decision, text_findings, l2_result
+
+
+def _first_chunk_fb(prov):
+    """首字节前 5xx 降级：返回 (local_prov, fb_decision) 或 None。"""
+    cfg = load_routing()
+    lp = cfg.local_provider()
+    if lp is None or prov.name == lp.name:
+        return None
+    return lp, {"name": "first_chunk_fallback", "priority": 0,
+                "action": "route_local", "target": {"provider": lp.name}}
 
 
 def _l2_decision(l2_result: dict | None) -> dict | None:
@@ -1389,8 +1524,8 @@ def _block_to_fallback(decision: dict) -> tuple[dict, str | None]:
 
 
 def _alias_ctx_now():
-    from .alias_router import ctx_get
-    return ctx_get()
+    from .alias_router import ctx_now
+    return ctx_now()
 
 
 def _gateway_meta(
@@ -1566,7 +1701,7 @@ def _resolve_actual_model(model, provider):
 def log_entry(entry: dict, *, count: bool = True):
     redact_audit_entry(entry)
 
-    # 模型列记实际：别名请求放行/本地路由时 model 还是别名（如 ext-flash），
+    # 模型列记实际：别名请求放行/本地路由时 model 还是别名（如 AB-flash），
     # 这里按落点 provider 解析成真实模型（deepseek-flash）。无落点（拦截/失败）保持原样。
     if entry.get("model") and entry.get("provider"):
         try:
@@ -1844,7 +1979,7 @@ def _health_payload() -> dict:
 
 @app.get("/v1/models")
 async def list_models(identity: Identity = Depends(_bind_identity_ctx)):
-    """OpenAI compatible model list — 对外别名组（ext-flash / ext-pro）+ 内网主力模型
+    """OpenAI compatible model list — 对外别名组（AB-flash / AB-pro）+ 内网主力模型
     （model_policy.internal_models，可直连点名）+ 用户自注册模型。
 
     列表构造在 admin_api.build_public_models（与管理端 /models/public 单一真源，
@@ -1921,10 +2056,21 @@ def _err_provider(exc, prov) -> str:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatReq, request: Request, identity: Identity = Depends(_rate_limit_chat)):
+async def chat_completions(request: Request, identity: Identity = Depends(_rate_limit_chat)):
+    # F1: body 改手动解析（FastAPI 内部解析 = json.loads + pydantic 同步跑在
+    # 事件循环上，1.17GB body 实测阻塞 2.2s）——上限 413 + 双阶段线程池。
+    payload = await _json_body(request)
+    try:
+        req = await run_in_threadpool(ChatReq.model_validate, payload)
+    except ValidationError as e:
+        raise HTTPException(422, detail=e.errors()[:10])
     session_id = extract_session_id(request.headers)
     _bundle = _extract_chat_bundle(req.messages)
     text = _bundle["text"]
+    # F3: tools 定义（description/parameters）并入审查文本——曾是密文免审通道
+    _tt = tools_text(getattr(req, "tools", None))
+    if _tt:
+        text = text + "\n" + _tt
     audit_preview = _bundle["audit_preview"]
     inline_text, inline_bad = await _inline_media_scan("chat", req.messages)
     if inline_text:
@@ -1940,8 +2086,8 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
     _mark_gw_action(request, decision)
     _mark_pre_upstream(request)
     _mentioned = _mentioned_data_filename(text)
-    _mark_session_hit(session_id, decision, "chat-inline-image" if (inline_text or inline_bad) else ("chat-mentioned-file:" + _mentioned if _mentioned else ""))
-    _mark_taint_hit(_identity_bind_key(request), _mentioned, decision)
+    _session_name = "chat-inline-image" if (inline_text or inline_bad) else ("chat-mentioned-file:" + _mentioned if _mentioned else "")
+    _mark_hit_context(session_id, _identity_bind_key(request), _session_name, _mentioned, decision)
     if decision.get("action") == "block":
 
         log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), "type": "chat", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview, "l2": l2_result,
@@ -1986,15 +2132,10 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
                     if not sent and exc.status_code >= 500:  # 仅瞬态错误(5xx/网络)降级；上游 4xx(密钥/权限/限流)直接透传
 
                         # 首字节前上游失败：透明降级到本地模型，对调用方无感
-                        try:
-
-                            cfg_fc = load_routing()
-                            lp = cfg_fc.local_provider()
-                            if lp is not None and prov.name != lp.name:
-
-                                fb_decision = {"name": "first_chunk_fallback", "priority": 0,
-
-                                               "action": "route_local", "target": {"provider": lp.name}}
+                        fb = _first_chunk_fb(prov)
+                        if fb is not None:
+                            lp, fb_decision = fb
+                            try:
 
                                 notice = {"id": "chatcmpl-fallback", "object": "chat.completion.chunk",
 
@@ -2019,9 +2160,12 @@ async def chat_completions(req: ChatReq, request: Request, identity: Identity = 
 
                                 return
 
-                        except Exception:
+                            except Exception:
 
-                            pass  # 本地也失败 -> 走下方原有错误上报
+                                log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
+                                     action=decision.get("action"), rule=decision.get("name"),
+                                     provider=prov, model=model, kind="first_chunk_fallback_failed",
+                                     session_id=session_id, text_preview=audit_preview)
 
                     msg = str(exc)
                     _ctx_overflow = _looks_like_context_overflow(msg)
@@ -2282,7 +2426,7 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
 
 async def anthropic_messages(request: Request, identity: Identity = Depends(_rate_limit_messages)):
     session_id = extract_session_id(request.headers)
-    body = await request.json()
+    body = await _json_body(request)
     text = anthropic_text(body)
     audit_preview = _audit_preview_anthropic(body, text)
     inline_text, inline_bad = await _inline_media_scan("anthropic", body)
@@ -2341,21 +2485,15 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
                     sent = True
                     yield chunk
-
             except RoutingError as exc:
 
                 if not sent and exc.status_code >= 500:  # 仅瞬态错误(5xx/网络)降级；上游 4xx(密钥/权限/限流)直接透传
 
                     # 首字节前上游失败：透明降级到本地模型
-                    try:
-
-                        cfg_fc = load_routing()
-                        lp = cfg_fc.local_provider()
-                        if lp is not None and prov.name != lp.name:
-
-                            fb_decision = {"name": "first_chunk_fallback", "priority": 0,
-
-                                           "action": "route_local", "target": {"provider": lp.name}}
+                    fb = _first_chunk_fb(prov)
+                    if fb is not None:
+                        lp, fb_decision = fb
+                        try:
 
                             async for chunk in route_messages_stream(body, fb_decision, request.headers):
 
@@ -2365,15 +2503,19 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                             log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
 
                                 "type": "messages", "action": "route_local", "rule": "first_chunk_fallback",
+
                                 "provider": lp.name, "local": True, "text_preview": audit_preview,
+
                                 "downgraded_from": "upstream_error", "stream": True})
 
                             return
 
-                    except Exception:
+                        except Exception:
 
-                        pass
-
+                            log_stream_error(request, type_="messages", status=getattr(exc, "status_code", 0) or 502,
+                                 action=decision.get("action"), rule=decision.get("name"),
+                                 provider=prov, model=model, kind="first_chunk_fallback_failed",
+                                 session_id=session_id, text_preview=audit_preview)
                 log_stream_error(request, type_="messages", status=getattr(exc, "status_code", 0) or 502,
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="upstream",
@@ -2442,7 +2584,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
 async def anthropic_count_tokens(request: Request, identity: Identity = Depends(_bind_identity_ctx)):
     """Claude Code 偶尔调用的 token 估算端点；网关层面给近似值即可"""
-    body = await request.json()
+    body = await _json_body(request)
     text = anthropic_text(body)
 
     # 中文约 1.5-2 token/字，保守按 len/3 估算，仅用于客户端预算
@@ -2487,7 +2629,7 @@ def _codex_session_id(body):
 @app.post("/v1/responses")
 
 async def responses_api(request: Request, identity: Identity = Depends(_rate_limit_messages)):
-    body = await request.json()
+    body = await _json_body(request)
 
     # codex 不发 X-Session-ID：回落对话指纹（见 _codex_session_id）
     session_id = extract_session_id(request.headers) or _codex_session_id(body)
@@ -2507,15 +2649,14 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     _mark_gw_action(request, decision)
     _mark_pre_upstream(request)
     if responses_should_mark(decision.get("name"), decision.get("action"), file_ctx):
-        # 附件/内联文件触发拦截后污染 session，后续追问自动走本地（TTL 见 .env）。
-        # （P1-1 client 身份标记已移除，2026-09-18）
         _mark_file = file_ctx.get("filename") or "responses-inline"
-        if session_id:
-            get_session_store().mark_confidential(
-                session_id,
-                {"name": _mark_file, "rule": decision.get("name"), "action": decision.get("action")},
-            )
-        _mark_taint_hit(_identity_bind_key(request), file_ctx.get("filename") or "", decision)
+        _mark_hit_context(
+            session_id,
+            _identity_bind_key(request),
+            _mark_file,
+            file_ctx.get("filename") or _mark_file,
+            decision,
+        )
     if decision.get("action") == "block":
 
         log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "responses", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
@@ -2551,21 +2692,15 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
 
                     sent = True
                     yield chunk
-
             except RoutingError as exc:
 
                 if not sent and exc.status_code >= 500:  # 仅瞬态错误(5xx/网络)降级；上游 4xx(密钥/权限/限流)直接透传
 
                     # 首字节前上游失败：透明降级到本地模型（本地走 chat->responses 事件转换）
-                    try:
-
-                        cfg_fc = load_routing()
-                        lp = cfg_fc.local_provider()
-                        if lp is not None and prov.name != lp.name:
-
-                            fb_decision = {"name": "first_chunk_fallback", "priority": 0,
-
-                                           "action": "route_local", "target": {"provider": lp.name}}
+                    fb = _first_chunk_fb(prov)
+                    if fb is not None:
+                        lp, fb_decision = fb
+                        try:
 
                             async for chunk in route_responses_stream(body, fb_decision, request.headers):
 
@@ -2575,15 +2710,19 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                             log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
 
                                 "type": "responses", "action": "route_local", "rule": "first_chunk_fallback",
+
                                 "provider": lp.name, "local": True, "text_preview": audit_preview,
+
                                 "downgraded_from": "upstream_error", "stream": True, "session_id": session_id})
 
                             return
 
-                    except Exception:
+                        except Exception:
 
-                        pass
-
+                            log_stream_error(request, type_="responses", status=getattr(exc, "status_code", 0) or 502,
+                                 action=decision.get("action"), rule=decision.get("name"),
+                                 provider=prov, model=model, kind="first_chunk_fallback_failed",
+                                 session_id=session_id, text_preview=audit_preview)
                 # 降级不可用/也失败：显式发 response.failed 事件收尾，Codex 前端可见，不再静默断流
                 log_stream_error(request, type_="responses", status=getattr(exc, "status_code", 0) or 502,
                      action=decision.get("action"), rule=decision.get("name"),
@@ -2752,8 +2891,10 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
 
 
     # L2 小模型二次判定（文件场景：L1 为 allow 时触发，支持分块聚合应对长文档）
+    # 2026-10-13 起对齐 _review_text：加灰区门槛（risk_score >= 20 才跑 L2），
+    # 与 chat/messages/responses 的 L2 触发语义一致。
     l2_result = None
-    if decision.get("action") == "allow":
+    if decision.get("action") == "allow" and _l2_gray_trigger(text_findings):
 
         chunks = file_info.get("chunks") or [text[:2000]]
         if len(chunks) > 1:
@@ -2808,17 +2949,7 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
         "session_id": session_id,
 
     })
-    if decision.get("action") in ("route_local", "block"):
-        # 命中即标 session（若有），后续同会话请求粘性走本地。
-        # （P1-1 client 身份标记已移除，2026-09-18）
-        if session_id:
-            get_session_store().mark_confidential(
-
-                session_id,
-                {"name": filename, "rule": decision.get("name"), "action": decision.get("action")},
-
-            )
-        _mark_taint_hit(_identity_bind_key(request), filename, decision)
+    _mark_hit_context(session_id, _identity_bind_key(request), filename, filename, decision)
 
 
     if decision.get("action") == "block":
@@ -2883,7 +3014,9 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
             text = (_body_text(fields) + " " + path).strip()
         else:
             try:
-                payload = await request.json()
+                payload = await _json_body(request)
+            except HTTPException:
+                raise
             except Exception:
                 raise HTTPException(400, detail={"type": "invalid_request", "path": path,
                                                  "message": "请求体不是合法 JSON"})

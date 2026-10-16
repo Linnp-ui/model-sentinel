@@ -43,6 +43,22 @@ def clip_audit_url(url: Any) -> str:
     return u[:200] if u.startswith("data:") else u[:2000]
 
 
+def tools_text(tools: Any) -> str:
+    """工具定义送审：description/parameters 曾是密文免审通道。
+
+    2026-10-14 红队：text 只扫 instructions+input/messages，tools 数组整体
+    不进 L1/L2 ⇒ 密文塞进 tool description、user 消息保持干净即 risk=0
+    直达外网。三端 tools 形状不一（function/parameters、input_schema、
+    namespace 嵌套），逐条 JSON 化统一截断，与消息块同预算；总量由
+    main._cap_review_text 兜底。
+    """
+    if not isinstance(tools, list):
+        return ""
+    parts = [clip_audit(json.dumps(t, ensure_ascii=False, default=str), 4000)
+             for t in tools if isinstance(t, dict)]
+    return "\n".join(p for p in parts if p)
+
+
 def _anthropic_content_ref(c: Any) -> str:
     if c is None:
         return ""
@@ -135,7 +151,7 @@ def _responses_item_ref(item: Dict[str, Any]) -> str:
 
 
 def anthropic_text(body: Dict[str, Any]) -> str:
-    """从 Anthropic messages 请求体提取待审查文本（system + messages 的文本块）"""
+    """从 Anthropic messages 请求体提取待审查文本（system + messages + tools）"""
     parts: list[str] = []
     sys = body.get("system")
     if isinstance(sys, str):
@@ -150,6 +166,9 @@ def anthropic_text(body: Dict[str, Any]) -> str:
             parts.append(c)
         elif isinstance(c, list):
             parts += [_anthropic_block_ref(b) if isinstance(b, dict) else "" for b in c]
+    tt = tools_text(body.get("tools"))
+    if tt:
+        parts.append(tt)
     return " ".join(p for p in parts if p)
 
 
@@ -276,7 +295,7 @@ def parse_openai_sse_deltas(chunk: bytes) -> list[dict]:
 # ================================================================
 
 def responses_text(body: Dict[str, Any]) -> str:
-    """从 OpenAI Responses 请求体提取待审查文本（instructions + input）"""
+    """从 OpenAI Responses 请求体提取待审查文本（instructions + input + tools）"""
     parts: list[str] = []
     ins = body.get("instructions")
     if isinstance(ins, str):
@@ -291,6 +310,9 @@ def responses_text(body: Dict[str, Any]) -> str:
                     parts.append(item)
                 continue
             parts.append(_responses_item_ref(item))
+    tt = tools_text(body.get("tools"))
+    if tt:
+        parts.append(tt)
     return " ".join(p for p in parts if p)
 
 

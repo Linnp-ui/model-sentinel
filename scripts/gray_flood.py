@@ -105,7 +105,7 @@ CANDIDATES = [
 
 
 def send(text):
-    body = json.dumps({"model": "vllm_local/qwen2.5:7b", "max_tokens": 8,
+    body = json.dumps({"model": "vllm_local/Qwen3.8-AB", "max_tokens": 8,
                        "messages": [{"role": "user", "content": text}]}).encode()
     req = urllib.request.Request(URL, data=body,
                                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"})

@@ -7,9 +7,9 @@
   - 数据含公司机密内容，**留在本机 models 目录，不进仓库**
 
 标签口径（与网关判定链一致，deny-overrides）：
-  正(1) = l2_confidential / pii_* / financial_local_only / block_secrets / drawing_local_only
-  负(0) = default_allow
-  排除  = session_route_local / AB文件 / first_chunk_fallback 等歧义规则
+  正(1) = l2_confidential / pii_* / 财务表转内网 / 拦截密钥 / 图纸转内网
+  负(0) = 默认放行
+  排除  = 会话机密转内网 / AB文件 / first_chunk_fallback 等歧义规则
 """
 import hashlib
 import json
@@ -25,9 +25,9 @@ OUT_DIR = os.path.expanduser("~/models/laya-dataset")
 AUDIT_URL = dict(host="127.0.0.1", user="root", password="infini_rag_flow",
                  database="gateway_audit", charset="utf8mb4")
 MIN_LABEL_CHARS = 10  # 人工标注样本长度下限（比 MIN_CHARS 松：分歧样本可短，排除极短噪声）
-POS_RULES = {"l2_confidential", "pii_weighted_route_local", "financial_local_only",
-             "block_secrets", "pii_critical_block", "drawing_local_only"}
-NEG_RULES = {"default_allow"}
+POS_RULES = {"l2_confidential", "隐私加权转内网", "财务表转内网",
+             "拦截密钥", "高危隐私拦截", "图纸转内网"}
+NEG_RULES = {"默认放行"}
 MIN_CHARS = 30  # 真实样本长度下限（2026-09-23 起 L2 门取消字数触发，短文本覆盖靠合成模板）
 EVAL_FRAC = 0.32  # 真实样本留出比例（73 → 23 评估 / 50 训练）
 

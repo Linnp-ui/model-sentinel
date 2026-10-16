@@ -506,7 +506,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
             if lbl.startswith("l1:"):
                 hits[lbl[3:]] = g.get("calls", 0)
         prio = {p.name: p.priority for p in load_policy()
-                if p.name != "default_allow"}
+                if p.name != "默认放行"}
         cands = [(n, c, prio[n]) for n, c in hits.items()
                  if n in prio and c >= th["reorder_min_hits"]]
         if len(cands) >= 2:
@@ -563,7 +563,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         grace = int(th.get("silent_grace_days", 14))
         win_d = int(th["kt_window_hours"] / 24)
         for p in load_policy():
-            if p.name in ("default_allow",) or p.name in seen:
+            if p.name in ("默认放行",) or p.name in seen:
                 continue
             if p.name not in ever and _days_since(first_seen.get(p.name) or today) < grace:
                 continue  # 新规则保底期内不上榜
@@ -726,6 +726,29 @@ def build_billing(store, window_hours: float = 168.0) -> dict:
     since, until = _window(window_hours)
     return _price_billing(store.stats_billing(since, until),
                           store.stats_billing_daily(since, until), window_hours)
+
+
+_WEEKLY_COST_CACHE: dict = {}
+
+
+def key_weekly_cost(store, kid: int, ttl: float = 60.0) -> float:
+    """某 key 近 7 天已定价金额（¥），60s 进程缓存。"""
+    if not kid:
+        return 0.0
+    import time
+    now = time.time()
+    hit = _WEEKLY_COST_CACHE.get(int(kid))
+    if hit is not None and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        since, until = _window(168.0)
+        billing = _price_billing(store.stats_billing_by_key(since, until, int(kid)), [], 168.0)
+        spend = round(sum(float(it.get("cost") or 0) for it in billing.get("items", [])
+                          if it.get("priced")), 4)
+    except Exception:
+        spend = 0.0
+    _WEEKLY_COST_CACHE[int(kid)] = (now, spend)
+    return spend
 
 
 def build_summary(store, window_hours: float = 168.0, top: int = 20) -> dict:

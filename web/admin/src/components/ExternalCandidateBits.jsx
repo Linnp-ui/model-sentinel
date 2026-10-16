@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { AutoComplete, Input, InputNumber, Modal, Form, Select, message } from 'antd';
+import { AutoComplete, InputNumber, Modal, Form, Select, message } from 'antd';
 import { api, errText } from '../api.js';
 
 // ---------------- 1.1/1.2/1.3 模型配置 ----------------
@@ -8,21 +8,19 @@ import { api, errText } from '../api.js';
 export function ExternalCandidateFormItems({ form }) {
   const [providers, setProviders] = useState([]);
   const [modelOpts, setModelOpts] = useState({}); // provider -> [{value,label}]
-  const [provKey, setProvKey] = useState('');
   const prov = Form.useWatch('provider', form);
 
   useEffect(() => {
     api('/providers').then((d) => setProviders(d.providers || [])).catch(() => {});
   }, []);
-  const loadModels = useCallback(async (p, key) => {
+  const loadModels = useCallback(async (p) => {
     if (!p) return;
-    if (key === undefined && modelOpts[p]) return;
-    if (key !== undefined) setModelOpts((m) => { const n = { ...m }; delete n[p]; return n; });
+    if (modelOpts[p]) return;
     try {
-      const d = await api('/providers/' + encodeURIComponent(p) + '/models', key ? { headers: { 'X-Api-Key': key } } : {});
+      const d = await api('/providers/' + encodeURIComponent(p) + '/models');
       setModelOpts((m) => ({ ...m, [p]: (d.models || []).map((x) => ({ value: x.id, label: x.id, context_length: x.context_length, pricing: x.pricing })) }));
     } catch (e) {
-      message.warning(`拉取 ${p} 模型列表失败（${errText(e)}）：可填 provider key 后重试，或直接手输模型名`);
+      message.warning(`拉取 ${p} 模型列表失败（${errText(e)}）：生产缺该 provider env key 时先到 Provider 页配置，或直接手输模型名`);
     }
   }, [modelOpts]);
   useEffect(() => { if (prov) loadModels(prov); }, [prov]);
@@ -31,15 +29,7 @@ export function ExternalCandidateFormItems({ form }) {
     <Form.Item name="provider" label="Provider" rules={[{ required: true }]}>
       <Select showSearch placeholder="选择 provider"
               options={providers.map((p) => ({ value: p.name, label: p.name + (p.local ? '（内网）' : '') }))}
-              onChange={(v) => loadModels(v, provKey || undefined)} />
-    </Form.Item>
-    <Form.Item label="provider key（拉模型列表/验证出口用，不落库）"
-      tooltip="gateway_only 模式实际外发走网关 env key：该 provider 未配 env key 时候选保存后外发会 503（可用「Provider 健康检查」验证）">
-      <Input.Password placeholder="生产缺该 provider 的 env key 时填写，不落库"
-                      autoComplete="new-password" value={provKey}
-                      onChange={(e) => setProvKey(e.target.value)}
-                      onBlur={() => { if (prov && provKey) loadModels(prov, provKey); }}
-                      onPressEnter={() => { if (prov && provKey) loadModels(prov, provKey); }} />
+              onChange={(v) => loadModels(v)} />
     </Form.Item>
     <Form.Item name="model" label="模型" rules={[{ required: true }]}>
       <AutoComplete options={modelOpts[prov] || []} style={{ width: '100%' }}
@@ -78,7 +68,6 @@ export default function ExternalCandidateModal({ open, onOk, onCancel, initial, 
         price_per_1m_out: initial?.price_per_1m_out ?? 0,
         price_per_1m_cached: initial?.price_per_1m_cached ?? 0,
         context_length: initial?.context_length ?? 65536,
-        rank: initial?.rank ?? 100,
         note: initial?.note ?? '',
         ...initial,
       });
@@ -98,8 +87,6 @@ export default function ExternalCandidateModal({ open, onOk, onCancel, initial, 
         <Form.Item name="price_per_1m_out" label="价格出(¥/1M)"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item>
         <Form.Item name="price_per_1m_cached" label="价格缓存命中(¥/1M，0=按全价)" tooltip="上游缓存命中 token 的单价；0 表示未配置，计费时缓存部分按全价算（高估）"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item>
         <Form.Item name="context_length" label="上下文"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item>
-        <Form.Item name="rank" label="Rank（小优先）"><InputNumber style={{ width: '100%' }} /></Form.Item>
-        <Form.Item name="note" label="备注"><Input /></Form.Item>
       </Form>
     </Modal>
   );

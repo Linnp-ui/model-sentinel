@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
-import { ReloadOutlined, SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
-import { api, errText, fetchJson, copyText } from '../api.js';
+import { SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
+import { api, errText, fetchJson, copyText, usePoll } from '../api.js';
 
 const { Text } = Typography;
 import { ruleZh, RULE_ZH } from '../ruleNames.jsx';
@@ -25,7 +25,10 @@ const L2Detail = ({ rec }) => {
   if (!l2) return <Text type="secondary">无 L2 判定（L1 直判，未进语义审查）</Text>;
   const hasShadow = l2.shadow_label || l2.shadow_conf !== undefined || l2.shadow_degraded;
   return (
-    <Space direction="vertical" size={2} style={{ fontSize: 12 }}>
+    /* 展开行是单 td 横跨整表且被 theme 强制居中：限宽 + 块居中，
+       文字左对齐由 theme.css 的 .audit-l2detail 翻回（同 ellipsis 例外口径），
+       不然宽屏下详情像悬浮在超宽空带中间 */
+    <Space className="audit-l2detail" direction="vertical" size={2} style={{ fontSize: 12, maxWidth: 880, margin: '0 auto' }}>
       <Space wrap>
         <Text strong>主判定：</Text>
         <Tag color={l2.label === 'CONFIDENTIAL' ? 'red' : 'green'}>{l2.label || '?'}</Tag>
@@ -55,9 +58,9 @@ const L2Detail = ({ rec }) => {
 // ---------------- 审计日志（原 /admin 审计页） ----------------
 const AUDIT_ACTIONS = [
   { value: '', label: '全部动作' },
-  { value: 'allow', label: 'allow 放行' },
-  { value: 'route_local', label: 'route_local 本地路由' },
-  { value: 'block', label: 'block 拦截' },
+  { value: 'allow', label: '放行' },
+  { value: 'route_local', label: '本地路由' },
+  { value: 'block', label: '拦截' },
 ];
 const AUDIT_RANGES = [
   { value: '', label: '全部时间' },
@@ -85,18 +88,20 @@ export default function AuditPage() {
   // 规则名下拉来源：与「规则管理」页同源（/admin/api/policies），避免前端硬编码漂移
   const [ruleNames, setRuleNames] = useState([]);
 
-  const load = useCallback(async (page = pageNo) => {
-    setLoading(true);
+  // silent=true：30s 轮询用（不点 loading 不闪 Spin、后台失败不弹错）
+  const load = useCallback(async (page = pageNo, silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const p = new URLSearchParams();
       Object.entries(f).forEach(([k, v]) => { if (v) p.set(k, v); });
       if (page > 1) p.set('page', String(page));
       setData(await fetchJson('/admin/audit/entries?' + p.toString()));
-    } catch (e) { message.error(errText(e)); }
-    setLoading(false);
+    } catch (e) { if (!silent) message.error(errText(e)); }
+    finally { if (!silent) setLoading(false); }
   }, [f, pageNo]);
 
   useEffect(() => { load(); }, [load]);
+  usePoll(() => load(pageNo, true)); // 替代原刷新按钮
 
   // 规则名清单拉取：失败时静默回退到内置中文映射（RULE_ZH），不影响筛选可用性
   useEffect(() => {
@@ -119,11 +124,14 @@ export default function AuditPage() {
 
   const setFld = (k) => (e) => { const next = { ...f, [k]: e.target.value }; setF(next); writeUrl(next); };
 
-  /* 列宽用 % 自适应（灌数轮次表口径）：固定 px 在窄屏撑出表内横向滚动 */
+  /* 列宽全 % + tableLayout=fixed：表跟随容器、列按比例分配，窄屏不再撑横向滚动。
+     内容摘要给 25% 定比（原 auto 弹性列靠内容顶宽，fixed 下必须有显式宽度） */
   const cols = [
-    /* 时间/Provider 是纯文本无省略号：窄列会溢出到邻列，加 ellipsis 裁切 */
-    { title: '时间', dataIndex: 'time', width: '15%', align: 'center', ellipsis: true },
-    { title: '动作 / 规则', width: '16%', align: 'center', ellipsis: true, className: 'cell-center',
+    /* 时间/Provider 加 ellipsis 防溢出；cell-center 必需——theme.css 把 ellipsis 列强制
+       左对齐，align:center 会被压掉（同模型/动作列） */
+    { title: '时间', dataIndex: 'time', width: '11%', align: 'center', ellipsis: true, className: 'cell-center' },
+    { title: 'Provider', dataIndex: 'provider', width: '9%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
+    { title: '动作 / 规则', width: '12%', align: 'center', ellipsis: true, className: 'cell-center',
       render: (_, r) => {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
         return (
@@ -132,13 +140,12 @@ export default function AuditPage() {
           </Tag>
         );
       } },
-    { title: 'Provider', dataIndex: 'provider', width: '10%', align: 'center', ellipsis: true, render: (v) => v || '—' },
-    { title: '模型', dataIndex: 'model', width: '12%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
-    { title: '调用方名称', dataIndex: 'key_name', width: '12%', align: 'center',
+    { title: '模型', dataIndex: 'model', width: '11%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
+    { title: '调用方名称', dataIndex: 'key_name', width: '11%', align: 'center',
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
-    { title: '客户端 IP', dataIndex: 'client_ip', width: '10%', align: 'center', render: (v) => v || '—' },
-    { title: '文件名', dataIndex: 'filename', width: '13%', ellipsis: true, render: (v) => v || '—' },
-    { title: '内容摘要', dataIndex: 'text_preview', width: '9%',
+    { title: '客户端 IP', dataIndex: 'client_ip', width: '9%', align: 'center', render: (v) => v || '—' },
+    { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
+    { title: '内容摘要', dataIndex: 'text_preview', width: '25%',
       render: (v) => (
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
@@ -165,27 +172,24 @@ export default function AuditPage() {
             onChange={(v) => { const next = { ...f, shadow: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
           <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/调用方/模型/L2/影子…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
           <Button type="primary" icon={<SearchOutlined />} onClick={search}>查询</Button>
-          <Button icon={<DownloadOutlined />} onClick={exportCsv}>导出 CSV</Button>
-          <Button aria-label="刷新" icon={<ReloadOutlined />} onClick={() => load()} />
+           <Button type="primary" icon={<DownloadOutlined />} onClick={exportCsv}>导出 CSV</Button>
         </Space>
       </Card>
       {data && (
         <>
-          <Space size="large" wrap>
-            <Statistic data-testid="audit-stat-total" title="命中总数" value={data.kpi.total} />
-            <Statistic data-testid="audit-stat-allow" title="放行" value={data.kpi.c_allow} valueStyle={{ color: '#52c41a' }} />
-            <Statistic data-testid="audit-stat-route" title="本地路由" value={data.kpi.c_route} valueStyle={{ color: '#faad14' }} />
-            <Statistic data-testid="audit-stat-block" title="阻断" value={data.kpi.c_block} valueStyle={{ color: '#ff4d4f' }} />
-          </Space>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            {data.kpi?.source === 'mysql'
-              ? 'KPI 口径：审计库（近 90 天，跟随筛选条件）；下方列表为 Redis 热窗，最多展示 5000 条，两者独立存储'
-              : 'KPI 口径：Redis 热窗（≤5000 条）；当前筛选（全文/调用方/IP/影子等）无法计入审计库，真值见导出 CSV'}
-          </Text>
+          <Card>
+            <Space wrap style={{ marginLeft: 16, columnGap: 60, rowGap: 12 }}>
+              <Statistic data-testid="audit-stat-total" title="命中总数" value={data.kpi.total} />
+              <Statistic data-testid="audit-stat-allow" title="放行" value={data.kpi.c_allow} valueStyle={{ color: '#52c41a' }} />
+              <Statistic data-testid="audit-stat-route" title="本地路由" value={data.kpi.c_route} valueStyle={{ color: '#faad14' }} />
+              <Statistic data-testid="audit-stat-block" title="阻断" value={data.kpi.c_block} valueStyle={{ color: '#ff4d4f' }} />
+            </Space>
+          </Card>
         </>
       )}
       <Card title="审计日志">
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
+        tableLayout="fixed"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}
         expandable={{ expandedRowRender: (rec) => <L2Detail rec={rec} />,
           rowExpandable: (rec) => !!normL2(rec.l2),

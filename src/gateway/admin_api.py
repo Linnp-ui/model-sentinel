@@ -28,6 +28,8 @@ M2：
   POST   /admin/api/policies/test            L1 规则测试（text/filename/size/model/client_key/hour -> 命中详情）
   GET    /admin/api/policies/match-choices  5.2 构造器可选项（前端下拉数据源）
   POST   /admin/api/policies/build-when      5.2 表单语义 -> when 条件（前端预览用）
+  POST   /admin/api/policies/build-when-group 条件组（多行 any/all）-> when 条件
+  POST   /admin/api/policies/parse-when      when 条件 -> 构造器控件值（编辑预填，单条件或条件组）
   POST   /admin/api/l2/generate-rule         5.2 匹配项 AI 生成（只建议不落库）
   POST   /admin/api/l2/test                  5.3 L2 规则测试（待识别内容 -> 审查判定）
 
@@ -42,8 +44,12 @@ M6（运维留痕）：
 """
 from __future__ import annotations
 
+import asyncio
 import os
+from pathlib import Path
 import re
+import signal
+import threading
 import time
 from typing import Dict, List, Optional, Union
 
@@ -102,7 +108,7 @@ class ApiKeyUpdateReq(BaseModel):
     name: Optional[str] = Field(default=None, max_length=128)
     owner: Optional[str] = Field(default=None, max_length=128)
     note: Optional[str] = Field(default=None, max_length=2048)
-    disabled: Optional[bool] = None
+    weekly_cost_cap: Optional[int] = Field(default=None, ge=0)
 
 
 class KeyRuleCreateReq(BaseModel):
@@ -223,9 +229,7 @@ def import_keys_api(body: KeysImportReq):
 @router.patch("/keys/{kid}")
 def update_key(kid: int, body: ApiKeyUpdateReq):
     try:
-        get_admin_store().update_api_key(
-            kid, name=body.name, owner=body.owner, note=body.note, disabled=body.disabled
-        )
+        get_admin_store().update_api_key(kid, name=body.name, owner=body.owner, note=body.note, weekly_cost_cap=body.weekly_cost_cap)
     except KeyError:
         raise HTTPException(404, "key not found")
     except ValueError as e:
@@ -521,6 +525,40 @@ def set_fallback_api(body: FallbackReq):
             "effective": os.getenv("AI_GATEWAY_MODEL_FALLBACK", "true")}
 
 
+@router.get("/model-policy/spend")
+def model_spend_api(hours: float = 168.0):
+    """每模型实际花费（计费口径），供模型策略页「推荐等级」：配置单价 × 实际用量混合排序。
+
+    复用 build_billing 定价口径（内网 cost=0、价目表未命中 priced=false 不计）；
+    计费行是 KEY×模型 粒度，这里按 provider/model 求和。
+    rate_per_1m = 实际花费/实际 token = 含真实 in/out/cached 混合的有效费率。
+    """
+    from src.gateway.admin_store import get_admin_store
+    from src.gateway import stats_service
+    hours = min(max(hours, 1.0), 720.0)
+    d = stats_service.build_billing(get_admin_store(), window_hours=hours)
+    per: Dict[str, Dict[str, float]] = {}
+    for it in d.get("items", []):
+        if not it.get("priced"):
+            continue
+        m = str(it.get("model") or "")
+        if not m:
+            continue
+        e = per.setdefault(m, {"cost": 0.0, "prompt": 0, "completion": 0})
+        e["cost"] += float(it.get("cost") or 0)
+        e["prompt"] += int(it.get("prompt") or 0)
+        e["completion"] += int(it.get("completion") or 0)
+    models = {}
+    for m, e in per.items():
+        toks = e["prompt"] + e["completion"]
+        models[m] = {
+            "cost": round(e["cost"], 2),
+            "tokens": toks,
+            "rate_per_1m": round(e["cost"] / toks * 1e6, 4) if toks else 0.0,
+        }
+    return {"hours": d.get("hours"), "models": models}
+
+
 
 # ---------------- M2: 5.1 L1 规则 CRUD ----------------
 
@@ -552,13 +590,23 @@ class ParseWhenReq(BaseModel):
 class BuildWhenReq(BaseModel):
     # 白名单从 policy_admin 的映射表派生，不另抄一份：新增匹配类型只改那一处
     # （size / hour_range 是自带字段的特例，不在映射表里）
-    content_type: str = Field(pattern="^(" + "|".join(sorted(policy_admin.CONTENT_TYPE_FIELD) + ["size"]) + ")$")
-    match_type: str = Field(pattern="^(" + "|".join(sorted(policy_admin.MATCH_TYPE_OP) + ["size", "hour_range"]) + ")$")
+    content_type: str = Field(pattern="^(" + "|".join(sorted(policy_admin.CONTENT_TYPE_FIELD) + ["size", "hour_range", "pii_score"]) + ")$")
+    match_type: str = Field(pattern="^(" + "|".join(sorted(policy_admin.MATCH_TYPE_OP) + ["size", "hour_range", "pii_score"]) + ")$")
     match_value: object
+
+
+class BuildWhenGroupReq(BaseModel):
+    combiner: str = Field(pattern="^(any|all)$")
+    rows: list[dict] = Field(min_length=1, max_length=8)
 
 
 class L2GenerateReq(BaseModel):
     description: str = Field(min_length=2, max_length=500)
+    # 「换一组」：已生成的匹配项，非空时提示模型避开这些词换一组（只传关键词类）
+    exclude: list = Field(default_factory=list, max_length=50)
+    # 覆盖范围：允许生成的 content_type 集合（prompt/filename/file/sheet_names/headers/…），
+    # 空=不限；越界输出整组拒
+    scopes: list = Field(default_factory=list, max_length=12)
 
 
 class L2TestReq(BaseModel):
@@ -568,7 +616,7 @@ class L2TestReq(BaseModel):
     sheet_names: list = Field(default_factory=list)
 
 
-# ---------- 对外模型别名（ext-flash / ext-pro 动态路由） ----------
+# ---------- 对外模型别名（AB-flash / AB-pro 动态路由） ----------
 
 class AliasMemberReq(BaseModel):
     provider: str
@@ -713,7 +761,7 @@ def list_providers_api():
         item = {
             "name": p.name, "base_url": p.base_url, "api_key_env": p.api_key_env,
             "api_mode": p.api_mode, "kind": p.kind, "default_model": p.default_model,
-            "embedding_model": p.embedding_model, "timeout": p.timeout,
+            "timeout": p.timeout,
             "local": p.local, "extra_headers": p.extra_headers or {},
         }
         for k, v in (raw_provs.get(p.name) or {}).items():
@@ -733,9 +781,9 @@ class ProviderUpsertReq(BaseModel):
     api_mode: str = Field(default="openai")
     kind: str = Field(default="chat", pattern="^(chat|embedding)$")
     default_model: str = Field(default="", max_length=256)
-    embedding_model: str = Field(default="", max_length=256)
     timeout: float = Field(default=60.0, ge=1, le=600)
     local: bool = False
+    new_name: str = Field(default="", max_length=64)
     extra_headers: Optional[Dict[str, str]] = None  # None=未传，更新时不动原值
 
 
@@ -746,6 +794,8 @@ class ProviderCreateReq(ProviderUpsertReq):
 def _provider_payload(body: ProviderUpsertReq) -> Dict[str, Any]:
     d = body.model_dump(exclude_none=True)
     d.pop("name", None)
+    d.pop("new_name", None)
+    d.pop("api_key", None)
     return d
 
 
@@ -807,15 +857,80 @@ def update_provider_api(request: Request, name: str, body: ProviderUpsertReq):
     provs = raw.get("providers") or {}
     if name not in provs and _pv.load_routing().get(name) is None:
         raise HTTPException(404, f"provider 不存在：{name}")
-    merged = {k: v for k, v in (provs.get(name) or {}).items() if k != "api_key_value"}
-    merged.update(_provider_payload(body))
-    provs[name] = merged
+    target = (body.new_name or name).strip()
+    if target != name:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", target):
+            raise HTTPException(422, f"provider 名不合法：{target!r}")
+        if target in (provs or {}) or _pv.load_routing().get(target) is not None:
+            raise HTTPException(409, f"provider {target} 已存在")
+        # 重命名：更新引用（routing 默认、model_policy 候选/内部模型、别名组成员）
+        routing = raw.get("routing") or {}
+        for fld in ("default_external", "default_local", "default_embedding"):
+            if routing.get(fld) == name:
+                routing[fld] = target
+        raw["routing"] = routing
+        # model_policy
+        try:
+            import yaml as _y
+            mp_raw = _y.safe_load(Path(_pv.DEFAULT_MODEL_POLICY if hasattr(_pv, "DEFAULT_MODEL_POLICY") else "model_policy.yaml").read_text(encoding="utf-8")) if False else None
+        except Exception:
+            mp_raw = None
+        # 直接操作 model_policy.yaml 文件
+        try:
+            from src.gateway import model_policy as _mp
+            mp_path = _mp._policy_path()
+            mp_doc = _y.safe_load(mp_path.read_text(encoding="utf-8")) or {}
+            mp = mp_doc.get("model_policy", mp_doc) if isinstance(mp_doc, dict) else {}
+            for c in (mp.get("external_candidates") or []):
+                if c.get("provider") == name:
+                    c["provider"] = target
+            for m in (mp.get("internal_models") or []):
+                if m.get("provider") == name:
+                    m["provider"] = target
+            mp_doc["model_policy" if "model_policy" in mp_doc else "model_policy"] = mp
+            # 保持原结构
+            if "model_policy" not in mp_doc and isinstance(mp_doc, dict):
+                mp_doc = {"model_policy": mp}
+            _y.safe_dump(mp_doc, open(mp_path, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
+            _mp.invalidate_model_policy_cache()
+        except Exception as e:
+            raise HTTPException(422, f"model_policy 更新失败：{e}")
+        # 别名组成员
+        try:
+            store = get_admin_store()
+            for g in store.list_alias_groups():
+                changed = False
+                members = [dict(m) for m in (g.get("members") or [])]
+                for m in members:
+                    if m.get("provider") == name:
+                        m["provider"] = target
+                        changed = True
+                if changed:
+                    store.update_alias_group(g.get("name"), members, description=g.get("description") or "")
+        except Exception:
+            pass
+    # move provider entry
+    if name in provs:
+        entry = provs.pop(name)
+        provs[target] = entry
+    merged = {k: v for k, v in (provs.get(target) or {}).items() if k != "api_key_value"}
+    payload = _provider_payload(body)
+    payload.pop("new_name", None)
+    merged.update(payload)
+    provs[target] = merged
+    raw["providers"] = provs
+    # providers.save_providers  expects full dict and writes yaml; but raw already modified routing; save_providers reloads raw anyway losing refs? Use save_providers only for providers + routing? save_providers writes whole raw including routing we mutated? Let's inspect: save_providers reads _routing_path raw independently, doesn't accept routing. It overwrites providers only but preserves raw routing? It calls load_raw fresh, so our raw mutations not persisted. Need instead write routing.yaml manually.
+    from src.gateway import providers as _pv
+    # persist routing + providers via yaml
     try:
-        _pv.save_providers(provs)
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-    get_admin_store().log_ops("provider_upsert", f"update {name}", _operator(request))
-    return {"ok": True, "name": name}
+        import yaml as _y
+        pth = _pv._routing_path()
+        _y.safe_dump(raw, open(pth, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
+        _pv.invalidate_cache()
+    except Exception as e:
+        raise HTTPException(422, f"routing 保存失败：{e}")
+    get_admin_store().log_ops("provider_rename" if target != name else "provider_upsert", f"{name} -> {target}", _operator(request))
+    return {"ok": True, "name": target}
 
 
 class ProviderKeyReq(BaseModel):
@@ -1023,13 +1138,18 @@ def match_choices_api():
     from src.gateway import policy_admin
     return {
         "choices": [
-            {"key": f"{ct}|{mt}", "content_type": ct, "match_type": mt, "label": label}
-            for ct, mt, label in policy_admin.MATCH_CHOICES
+            {"key": f"{ct}|{mt}", "content_type": ct, "match_type": mt, "label": label, "desc": desc}
+            for ct, mt, label, desc in policy_admin.MATCH_CHOICES
         ],
         # 自带字段的匹配类型不绑内容类型，单列出来让 UI 也能选。
         # hour_range 不在下拉里：时段规则只能手写 when_json（引擎 time.hour 运算符保留）
-        "self_field": [
-            {"key": f"size|size", "content_type": "size", "match_type": "size", "label": "文件大小 ≥"},
+         "self_field": [
+            {"key": f"size|size", "content_type": "size", "match_type": "size", "label": "文件大小 ≥",
+             "desc": "匹配项=字节数：文件大小达到或超过该值才算命中（例：1048576=1MB，20971520=20MB）。只对带附件的请求生效，纯文本请求 size=0 永不命中"},
+            {"key": f"hour_range|hour_range", "content_type": "hour_range", "match_type": "hour_range", "label": "本地时段",
+             "desc": "匹配项=“起-止”小时（0-23，例：22-6 跨午夜、9-18 同日）：请求时本地小时落在区间内就算命中。纯文本与文件请求都生效"},
+            {"key": f"pii_score|pii_score", "content_type": "pii_score", "match_type": "pii_score", "label": "加权隐私分 ≥",
+             "desc": "匹配项=分数阈值（整数，例：60）：加权隐私 PII 评分达到或超过该值才算命中。身份证 70 分、银行卡 Luhn 60 分、密钥类 90+ 分"},
         ],
     }
 
@@ -1054,6 +1174,18 @@ def build_when_api(body: BuildWhenReq):
     return {"ok": True, "when": when}
 
 
+@router.post("/policies/build-when-group")
+def build_when_group_api(body: BuildWhenGroupReq):
+    """条件组（多行 字段+匹配方式+匹配项，any/all 组合）-> when。与 build-when 共用
+    policy_admin 的映射表与逐行校验，前端构造器多条件预览用。"""
+    from src.gateway import policy_admin
+    try:
+        when = policy_admin.build_when_group(body.combiner, body.rows)
+    except (ValueError, re.error) as e:
+        raise HTTPException(422, str(e))
+    return {"ok": True, "when": when}
+
+
 # ---------------- M2: 5.2/5.3 L2 生成与测试 ----------------
 
 @router.post("/l2/generate-rule")
@@ -1061,7 +1193,7 @@ async def l2_generate_rule_api(body: L2GenerateReq):
     """AI 生成匹配项建议（5.2）。只返回建议，不落库；失败由 UI 手动填写兜底。"""
     from src.gateway.rule_ai import generate_rule_suggestion
     try:
-        suggestion = await generate_rule_suggestion(body.description)
+        suggestion = await generate_rule_suggestion(body.description, exclude=body.exclude, scopes=body.scopes)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except RuntimeError as e:
@@ -1095,6 +1227,17 @@ class L2ConfigPutReq(BaseModel):
     AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD: Optional[Union[int, Dict[str, int]]] = None
     AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD: Optional[Union[int, Dict[str, int]]] = None
     AI_GATEWAY_SUGGEST_ERROR_RATE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # 其余建议引擎阈值（原只能改 env 文件；此处补齐后管理台可调 + 落盘重启仍生效）
+    AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS: Optional[int] = Field(default=None, ge=1)
+    AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK: Optional[int] = Field(default=None, ge=1)
+    AI_GATEWAY_KEYTIER_MIN_VIOLATIONS: Optional[int] = Field(default=None, ge=0)
+    AI_GATEWAY_KEYTIER_VIOLATION_RATE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE: Optional[int] = Field(default=None, ge=1)
+    AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS: Optional[int] = Field(default=None, ge=0)
+    AI_GATEWAY_KEYTIER_WINDOW_HOURS: Optional[float] = Field(default=None, gt=0, le=8760)
+    AI_GATEWAY_SUGGEST_REORDER_MIN_HITS: Optional[int] = Field(default=None, ge=1)
+    AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS: Optional[int] = Field(default=None, ge=1)
+    AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS: Optional[int] = Field(default=None, ge=0)
 
 
 def _ser_window_map(v, lo: int, hi: int, key: str) -> str:
@@ -1143,6 +1286,17 @@ def l2_config_get():
         "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": win3(th["violation_map"], 20),
         "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD": win3(th["volume_map"], 1000),
         "AI_GATEWAY_SUGGEST_ERROR_RATE": th["error_rate"],
+        # 建议引擎其余阈值（与 _thresholds() 同键，弹窗一次取全）
+        "AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS": th["error_min_calls"],
+        "AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK": th["kt_black_calls"],
+        "AI_GATEWAY_KEYTIER_MIN_VIOLATIONS": th["kt_black_min_violations"],
+        "AI_GATEWAY_KEYTIER_VIOLATION_RATE": th["kt_violation_rate"],
+        "AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE": th["kt_white_calls"],
+        "AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS": th["kt_revoke_violations"],
+        "AI_GATEWAY_KEYTIER_WINDOW_HOURS": th["kt_window_hours"],
+        "AI_GATEWAY_SUGGEST_REORDER_MIN_HITS": th["reorder_min_hits"],
+        "AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS": th["limit_min_calls"],
+        "AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS": th["silent_grace_days"],
         # T46: PUT 落盘 l2_overrides.yaml，启动时由 l2_overrides.apply_overrides 应用
         "persisted": _l2ov.load_overrides(),
     }
@@ -1652,8 +1806,9 @@ def events_api(hours: int = 24):
 
 @router.get("/rule-hits")
 def rule_hits_api(hours: int = 168):
-    """L1 规则命中统计：audit_logs 窗口按 rule 聚合（排除 default_allow），
-    带 action 分布 + 最后命中（UTC）。沉默规则判断的页面内证据（建议规则 5）。"""
+    """L1 规则命中统计：audit_logs 窗口按 rule 聚合（排除 默认放行，含改名前旧名 default_allow
+    的历史行），带 action 分布 + 最后命中（UTC）。沉默规则判断的页面内证据（建议规则 5）。
+    2026-10-14 规则名改中文：改名前历史行按旧英文名出现，窗口滑过后自然消失。"""
     import datetime as _dt
     from src.gateway.audit_store import get_audit_store
 
@@ -1667,7 +1822,7 @@ def rule_hits_api(hours: int = 168):
     total = 0
     for r in rows:
         name = r.get("rule") or ""
-        if not name or name == "default_allow":
+        if not name or name in ("default_allow", "默认放行"):
             continue
         total += 1
         a = agg.setdefault(name, {"rule": name, "count": 0, "actions": {}, "last_seen": ""})
@@ -1745,6 +1900,13 @@ def l2_retrain_prompt_propose_api():
         raise HTTPException(422, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
+
+
+@router.get("/l2/retrain/prompt-propose")
+def l2_retrain_prompt_propose_latest_api():
+    """最近一次候选 prompt 修补（盘上持久化）：重启/切页后前端可恢复显示。"""
+    from src.gateway import l2_retrain
+    return {"proposal": l2_retrain.latest_prompt_fix()}
 
 
 class HardAddReq(BaseModel):
@@ -2000,7 +2162,7 @@ async def route_inspect_api(body: RouteInspectReq):
         decision = decision0
         _fn = " ".join((f.filename or "").strip() for f in files if (f.filename or "").strip())
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel or "text",
-                                     body, _rt, provider_keys,
+                                     body.model, _rt, provider_keys,
                                      shadow=await _shadow_of(text, _fn))
 
     if channel == "check" and files:
@@ -2188,6 +2350,23 @@ def circuit_set_api(request: Request, name: str, body: CircuitSetReq):
 # ---------------- 状态条 SSE ----------------
 # 本文件其余端点都是 sync def（FastAPI 自动进线程池）。SSE 必须是 async 生成器，
 # 所以聚合本身仍走 sync 路径，再 run_in_threadpool 挪出事件循环。
+
+# 停机信号：uvicorn 0.30 对「未完成的流式响应」只置 keep_alive=False 不断连，
+# 且 lifespan shutdown 排在连接排空之后 —— 永不结束的 SSE 生成器会把 stop 拖满
+# systemd TimeoutStopSec=90s 然后 SIGKILL，浏览器端报 net::ERR_INCOMPLETE_CHUNKED_ENCODING。
+# 修法：unit 的 ExecStop 先 kill -USR1 $MAINPID（见 agents/deploy.md），生成器见
+# sse_stop 正常 return（chunked 终止块照发），连接干净排空，进程快速自退。
+sse_stop = asyncio.Event()
+
+
+def register_sse_stop() -> None:
+    """startup 钩子调：SIGUSR1 → sse_stop.set()。TestClient 的 portal 线程不是
+    主线程，signal.signal 会抛 ValueError，测试态直接跳过。"""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    signal.signal(signal.SIGUSR1, lambda *_args: sse_stop.set())
+
+
 def _status_snapshot() -> dict:
     """状态条要的四份原始数据，逐个复用现成端点逻辑（不复制计算）。"""
     from src.gateway import small_model as _sm
@@ -2220,19 +2399,23 @@ async def status_stream():
     取代前端 4 个 fetch 的轮询；派生（五灯/覆盖率/异常判定）仍在前端算，
     与聚合口径同源。手动刷新 = 断开重连（EventSource 断线自带重连）。
     """
-    import asyncio
-
     from fastapi.responses import StreamingResponse
     from starlette.concurrency import run_in_threadpool
 
     async def gen():
+        if sse_stop.is_set():
+            return  # 停机窗口内的晚到重连：别开新流，让 EventSource 下轮再试
         while True:
             try:
                 payload = await run_in_threadpool(_status_snapshot)
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             except Exception as e:  # 单次聚合失败不掐流，下一拍重试
                 yield f"data: {json.dumps({'error': repr(e)[:200]}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(60)
+            try:
+                await asyncio.wait_for(sse_stop.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                continue  # 到点没停机信号，下一拍
+            return  # 停机：流正常收尾（chunked 终止块照发），EventSource 自动重连
 
     return StreamingResponse(
         gen(),

@@ -1,0 +1,1 @@
+const a=new Intl.DateTimeFormat("sv-SE",{timeZone:"Asia/Shanghai",dateStyle:"short",timeStyle:"medium",hour12:!1}),l=t=>{const e=Date.parse(String(t).replace(" ","T").slice(0,19)+"Z");return Number.isNaN(e)?String(t||""):a.format(e)},s=t=>{const e=t.filter(n=>n!=null);return e.length?e.reduce((n,r)=>n+r,0)/e.length:null};export{s as a,l as b};

@@ -1,7 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col, Alert } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
-import { api, errText } from '../api.js';
+import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col, Tooltip } from 'antd';
+import { api, errText, usePoll } from '../api.js';
 
 const { Text } = Typography;
 import ExternalCandidateModal, { ExternalCandidateFormItems } from './ExternalCandidateBits.jsx';
@@ -22,8 +21,6 @@ const savePolicySection = async (section, rows) => {
     load_balance_mode: pol.load_balance_mode || 'none',
     review_model: pol.review_model || {},
   })});
-  // 政策落盘后通知依赖它的展示（别名卡标题=/models/public 含内网模型，改内部模型要跟上）
-  window.dispatchEvent(new Event('gateway:model-policy-saved'));
 };
 
 function AliasGroupsCard() {
@@ -32,40 +29,32 @@ function AliasGroupsCard() {
   const [editing, setEditing] = useState(null);
   const [extCands, setExtCands] = useState([]);
   const [intModels, setIntModels] = useState([]);
-  const [publicModels, setPublicModels] = useState([]);
   const [extLoading, setExtLoading] = useState(false);
   const [extModal, setExtModal] = useState(null); // null | "new"
   const [addForm] = Form.useForm();
 
-  const loadExt = useCallback(async () => {
-    setExtLoading(true);
+  // silent=true：30s 轮询用（不点 loading 不闪 Spin、后台失败不弹错）
+  const loadExt = useCallback(async (silent = false) => {
+    if (!silent) setExtLoading(true);
     try {
       const d = await api('/model-policy');
       setExtCands(d.policy.external_candidates || []);
       setIntModels(d.policy.internal_models || []);
-      const pm = await api('/models/public').catch(() => null);
-      setPublicModels((pm && pm.data) || []);
-    } catch (e) { message.error(errText(e)); }
-    setExtLoading(false);
+    } catch (e) { if (!silent) message.error(errText(e)); }
+    finally { if (!silent) setExtLoading(false); }
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const d = await api('/aliases');
       setGroups(d.groups || []);
-    } catch (e) { message.error(errText(e)); }
-    setLoading(false);
-    loadExt();
+    } catch (e) { if (!silent) message.error(errText(e)); }
+    finally { if (!silent) setLoading(false); }
+    loadExt(silent);
   }, [loadExt]);
   useEffect(() => { load(); }, [load]);
-
-  // 内网模型等政策段保存后自动刷新公共模型列表（标题与 /v1/models 保持对齐）
-  useEffect(() => {
-    const onSaved = () => loadExt();
-    window.addEventListener('gateway:model-policy-saved', onSaved);
-    return () => window.removeEventListener('gateway:model-policy-saved', onSaved);
-  }, [loadExt]);
+  usePoll(() => load(true)); // 替代原刷新按钮（别名+外部候选一起刷）
 
   const save = async () => {
     const gname = (editing.name || '').trim();
@@ -93,23 +82,21 @@ function AliasGroupsCard() {
   };
 
   return (
-    <Card title={`对外模型别名（${publicModels.map((m) => m.id).join(' / ') || '无'}）`}
+    <Card title="对外模型别名组"
           size="small" style={{ marginBottom: 16 }}
-          extra={<Space>
-            <Button type="primary"
-                    onClick={() => { addForm.resetFields(); setEditing({ isNew: true, name: '', description: '', members: [] }); }}>新建别名组</Button>
-            <Button onClick={load}>刷新</Button>
-          </Space>}>
+           extra={<Button type="primary"
+                     onClick={() => { addForm.resetFields(); setEditing({ isNew: true, name: '', description: '', members: [] }); }}>新建别名组</Button>}>
       <Table
         loading={loading}
         rowKey={(g) => g.name}
         dataSource={groups}
         pagination={false}
         size="small"
+        tableLayout="fixed"
         columns={[
-          /* 列宽用 % 自适应（灌数轮次表口径）；操作列是按钮组，保留定宽 */
-          { title: '别名', dataIndex: 'name', width: '12%', render: (v) => <Tag color="blue">{v}</Tag> },
-          { title: '候选链（顺序即优先级，第一个为默认）', width: '77%', render: (_, g) => (
+          /* 列宽全 %  + tableLayout=fixed：表跟随容器宽度，列按比例分配；操作列装两个链接按钮，给足 14% */
+          { title: '别名组', dataIndex: 'name', width: '12%', render: (v) => <Tag color="blue">{v}</Tag> },
+          { title: '候选链（顺序即优先级，第一个为默认）', width: '74%', render: (_, g) => (
               <Space direction="vertical" size={2}>
                 {(g.members || []).map((m, i) => (
                   <Typography.Text key={i} type={m.enabled ? undefined : 'secondary'}>
@@ -119,9 +106,9 @@ function AliasGroupsCard() {
                 ))}
               </Space>
           )},
-          { title: '操作', width: 160, render: (_, g) => (
+          { title: '操作', width: '14%', render: (_, g) => (
               <Space size={4}>
-                <Button onClick={() => { addForm.resetFields(); setEditing({
+                <Button type="link" onClick={() => { addForm.resetFields(); setEditing({
                   name: g.name, origName: g.name, description: g.description || '',
                   members: (g.members || []).map((m) => ({ provider: m.provider, model: m.model, priority: m.priority, enabled: !!m.enabled })),
                 }); }}>编辑</Button>
@@ -129,7 +116,7 @@ function AliasGroupsCard() {
                             description="整组及候选链一并删除，/v1/models 立即不再展示，且不可恢复。"
                             okText="删除" okButtonProps={{ danger: true }} cancelText="取消"
                             onConfirm={() => remove(g.name)}>
-                  <Button danger>删除</Button>
+                  <Button type="link" danger>删除</Button>
                 </Popconfirm>
               </Space>
           )},
@@ -144,13 +131,8 @@ function AliasGroupsCard() {
               <Form.Item label="别名" required>
                 <Input value={editing.name} style={{ width: 220 }}
                        onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-                       placeholder="如 ext-flash" />
+                       placeholder="如 AB-flash" />
               </Form.Item>
-              {!editing.isNew && (
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  改名 = 重命名整组：/v1/models 立即按新名展示，旧名请求变 404
-                </Text>
-              )}
             </Form>
             <Form layout="inline" style={{ marginBottom: 8 }} form={addForm}
                   onFinish={(v) => {
@@ -182,23 +164,23 @@ function AliasGroupsCard() {
               <Button htmlType="submit">添加候选</Button>
               <Button onClick={() => setExtModal("new")}>＋新增外部候选</Button>
             </Form>
-            <Table rowKey={(_, i) => 'm' + i} size="small" pagination={false}
+            <Table rowKey={(_, i) => 'm' + i} size="small" pagination={false} tableLayout="fixed"
                    dataSource={editing.members}
                    columns={[
-                     { title: '#', width: 60, render: (_, __, i) => (i === 0 ? <Tag color="green">默认</Tag> : i + 1) },
-                     { title: 'Provider', dataIndex: 'provider' },
-                     { title: 'Model', dataIndex: 'model' },
-                     { title: '启用', dataIndex: 'enabled', width: 80, render: (v, _, i) => (
+                     { title: '#', width: '6%', render: (_, __, i) => (i === 0 ? <Tag color="green">默认</Tag> : i + 1) },
+                     { title: 'Provider', dataIndex: 'provider', width: '30%' },
+                     { title: 'Model', dataIndex: 'model', width: '32%' },
+                     { title: '启用', dataIndex: 'enabled', width: '10%', render: (v, _, i) => (
                          <Switch size="small" checked={v} onChange={(ck) => {
                            const ms = [...editing.members]; ms[i] = { ...ms[i], enabled: ck }; setEditing({ ...editing, members: ms });
                          }} /> )},
-                     { title: '操作', width: 170, render: (_, __, i) => (
+                     { title: '操作', width: '22%', render: (_, __, i) => (
                          <Space>
                            <Button disabled={i === 0} onClick={() => {
                              const ms = [...editing.members]; const t = ms[i - 1]; ms[i - 1] = ms[i]; ms[i] = t; setEditing({ ...editing, members: ms });
                            }}>上移</Button>
                            <Popconfirm title="删除该候选？" onConfirm={() => setEditing({ ...editing, members: editing.members.filter((_, k) => k !== i) })}>
-                             <Button danger>删除</Button>
+                             <Button type="link" danger>删除</Button>
                            </Popconfirm>
                          </Space>
                      )},
@@ -244,6 +226,8 @@ function ExternalCandidatesCard() {
   const [modal, setModal] = useState(null);
   const [envFlag, setEnvFlag] = useState(null);
   const [fbSaving, setFbSaving] = useState(false);
+  // "provider/model" -> {cost, tokens, rate_per_1m}：近 7d 实际花费（计费口径）
+  const [spend, setSpend] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -251,6 +235,8 @@ function ExternalCandidatesCard() {
       const d = await api('/model-policy');
       setRows(d.policy.external_candidates || []);
       setEnvFlag(d.env_flag || {});
+      const sp = await api('/model-policy/spend').catch(() => null);
+      setSpend((sp && sp.models) || {});
     } catch (e) { message.error(errText(e)); }
     setLoading(false);
   }, []);
@@ -272,18 +258,50 @@ function ExternalCandidatesCard() {
     load();
   };
 
+  // 推荐等级：计算单价 + 实际花费共同决定（越便宜越推荐，纯展示派生值）。
+  // 计算单价 = 配置的 (入+出)/2；实际费率 = 近 7d 实际花费/实际 token（含真实
+  // in/out/cached 混合，无用量时按计算单价）；两者各自升序取排名后取平均：
+  // 最便宜=高，最贵=低，其余=中。不改数据，切换优先级仍是 rank 字段。
+  const calcPrice = (r) => ((Number(r.price_per_1m_in) || 0) + (Number(r.price_per_1m_out) || 0)) / 2;
+  const rateOf = (r) => {
+    const s = (spend || {})[`${r.provider}/${r.model}`];
+    return (s && s.tokens > 0) ? s.rate_per_1m : calcPrice(r);
+  };
+  const recommendOf = (r) => {
+    const n = rows.length;
+    if (n <= 1) return '高';
+    const key = (x) => `${x.provider}/${x.model}`;
+    const rankBy = (get) => {
+      const sorted = rows.slice().sort((a, b) => get(a) - get(b));
+      return new Map(sorted.map((x, i) => [key(x), i]));
+    };
+    const rc = rankBy(calcPrice);
+    const rr = rankBy(rateOf);
+    if (rows.every((x) => calcPrice(x) === calcPrice(rows[0])) &&
+        rows.every((x) => rateOf(x) === rateOf(rows[0]))) return '高';
+    const avg = ((rc.get(key(r)) ?? 0) + (rr.get(key(r)) ?? 0)) / 2;
+    return avg <= 0 ? '高' : avg >= n - 1 ? '低' : '中';
+  };
+  const spendTip = (r) => {
+    const s = (spend || {})[`${r.provider}/${r.model}`];
+    const actual = (s && s.tokens > 0)
+      ? `实际 7d 花费 ¥${s.cost}（${s.tokens} tokens，有效费率 ¥${s.rate_per_1m}/1M）`
+      : '近 7d 无用量（实际费率按计算单价）';
+    return `计算单价 ¥${calcPrice(r)}/1M（入+出 /2）；${actual}。推荐等级=两者排名平均，越便宜越推荐；切换优先级 rank 在编辑里改`;
+  };
+
   return (
-    <Card title="外部候选（失败切换：rank→价格；溢出按上下文升序试）"
+    <Card title="外部候选"
       extra={<Button type="primary"
         onClick={() => setModal({ mode: 'new' })}>新增候选</Button>}>
       <Space align="center" wrap style={{ display: 'flex', marginBottom: 12 }}>
-        <Text>外网候选自动切换（fallback）：</Text>
+        <Text style={{ marginLeft: 10 }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text>
         <Switch size="small" loading={fbSaving}
           checked={!['0', 'false', 'no', 'off'].includes(String(envFlag?.AI_GATEWAY_MODEL_FALLBACK ?? 'true').toLowerCase())}
           onChange={setFallback} />
-        <Text type="secondary">关闭后报错/溢出不再自动切换；重启后恢复 env 配置</Text>
       </Space>
       <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" pagination={false}
+        tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无外部候选，点「新增候选」添加' }}
         columns={[
@@ -293,13 +311,15 @@ function ExternalCandidatesCard() {
           { title: '价格入(¥/1M)', dataIndex: 'price_per_1m_in', width: '13%' },
           { title: '价格出(¥/1M)', dataIndex: 'price_per_1m_out', width: '13%' },
           { title: '上下文', dataIndex: 'context_length', width: '11%' },
-          { title: 'Rank', dataIndex: 'rank', width: '9%' },
-          { title: '启用', dataIndex: 'enabled', width: '8%', render: (v, _, i) => (
-            <Switch size="small" checked={!!v} onChange={(on) => {
-              const next = rows.slice(); next[i] = { ...next[i], enabled: on };
-              saveAll(next).catch((e) => message.error(errText(e)));
-            }} />) },
-          { title: '操作', width: '18%', render: (_, r, i) => (
+          { title: '推荐等级', width: '10%', render: (_, r) => {
+            const lv = recommendOf(r);
+            return (
+              <Tooltip title={spendTip(r)}>
+                <Tag color={lv === '高' ? 'green' : lv === '中' ? 'blue' : 'orange'}>{lv}</Tag>
+              </Tooltip>
+            );
+          } },
+          { title: '操作', width: '26%', render: (_, r, i) => (
             <Space>
               <Button type="link" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.provider}/${r.model}？`} onConfirm={() => {
@@ -443,16 +463,11 @@ function L2RuntimeSection() {
       <Space align="center" wrap>
         <Text strong style={{ fontSize: 14 }}>L2 运行配置</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          {loadedAt ? `数据取自 ${loadedAt.toLocaleTimeString('zh-CN', { hour12: false })}` : ''}
+          {loadedAt ? `数据取自 ${loadedAt.toLocaleTimeString('zh-CN', { hour12: false })}（切回本页自动重取）` : ''}
           {dirty ? '（有未保存改动）' : ''}
         </Text>
-        <Button icon={<ReloadOutlined />} data-testid="l2cfg-reload"
-          onClick={load}>刷新</Button>
       </Space>
       <Space direction="vertical" size={10} style={{ width: '100%', marginLeft: 8, marginTop: 12 }}>
-        {cfgRow('L2 总开关：',
-          <Switch size="small" checked={!!cfg.SMALL_MODEL_ENABLED}
-            onChange={(v) => set('SMALL_MODEL_ENABLED', v)} />)}
         {isLaya && cfgRow('端点：',
           <Select size="small" showSearch style={{ width: 320 }} value={cfg.SMALL_MODEL_URL || ''}
             placeholder="从内部模型中选择"
@@ -461,10 +476,10 @@ function L2RuntimeSection() {
             filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />)}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 16px' }}>
           {cfgRow('超时(s)：',
-            <Slider style={{ width: 160 }} min={0.5} max={60} step={0.5}
+            <Slider style={{ width: 280 }} min={0.5} max={60} step={0.5}
               value={cfg.SMALL_MODEL_TIMEOUT} onChange={(v) => set('SMALL_MODEL_TIMEOUT', v)} />)}
           {cfgRow('白名单抽样：',
-            <Slider style={{ width: 160 }} min={0} max={1} step={0.05}
+            <Slider style={{ width: 280 }} min={0} max={1} step={0.05}
               value={cfg.AI_GATEWAY_WL_L2_SAMPLE} onChange={(v) => set('AI_GATEWAY_WL_L2_SAMPLE', v)} />)}
           {cfgRow('模型：',
             <Select size="small" showSearch style={{ width: 280 }} value={cfg.SMALL_MODEL_NAME || ''}
@@ -508,25 +523,28 @@ export function L2PromptsSection() {
   const [draft, setDraft] = useState({ system: '', template: '' });
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [proposing, setProposing] = useState(false);
-  const [proposal, setProposal] = useState(null);
-  const propose = async () => {
-    setProposing(true);
-    try {
-      setProposal(await api('/l2/retrain/prompt-propose', { method: 'POST' }));
-    } catch (e) { message.error(errText(e)); }
-    setProposing(false);
-  };
   const dirty = !!data && (draft.system !== data.system_prompt || draft.template !== data.user_prompt_template);
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
 
   const load = useCallback(async () => {
     try {
       const d = await api('/l2-prompts');
       setData(d);
-      setDraft({ system: d.system_prompt, template: d.user_prompt_template });
+      // 从 L2 影子页「自动修补」带过来的候选 system prompt：预填并直接开编辑器（人工确认后保存）
+      const pend = sessionStorage.getItem('gw-l2-propose-prompt');
+      if (pend != null) {
+        sessionStorage.removeItem('gw-l2-propose-prompt');
+        setDraft({ system: pend, template: d.user_prompt_template });
+        setOpen(true);
+      } else {
+        setDraft({ system: d.system_prompt, template: d.user_prompt_template });
+      }
     } catch (e) { message.error(errText(e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
+  // 30s 轮询（替代原刷新按钮）：有未保存编辑时跳过，轮询不得冲掉草稿
+  usePoll(() => { if (!dirtyRef.current) load(); });
 
   const save = async () => {
     setSaving(true);
@@ -553,8 +571,7 @@ export function L2PromptsSection() {
       <Space align="center" style={{ marginBottom: 4 }}>
         <Text strong>L2 提示词</Text>
         <Button type="link" onClick={() => setOpen(true)}>查看/编辑</Button>
-        <Text type="secondary" style={{ fontSize: 12 }}>{dirty ? '（有未保存改动）' : ''}</Text>
-        <Button icon={<ReloadOutlined />} onClick={load}>刷新</Button>
+        <Text type="secondary" style={{ fontSize: 12 }}>{dirty ? '（有未保存改动）' : '30s 自动刷新（编辑中暂停）'}</Text>
       </Space>
       <WheelGate>
       <Row gutter={8}>
@@ -562,28 +579,6 @@ export function L2PromptsSection() {
         <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>USER 模板</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.user_prompt_template}</Typography.Paragraph></Col>
       </Row>
       </WheelGate>
-      <Space style={{ marginTop: 8 }}>
-        <Button loading={proposing} onClick={propose}>自动修补（qwen 自省错题，~2min，只生成不应用）</Button>
-      </Space>
-      {proposal && (
-        <Alert type={proposal.candidate.correct >= proposal.baseline.correct ? 'success' : 'warning'}
-          showIcon style={{ marginTop: 8 }}
-          message={`候选 ${proposal.candidate.correct}/${proposal.candidate.total}（基线 ${proposal.baseline.correct}/${proposal.baseline.total}，${proposal.cases_used} 条主判错题自省）`}
-          description={
-            <Space direction="vertical" size={4} style={{ width: '100%' }}>
-              <div>补丁：{proposal.patch}</div>
-              {proposal.rationale && <div>理由：{proposal.rationale}</div>}
-              {proposal.candidate.wrong.length > 0
-                && <div>候选仍错：{proposal.candidate.wrong.map((w) => w.name).join('；')}</div>}
-              <Space>
-                <Button size="small" type="primary"
-                  onClick={() => { setDraft({ ...draft, system: proposal.candidate_prompt }); setOpen(true); }}>
-                  填入编辑器（人工确认后保存）
-                </Button>
-                <Button size="small" onClick={() => setProposal(null)}>放弃</Button>
-              </Space>
-            </Space>} />
-      )}
       <Modal title="编辑 L2 提示词" open={open} onCancel={() => setOpen(false)} destroyOnClose
              okText="保存" cancelText="取消" confirmLoading={saving} width={760}
              onOk={async () => { await save(); setOpen(false); }}>
@@ -631,7 +626,7 @@ function InternalModelsCard() {
   useEffect(() => {
     if (modal) {
       form.resetFields();
-      form.setFieldsValue({ provider: '', model: '', note: '', url: '', enabled: true, ...(modal.row || {}) });
+      form.setFieldsValue({ provider: '', model: '', note: '', enabled: true, ...(modal.row || {}) });
     }
   }, [modal]);
 
@@ -665,31 +660,29 @@ function InternalModelsCard() {
   };
 
   return (
-    <Card title="内部模型（降级目标登记）"
+    <Card title="内部模型"
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增内部模型</Button>}>
       <Table data-testid="mp-internal-table" rowKey={(r) => `${r.provider}/${r.model}`} size="small" pagination={false}
+        tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无内部模型，点「新增内部模型」添加' }}
         columns={[
-          /* 列宽用 % 自适应（灌数轮次表口径）；操作列是按钮组，保留定宽 */
-          { title: 'Provider', dataIndex: 'provider', width: '14%' },
-          { title: '模型', dataIndex: 'model', width: '16%', ellipsis: true },
-          { title: '网址', dataIndex: 'url', width: '20%', ellipsis: true,
+          /* 列宽全 % + tableLayout=fixed；操作列是按钮组，同样给 % 定比。
+             Provider 列已删（2026-10-14）：内部模型都是同一个本机 provider，列里全是重复值；字段仍留（弹窗可编辑、路由要用） */
+          { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true },
+          { title: '服务地址', dataIndex: 'url', width: '30%', ellipsis: true,
             render: (v) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : <Text type="secondary">—</Text>) },
           { title: '备注', dataIndex: 'note', width: '13%', ellipsis: true },
-          { title: '健康', width: '12%', ellipsis: true, render: (_, r) => (
-              !r._health ? <Text type="secondary">—</Text>
+          { title: '健康', width: '26%', ellipsis: true, className: 'cell-center', render: (_, r, i) => (
+            <Space size={4}>
+              {!r._health ? <Text type="secondary">—</Text>
               : r._health.ok
                 ? <Text type="success">正常 {r._health.latency_ms ?? '?'}ms{r._health.label ? ` ${r._health.label}` : ''}</Text>
-                : <Text type="danger" title={r._health.error}>{r._health.error || '异常'}</Text>) },
-          { title: '启用', dataIndex: 'enabled', width: '14%', render: (v, _, i) => (
-            <Switch size="small" checked={!!v} onChange={(on) => {
-              const next = rows.slice(); next[i] = { ...next[i], enabled: on };
-              saveAll(next).catch((e) => message.error(errText(e)));
-            }} />) },
-          { title: '操作', width: 180, render: (_, r, i) => (
-            <Space>
+                : <Text type="danger" title={r._health.error}>{r._health.error || '异常'}</Text>}
               <Button type="link" size="small" loading={checking === i} onClick={() => checkRow(r, i)}>检查</Button>
+            </Space>) },
+          { title: '操作', width: '11%', render: (_, r, i) => (
+            <Space>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.provider}/${r.model}？`} onConfirm={() => {
                 const next = rows.slice(); next.splice(i, 1);
@@ -713,7 +706,7 @@ function InternalModelsCard() {
           const v = await form.validateFields();
           const next = rows.slice();
           if (modal.mode === 'edit') next[modal.idx] = { ...next[modal.idx], ...v };
-          else next.push(v);
+          else next.push({ ...v, enabled: true });
           try { await saveAll(next); } catch (e) { message.error(errText(e)); return; }
           setModal(null);
           // 保存后干跑验证：目标可解析 + 必须落在内网 provider（内部模型指外网是配置错误）
@@ -728,12 +721,6 @@ function InternalModelsCard() {
         <Form form={form} layout="vertical" preserve={false}>
           <ExternalCandidateFormItems form={form} />
           <Form.Item name="note" label="备注"><Input /></Form.Item>
-          <Form.Item name="url" label="网址（可选，仅 laya 类非 chat 模型填 /classify 地址；chat 模型走 provider base_url，不填）">
-            <Input placeholder="如 http://127.0.0.1:8003/classify" />
-          </Form.Item>
-          <Form.Item name="enabled" label="启用" valuePropName="checked">
-            <Switch />
-          </Form.Item>
         </Form>
       </Modal>
     </Card>
@@ -769,7 +756,7 @@ function ModelLimitsCard() {
   useEffect(() => {
     if (modal) {
       form.resetFields();
-      form.setFieldsValue({ model: '', rpm: 0, note: '', enabled: true, ...(modal.row || {}) });
+      form.setFieldsValue({ model: '', rpm: 0, note: '', ...(modal.row || {}) });
     }
   }, [modal]);
 
@@ -780,21 +767,17 @@ function ModelLimitsCard() {
   };
 
   return (
-    <Card title="模型限流（全局，超限 429）"
+    <Card title="模型限流"
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增限流</Button>}>
-      <Table rowKey="model" className="tbl-limits" size="small" pagination={false}
+      <Table rowKey="model" className="tbl-limits" size="small" pagination={false} tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '未配置限流（全部不限）' }}
         columns={[
-          /* 全部列显式 % 宽（fixed 布局下无宽 auto 列没有最窄列宽，会塌到 0） */
+          /* 全部列显式 % 宽（fixed 布局下无宽 auto 列没有最窄列宽，会塌到 0）。
+             启用列已删（2026-10-14）：开关留在弹窗里，字段仍生效（model_rpm 卡口认 enabled） */
           { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true, render: (v) => <Text code>{v}</Text> },
           { title: 'RPM', dataIndex: 'rpm', width: '20%', render: (v) => (v > 0 ? v : <Tag>不限</Tag>) },
-          { title: '备注', dataIndex: 'note', width: '20%' },
-          { title: '启用', dataIndex: 'enabled', width: '20%', render: (v, _, i) => (
-            <Switch size="small" checked={!!v} onChange={(on) => {
-              const next = rows.slice(); next[i] = { ...next[i], enabled: on };
-              saveAll(next).catch((e) => message.error(errText(e)));
-            }} />) },
+          { title: '备注', dataIndex: 'note', width: '40%' },
           { title: '操作', width: '20%', render: (_, r, i) => (
             <Space>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
@@ -827,9 +810,6 @@ function ModelLimitsCard() {
             <InputNumber min={0} max={100000} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="note" label="备注"><Input /></Form.Item>
-          <Form.Item name="enabled" label="启用" valuePropName="checked">
-            <Switch />
-          </Form.Item>
         </Form>
       </Modal>
     </Card>

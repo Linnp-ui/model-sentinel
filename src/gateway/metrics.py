@@ -464,6 +464,7 @@ class Metrics:
                 "upstream_key_rejected": self._upstream_key_rejected,
                 "upstream_key_exhausted": sum(self._upstream_key_exhausted.values()),
                 "rate_limited_total": sum(self._rate_limited.values()),
+                "quota_exceeded": sum(v for (_scope, kind), v in self._rate_limited.items() if kind == "weekly_cost_cap"),
                 "ocr_pages": self._ocr_pages_total,
                 "ocr_errors": self._ocr_errors_total,
                 "tokens_total": sum(self._tokens.values()),

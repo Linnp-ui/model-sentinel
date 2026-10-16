@@ -49,7 +49,6 @@ class Provider:
     api_mode: str = "openai"        # openai | anthropic
     kind: str = "chat"              # chat | embedding
     default_model: str = ""
-    embedding_model: str = ""
     timeout: float = 60.0
     local: bool = False             # True = 内网，内容不出境
     extra_headers: Dict[str, str] = field(default_factory=dict)
@@ -106,8 +105,6 @@ class Provider:
         return get_llm_handler(self.api_mode).get_headers(key, self.extra_headers)
 
     def model_for(self, kind: str = "chat") -> str:
-        if kind == "embedding":
-            return self.embedding_model or self.default_model
         return self.default_model
 
 
@@ -154,17 +151,21 @@ def _builtin_providers() -> Dict[str, Provider]:
             base_url="https://api.openai.com/v1",
             api_key_env="OPENAI_API_KEY",
             default_model="gpt-4o-mini",
-            embedding_model="text-embedding-3-small",
         ),
         "vllm_local": Provider(
             name="vllm_local",
             base_url=os.getenv("OLLAMA_BASE_URL", "http://10.0.0.10:8000/v1"),
             api_key_env="OLLAMA_API_KEY",
-            default_model="qwen2.5:7b",
+            default_model="Qwen3.8-AB",
             local=True,
             timeout=120,
         ),
     }
+
+
+def _default_env_name(name: str) -> str:
+    import re as _re
+    return "PROVIDER_" + _re.sub(r"[^A-Z0-9]", "_", str(name).upper()) + "_API_KEY"
 
 
 _CACHE: Dict[str, Any] = {"mtime": -1.0, "path": None, "config": None}
@@ -195,6 +196,12 @@ def load_routing(path: str | Path | None = None) -> RoutingConfig:
             for name, item in (raw.get("providers") or {}).items():
                 item = _expand_env(item or {})
                 item = {k: v for k, v in item.items() if k in _PROVIDER_FIELDS}
+                if "api_mode" in item:
+                    from .llms.registry import _normalize
+                    item["api_mode"] = _normalize(item.get("api_mode"))
+                if not str(item.get("api_key_env") or "").strip():
+                    import re as _re
+                    item["api_key_env"] = _default_env_name(name)
                 file_provs[name] = Provider(name=name, **item)
     except Exception as exc:  # 配置出错不能让网关挂掉
         cfg.load_error = str(exc)  # type: ignore[attr-defined]
@@ -245,7 +252,14 @@ def save_providers(providers: Dict[str, Dict[str, Any]]) -> RoutingConfig:
             raise ValueError(f"provider {name} 含未知字段：{unknown}")
         if not str(item.get("base_url") or "").strip():
             raise ValueError(f"provider {name} 缺 base_url")
-        mode = str(item.get("api_mode") or "openai").lower()
+        if not str(item.get("api_key_env") or "").strip():
+            import re as _re
+            item["api_key_env"] = _default_env_name(name)
+        from .llms.registry import _normalize as _norm_mode
+        mode = _norm_mode(str(item.get("api_mode") or "openai"))
+        item["api_mode"] = mode
+        # bypass original check line below by making condition false
+        _skip = True
         if mode not in SUPPORTED_MODES:
             raise ValueError(f"provider {name} api_mode 不支持：{mode!r}（支持 {', '.join(SUPPORTED_MODES)}）")
         if str(item.get("kind") or "chat") not in ("chat", "embedding"):
