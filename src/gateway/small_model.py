@@ -128,7 +128,7 @@ def _get_client() -> httpx.AsyncClient:
     if client is None or client.is_closed:
         # 小模型在内网，必须绕过系统代理，否则请求会被公司代理转发/拖慢
         client = httpx.AsyncClient(timeout=l2_timeout(), trust_env=False,
-                                   limits=httpx.Limits(max_keepalive_connections=10))
+                                   limits=httpx.Limits(max_keepalive_connections=20, max_connections=100))
         if loop is not None:
             _CLIENTS[loop] = client
     return client
@@ -236,6 +236,12 @@ async def classify(text: str, filename: str = "", headers: list = None, sheet_na
         # 连续失败已熔断：不再等超时，直接判定不可用（结果由调用方 fail-local）
         return _degraded(DEGRADED_CIRCUIT, 0)
     start = time.time()
+    _sh_task = None
+    if _shadow_enabled() and l2_backend() != "laya":
+        # P0 高性能：影子与主判定并行（延迟 sum→max，qwen~270ms+laya~30ms 省约30ms）；
+        # 合并口径与 _shadow_run 一致，失败只丢影子数据。
+        _sh_task = asyncio.ensure_future(
+            _call_laya(text, filename, headers, sheet_names, timeout=2.0))
     try:
         if l2_backend() == "laya":
             res = await _call_laya(text, filename, headers, sheet_names)
@@ -244,7 +250,19 @@ async def classify(text: str, filename: str = "", headers: list = None, sheet_na
     except Exception as e:
         _cb.record_failure(_L2_BREAKER_KEY)
         res = _degraded(DEGRADED_EXC, int((time.time() - start) * 1000), error=str(e))
-    if _shadow_enabled():
+    if _sh_task is not None:
+        try:
+            _sh = await _sh_task
+            if _sh.get("degraded"):
+                res["shadow_degraded"] = _sh.get("error") or _sh.get("degraded_reason") or "error"
+            else:
+                res["shadow_label"] = _sh.get("label")
+                res["shadow_conf"] = _sh.get("confidence")
+                res["shadow_probabilities"] = _sh.get("probabilities")
+                res["shadow_reason"] = _sh.get("reason")
+        except Exception as e:
+            res["shadow_degraded"] = str(e)[:120]
+    elif _shadow_enabled():
         # 影子失败只丢影子数据，绝不影响主判定（上方已定型）
         await _shadow_run(res, text, filename, headers, sheet_names)
     if not res.get("degraded"):

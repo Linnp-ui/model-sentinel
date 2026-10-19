@@ -494,9 +494,11 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         _rule_failed("model_error_rate")
 
     # 规则 4：L1 规则优先级建议 —— 触发次数高的规则应排前面（先判先命中，
-    # policy 按 priority 升序短路）。一次算出全量目标顺序，一键应用全排到底：
-    # 按触发数降序，把参与规则当前的 priority 槽位升序分给它们（只 permute，
-    # 不动整体刻度；未触发规则不动）。参与门槛 reorder_min_hits 防抖动。
+    # policy 按 priority 升序短路）。按 action 分组各排各的：block 组 / route_local 组
+    # 只在自己当前的 priority 槽位内 permute，不跨组——跨组混排会让高频 PII route_local
+    # 规则把低频 block 规则（拦截密钥）挤到身后，reject 模式 403 失效（2026-10-19 预演实证）。
+    # 一键应用一次排到底；未触发规则不动，门槛 reorder_min_hits 防抖动。
+    # apply 的 order 必须是单组名单（apply 对传入名单的槽位并集 permute，混组即跨组污染）。
     # 窗口：固定长窗口（同规则 0/5/6，默认 30 天）—— 优先级是慢变量，不跟面板小时窗。
     try:
         k4_since, k4_until = _window(th["kt_window_hours"])
@@ -505,12 +507,18 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
             lbl = (g.get("label") or "")
             if lbl.startswith("l1:"):
                 hits[lbl[3:]] = g.get("calls", 0)
-        prio = {p.name: p.priority for p in load_policy()
-                if p.name != "默认放行"}
-        cands = [(n, c, prio[n]) for n, c in hits.items()
-                 if n in prio and c >= th["reorder_min_hits"]]
-        if len(cands) >= 2:
-            slots = sorted(p for _, _, p in cands)
+        groups: dict = {}
+        for p in load_policy():
+            if p.name == "默认放行":
+                continue
+            c = hits.get(p.name, 0)
+            if c >= th["reorder_min_hits"]:
+                groups.setdefault(p.action, []).append((p.name, c, p.priority))
+        for action, cands in groups.items():
+            if len(cands) < 2:
+                continue
+            prio = {n: p for n, _, p in cands}
+            slots = sorted(prio.values())
             want = [n for n, _, _ in sorted(cands, key=lambda t: (-t[1], t[2]))]
             cur = [n for n, _, _ in sorted(cands, key=lambda t: (t[2], -t[1]))]
             if want != cur:
@@ -520,12 +528,12 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                                   for n in moved)
                 win_d = int(th["kt_window_hours"] / 24)
                 out.append({
-                    "id": "reorder:all",
+                    "id": f"reorder:{action}",
                     "type": "rule_priority",
                     "severity": "info",
-                    "metric": f"{len(moved)} 条规则错位 / 近 {win_d} 天",
-                    "message": (f"按近 {win_d} 天触发次数，高频规则应排前面：{moves}。"
-                                f"一键应用一次排到底"),
+                    "metric": f"{len(moved)} 条规则错位 / 近 {win_d} 天（{action} 组内）",
+                    "message": (f"按近 {win_d} 天触发次数，{action} 组内高频规则应排前面：{moves}。"
+                                f"各组在自己槽位内重排、不跨组（block 与 route_local 互不干涉）"),
                     "apply": {"kind": "reorder", "order": want},
                 })
     except Exception:

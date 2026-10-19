@@ -219,31 +219,30 @@ export default function StatsPage() {
       <Row gutter={[12, 12]}>
         <Col flex={1}>
           <Card data-testid="stats-ov-total" styles={{ body: { padding: '12px 16px', height: 104 } }}>
-            <Statistic title="总调用量" value={ov ? ov.total : '-'} valueStyle={{ fontSize: 24 }} />
+            <Statistic title="总调用量" value={ov ? ov.total : '-'} valueStyle={{ fontSize: 24, marginLeft: 8 }} />
           </Card>
         </Col>
         <Col flex={1}>
           <Card data-testid="stats-ov-nonallow" styles={{ body: { padding: '12px 16px', height: 104 } }}>
             <Statistic title={<Tooltip title="口径：非放行 = 拦截（action=block* 或 HTTP 403）+ 本地路由（route_local 机密降级）。生产 on_block=fallback_local，敏感内容多落本地路由，只看拦截会漏。来源 request_log，仅 /v1/* 的 POST">非放行率</Tooltip>}
               value={ov && ov.total ? ((ov.blocked + ov.local_routed) / ov.total * 100).toFixed(1) : '-'} suffix="%"
-              valueStyle={{ fontSize: 24, color: ov && ov.blocked > 0 ? '#cf1322' : ov && ov.local_routed > 0 ? '#fa8c16' : undefined }} />
-            <Text type="secondary" style={{ fontSize: 12 }}>拦截 {ov ? ov.blocked : '-'} / 本地路由 {ov ? ov.local_routed : '-'}</Text>
+               valueStyle={{ fontSize: 24, marginLeft: 8, color: ov && ov.blocked > 0 ? '#cf1322' : ov && ov.local_routed > 0 ? '#d46b08' : undefined }} />
           </Card>
         </Col>
         <Col flex={1}>
           <Card data-testid="stats-ov-ips" styles={{ body: { padding: '12px 16px', height: 104 } }}>
-            <Statistic title="活跃 IP" value={ov ? ov.active_ips : '-'} valueStyle={{ fontSize: 24 }} />
+            <Statistic title="活跃 IP" value={ov ? ov.active_ips : '-'} valueStyle={{ fontSize: 24, marginLeft: 8 }} />
           </Card>
         </Col>
         <Col flex={1}>
           <Card data-testid="stats-ov-avgms" styles={{ body: { padding: '12px 16px', height: 104 } }}>
             <Statistic title={<Tooltip title="口径：request_log.duration_ms 均值，端到端总耗时（含上游生成）；网关自身耗时看下方运行指标 P50/P95/P99">平均总耗时</Tooltip>}
-              value={ov ? ov.avg_ms : '-'} suffix="ms" valueStyle={{ fontSize: 24 }} />
+              value={ov ? ov.avg_ms : '-'} suffix="ms" valueStyle={{ fontSize: 24, marginLeft: 8 }} />
           </Card>
         </Col>
         <Col flex={1}>
           <Card data-testid="stats-ov-tokens" styles={{ body: { padding: '12px 16px', height: 104 } }}>
-            <Statistic title="Token 用量" value={ov && ov.tokens_total != null ? ov.tokens_total.toLocaleString() : '-'} valueStyle={{ fontSize: 24 }} />
+            <Statistic title="Token 用量" value={ov && ov.tokens_total != null ? ov.tokens_total.toLocaleString() : '-'} valueStyle={{ fontSize: 24, marginLeft: 8 }} />
           </Card>
         </Col>
       </Row>

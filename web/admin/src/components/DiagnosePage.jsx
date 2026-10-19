@@ -59,7 +59,7 @@ export default function RouteInspectCard() {
             { value: 'chat', label: '文件通道：workbuddy image_url 内联图' },
             { value: 'responses', label: '文件通道：codex input_file 块' },
           ]} />
-          <input ref={fileRef} className="file-pick" type="file" multiple onChange={pickFiles} />
+          <input ref={fileRef} className="file-pick" type="file" multiple aria-label="选择文件" onChange={pickFiles} />
           {picked.length > 0 && <Tag color="blue">已选 {picked.length} 个：{picked.map((f) => f.filename).join('、')}</Tag>}
           {picked.length > 0 && <Button size="small" onClick={clearFiles}>清除文件</Button>}
           <Button type="primary" loading={running} onClick={run} style={{ marginLeft: 'auto' }}>运行检查</Button>
@@ -93,6 +93,11 @@ export default function RouteInspectCard() {
                       && <div><Tag color="red">{res.routing.gateway_key.note}</Tag></div>}
                   </Space>
                 )}
+                <div><Text type="secondary" style={{ fontSize: 12 }}>
+                  {res.uncovered && res.uncovered.length
+                    ? `本次干跑不生效的维度：${res.uncovered.join('、')}（当前策略真写了这些条件，此处恒不命中——不是规则写错）`
+                    : '当前策略用到的条件维度，本次干跑全部生效'}
+                </Text></div>
               </Space>} />
         )}
       </Space>

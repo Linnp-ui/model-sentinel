@@ -196,7 +196,7 @@ def _get_client(local: bool = False) -> httpx.AsyncClient:
             timeout=60,
             trust_env=False,  # 不读系统/环境代理，避免被开发机本地代理劫持
             proxy=proxy,  # 需要代理时由 AI_GATEWAY_UPSTREAM_PROXY 显式指定
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
         )
         if loop is not None:
             _CLIENTS[key] = client

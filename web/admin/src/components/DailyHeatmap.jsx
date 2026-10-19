@@ -27,7 +27,9 @@ export default function DailyHeatmap({ points, unit = '次', testid }) {
         return (
           <div key={p.day} title={`${p.day}：${p.v} ${unit}`}
             style={{ background: p.v > 0 ? `rgba(22,119,255,${(0.15 + 0.85 * f).toFixed(3)})` : '#f5f5f5',
-              borderRadius: 4, padding: '8px 4px', textAlign: 'center', color: p.v > 0 && f > 0.5 ? '#fff' : '#666' }}>
+              /* 格内文字恒用深色：蓝色标尺从 0.15 到 1.0，白字即便在全饱和格也只有
+                 4.1:1（11px 需 4.5）⇒ 深色字全档达标（最深格 5.1:1） */
+              borderRadius: 4, padding: '8px 4px', textAlign: 'center', color: p.v > 0 ? '#000' : '#666' }}>
             <div style={{ fontSize: 14, fontWeight: 600 }}>{p.v || '·'}</div>
             <div style={{ fontSize: 11 }}>{p.day.slice(5)}</div>
           </div>

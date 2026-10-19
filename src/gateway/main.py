@@ -539,7 +539,13 @@ def _mentioned_data_filename(text):
     global _MENTIONED_FILE_RE
     try:
         if _MENTIONED_FILE_RE is None:
-            _MENTIONED_FILE_RE = re.compile(r"[A-Za-z0-9_\-\u4e00-\u9fa5~]+\.(?:csv|tsv|txt|xlsx|xls|pdf|docx?)", re.IGNORECASE)
+            # 2026-10-19：原 greedy 字符类在「长无点单词串」上 O(n²) 回溯 —— 512KB 'a'
+            # 实测把事件循环卡死 20 分钟（单请求 DoS，M1 探针踩到）。加左边界 lookbehind
+            # （只从词首尝试）+ 长度上限 200（文件名远短于此）⇒ 线性；CJK 连写命中形态不变。
+            _MENTIONED_FILE_RE = re.compile(
+                r"(?<![A-Za-z0-9_\-\u4e00-\u9fa5~])"
+                r"[A-Za-z0-9_\-\u4e00-\u9fa5~]{1,200}\.(?:csv|tsv|txt|xlsx|xls|pdf|docx?)",
+                re.IGNORECASE)
         m = _MENTIONED_FILE_RE.search(text or "")
         return m.group(0) if m else ""
     except Exception:
@@ -920,6 +926,21 @@ def _l2_gray_trigger(findings) -> bool:
         return False
 
 
+def _encoded_keyword_decision(findings) -> dict | None:
+    """解码层（base64/hex）独有关键词 ⇒ 直接 route_local，不交给 L2。
+
+    2026-10-19 生产实测：整段机密文本编码后 risk_score 进灰区，L2 看到的是编码串，
+    判 NORMAL 秒放行 ⇒ 内容直出外网。编码本身即逃避特征，L2 在此看不清明文，
+    判决不可信 ⇒ fail-safe 转本地（与 l2_unavailable 同向：守住不出境）。
+    读原始 findings（inspection.inspect_text 的 encoded_keyword_hits）。
+    """
+    hits = (findings or {}).get("encoded_keyword_hits") or []
+    if not hits:
+        return None
+    return _route_local_decision("encoded_keyword",
+                                 "解码层关键词: " + ",".join(str(h) for h in hits[:6]))
+
+
 def _l2_scope_warn(msg: str) -> None:
     """scope 配置/容量类告警。绝不抛异常：L2 视野是增强，不能反过来打断请求。"""
     try:
@@ -1294,9 +1315,17 @@ def _review_text_budget() -> int:
         return _REVIEW_TEXT_BUDGET_DEFAULT
 
 
-def _cap_review_text(text: str) -> str:
+def _cap_review_text(text: str) -> tuple[str, bool]:
+    """保留尾部并返回是否溢出（M1，2026-10-19）。
+
+    超预算静默丢头部 = 绕过：头部放密文 + 尾部堆 >预算 良性填充，密文从未被扫
+    ⇒ 调用侧必须对溢出整条 fail-safe 转本地（内容不出境），不能假装审完了。
+    预算可调 AI_GATEWAY_REVIEW_TEXT_BUDGET（越大 CPU 越贵：512KB ≈ 150ms）。
+    """
     b = _review_text_budget()
-    return text if len(text) <= b else text[-b:]
+    if len(text) <= b:
+        return text, False
+    return text[-b:], True
 
 
 # F1(2026-10-14)：入站 body 无大小上限、且 request.json()= json.loads 同步跑在
@@ -1345,7 +1374,7 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
     返回 (decision, text_findings, l2_result)
 
     """
-    text = _cap_review_text(text)
+    text, _overflow = _cap_review_text(text)
     if model and _all_local_alias(model):
         return {"action": "allow", "name": "local_alias_bypass"}, {}, None
 
@@ -1380,15 +1409,23 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
     }
     decision = decide(load_policy(), ctx)
+    # M1 fail-safe：超审查预算（头部已被截）⇒ 整条转本地，内容不出境；不静默放行。
+    if _overflow and decision.get("action") == "allow":
+        decision = _route_local_decision(
+            "review_text_overflow",
+            f"审查文本超预算（> {_review_text_budget()} 字符），整条不出境")
+    # 解码层独有关键词：L2 只能看到编码串（实测判 NORMAL 放行）⇒ 直接转本地，不送 L2
+    _enc = _encoded_keyword_decision(text_findings)
+    if _enc and decision.get("action") == "allow":
+        decision = _enc
     if request is not None and decision.get("action") != "allow":
         request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
 
 
     l2_result = None
 
-    # 注：/v1/embeddings 未复用本函数（内联 L1 副本，且不跑 L2），
-    #     行为差异见 docs/gateway-hidden-issues-2026-09-15.md「范围外」一节。
-    # files_check 的 L2 路径（下方）与本函数不同：不检查灰区门槛，L1 allow 即跑 L2。
+    # 2026-10-19：/v1/embeddings 已收口到本函数（灰区 L2 与 chat 同源，见 embeddings 端点）。
+    # files_check 的单块文件式 L2 走自己的路径（门槛同为灰区，见 files_check）。
     _dec_blocks = l2_chunks or [(_L2_SCOPE_LAST_USER, l2_text or text)]
     if (decision.get("action") == "allow" and _l2_gray_trigger(text_findings)
             and (session_conf or not _wl_l2_skip(request))):
@@ -1444,6 +1481,14 @@ def _first_chunk_fb(prov):
                 "action": "route_local", "target": {"provider": lp.name}}
 
 
+def _route_local_decision(name: str, reason, **extra) -> dict:
+    """route_local 判决统一形状（L2 判密 / L2 不可用 / 解码层 / 超预算 共用）。"""
+    d = {"name": name, "priority": 15, "action": "route_local",
+         "target": {"provider": load_routing().default_local}, "reason": reason}
+    d.update(extra)
+    return d
+
+
 def _l2_decision(l2_result: dict | None) -> dict | None:
     """L2 小模型结论 -> 覆盖用的 decision；None = 维持原判（L1 放行）。
 
@@ -1457,25 +1502,14 @@ def _l2_decision(l2_result: dict | None) -> dict | None:
     if not l2_result:
         return None
     if is_confidential(l2_result):
-        return {
-            "name": "l2_confidential",
-            "priority": 15,
-            "action": "route_local",
-            "target": {"provider": load_routing().default_local},
-            "reason": l2_result.get("reason"),
-            "confidence": l2_result.get("confidence"),
-        }
+        return _route_local_decision("l2_confidential", l2_result.get("reason"),
+                                     confidence=l2_result.get("confidence"))
     if is_degraded(l2_result):
         if (os.getenv("AI_GATEWAY_L2_FAIL_MODE", "local") or "local").strip().lower() == "open":
             return None
-        return {
-            "name": "l2_unavailable",
-            "priority": 15,
-            "action": "route_local",
-            "target": {"provider": load_routing().default_local},
-            "reason": f"L2 不可用（{l2_result.get('degraded_reason') or 'unknown'}），已降级到本地",
-            "confidence": 0.0,
-        }
+        return _route_local_decision(
+            "l2_unavailable", f"L2 不可用（{l2_result.get('degraded_reason') or 'unknown'}），已降级到本地",
+            confidence=0.0)
     return None
 
 
@@ -2356,24 +2390,20 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
 
 @app.post("/v1/embeddings")
 
-async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = Depends(_rate_limit_embed)):
+async def embeddings(request: Request, identity: Identity = Depends(_rate_limit_embed)):
+    # 2026-10-19 收口：与 chat 主链路一致 —— body 上限 + 线程池解析 + _review_text。
+    # 此前是内联 L1 副本：不跑 L2 灰区、无文件名污染、inspect_text 同步跑事件循环、
+    # 无 body 上限（EmbeddingReq 裸解析）⇒ 分叉面全部补齐。
+    body = await _json_body(request)
+    try:
+        req = await run_in_threadpool(EmbeddingReq.model_validate, body)
+    except ValidationError as e:
+        raise HTTPException(422, detail=e.errors()[:10])
     raw = req.input
     text = " ".join(raw) if isinstance(raw, list) else str(raw or "")
-    text_findings = inspect_text(text)
-    _note_risk(text_findings)
-    session_id = extract_session_id(request.headers) if request is not None else None
-    session_conf = _is_session_confidential(session_id)
-    ctx = {
-
-        "text": text,
-        "file": {"ext": "", "filename": "", "headers": [], "sheet_names": [], "text": ""},
-        "findings": text_findings,
-        "session": {"confidential": session_conf},
-
-    }
-    decision = decide(load_policy(), ctx)
-    if decision.get("action") != "allow":
-        request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
+    session_id = extract_session_id(request.headers)
+    decision, _text_findings, l2_result = await _review_text(
+        text, request, model=str(req.model or ""))
 
     decision, downgraded = _block_to_fallback(decision)
     _mark_gw_action(request, decision)
@@ -2382,7 +2412,7 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
 
         log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
                    "type": "embedding", "action": "block", "rule": decision.get("name"),
-                   "text_preview": text[:200], "session_id": session_id})
+                   "text_preview": text[:200], "l2": l2_result, "session_id": session_id})
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name")})
 
 
@@ -2405,11 +2435,12 @@ async def embeddings(req: EmbeddingReq, request: Request, identity: Identity = D
         raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "provider": _err_provider(exc, prov), "message": str(exc)})
 
 
-    result["gateway"] = _gateway_meta(decision, prov, model, notes, None, downgraded)
+    result["gateway"] = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
     log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
         "type": "embedding", "action": decision.get("action"), "rule": decision.get("name"),
         "provider": prov.name, "local": prov.local, "model": model, "text_preview": text[:200],
+        "l2": l2_result,
 
     })
     return JSONResponse(result)
@@ -2860,7 +2891,9 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
 
     # 异步线程池，避免阻塞事件循环（Excel/PDF 解析 20-100ms）
     file_info = await run_in_threadpool(inspect_file, data, filename)
-    text = file_info.get("text", "")[:5000]
+    # M3（2026-10-19）：不再切前 5000 字符——inspect_file 输出本身已有上限（文本 50KB /
+    # xlsx 15KB），切片只会让 >5000 字符后的机密关键词免审（垫长前置即可绕过）。
+    text = file_info.get("text", "")
     text_findings = inspect_text(text)
     _note_risk(text_findings)
     session_id = extract_session_id(request.headers)
@@ -2886,6 +2919,11 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
     ctx["file"]["findings_text"] = str(file_info.get("findings", {}))
     policy_list = load_policy()
     decision = decide(policy_list, ctx)
+    # 与 _review_text 同口径：解码层独有关键词 L2 判不了（只见编码串）⇒ 直接转本地，
+    # 否则 base64 包一层机密文件的预检会误报「审查通过：可走外网」
+    _enc = _encoded_keyword_decision(text_findings)
+    if _enc and decision.get("action") == "allow":
+        decision = _enc
     if decision.get("action") != "allow":
         request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
 

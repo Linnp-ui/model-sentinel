@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { Table, Button, Input, Modal, Form, Space, message, Popconfirm, Typography, Alert, Card } from 'antd';
 import { KeyOutlined, CopyOutlined } from '@ant-design/icons';
 import { api, errText, copyText } from '../api.js';
+import { wideSticky } from '../utils.js';
 
 const { Text } = Typography;
 // ---------------- 4.2 API KEY 管理 ----------------
@@ -84,6 +85,7 @@ export default function KeysPage() {
       <Button type="primary" icon={<KeyOutlined />} onClick={openGenerate} style={{ marginLeft: 16 }}>生成 KEY</Button>
       <Card title="已登记 KEY">
       <Table rowKey="id" className="tbl-keys" columns={cols} dataSource={items} loading={loading} size="small"
+        sticky={wideSticky()}
         tableLayout="fixed"
         locale={{ emptyText: '暂无已登记 KEY（点「生成 KEY」添加）' }}
         pagination={{ pageSize: 50, showSizeChanger: false }} />

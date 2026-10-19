@@ -30,6 +30,10 @@ body.ant-scrolling-effect { width: auto !important; }
 /* 单元格不换行：fixed 布局缩宽时 % 列等比缩小，压到最窄列宽后表内横向滚动而不是
    折行；ellipsis 列本就 nowrap+省略号，不受影响 */
 .ant-table-cell { white-space: nowrap; }
+/* 空表提示是用户要读的正文（如「尚未检查，点右上角…」），antd 默认 0.25 在白底仅 1.83:1 */
+.ant-table-tbody > tr.ant-table-placeholder > td { color: rgba(0, 0, 0, 0.6) !important; }
+/* code 字号统一 12px：antd 默认 0.85em 会随父级缩到 10.2/11.9px（表内 URL、key 掩码、规则上下文名） */
+code { font-size: 12px !important; }
 /* 每列最窄列宽：rc-table 默认 tableLayout=fixed，列宽只认 col 的 %，单元格
    min-width/内容宽都不参与布局 ⇒ ellipsis 列可被压到 0、各表横滚起点互不相同
    （2026-10 实测；auto 布局也不行——Blink 把 nowrap 全文宽当硬下限，长文本列
@@ -54,9 +58,18 @@ body.ant-scrolling-effect { width: auto !important; }
 .tbl-ext col:nth-child(8) { min-width: 150px; }
 .tbl-limits col:nth-child(5) { min-width: 150px; }
 .tbl-circuit col:nth-child(5) { min-width: 170px; }
+/* sticky 模式下 rc-table 把表头拆成独立 <table>：表头列是实测 px 宽、表体仍走 % 宽，
+   上面这些 col min-width 只会夹住表头（px 列才吃 min-width）⇒ 表头/表体列错位
+   （实测 rules 7px、L2 分歧表 45px）。表头宽度本就是按表体实测回填的，无需再夹一遍 */
+.ant-table-sticky-holder col { min-width: 0 !important; }
 /* 无固定头的表 .ant-table-content 默认 overflow visible：nowrap 后表宽超卡会顶出
-   卡片撑宽 body，改表内横向滚动（固定头表走 .ant-table-body，不受影响） */
-.ant-table-content { overflow-x: auto; }
+   卡片撑宽 body，改表内横向滚动。开 sticky 后 rc-table 换成固定头结构（表头/表体
+   拆两 div），表体走 .ant-table-body，故两条同口径 */
+.ant-table-content, .ant-table-body { overflow-x: auto; }
+/* 全表 sticky（组件侧传 sticky）：吸顶位=顶部常驻块高度，由 App.jsx 实测写
+   --app-topbar-h；rc-table 内联 top:0 压不住，必须 !important。z-index 由 antd
+   给 3 < .app-topbar 的 10 ⇒ 滚动时表头从状态条下方穿过（不遮状态条） */
+.ant-table-sticky-holder { top: var(--app-topbar-h, 0px) !important; }
 /* 卡内正文基准 14→16（antd 默认）：继承生效，显式字号组件（KPI 标签/注释行等）不受影响 */
 .ant-card-body { font-size: 16px; }
 /* Statistic title 被 antd css-xxx 硬编码 14px、不吃卡体继承（同 head/cell 的 !important 因） */
@@ -112,6 +125,10 @@ body.ant-scrolling-effect { width: auto !important; }
 .page-enter { animation: page-in .18s ease-out; }
 /* 状态条节点色随 SSE 推送变：颜色硬切改渐变，critical 脉冲保留 */
 .app-statusbar .ant-tag { transition: background-color .3s ease-out, border-color .3s ease-out, color .3s ease-out; }
+/* 语义 tag / 状态文本的字色：antd 预设浅底上的 7 号色只有 3.3–3.5:1（13–14px 不达 AA），
+   加深到绿 8 / 橙 8（5.4/5.2:1）。红/蓝预设本就达标，不动 */
+.ant-tag-green, .ant-typography-success { color: #237804 !important; }
+.ant-tag-orange, .ant-tag-gold, .ant-typography-warning { color: #ad4e00 !important; }
 @media (prefers-reduced-motion: reduce) {
   .page-enter { animation: none; }
   .app-statusbar .ant-tag { transition: none; }
@@ -123,12 +140,12 @@ body.ant-scrolling-effect { width: auto !important; }
 .ant-btn-variant-outlined.ant-btn-color-default,
 .ant-btn-variant-outlined.ant-btn-color-default:hover,
 .ant-btn-variant-outlined.ant-btn-color-default:focus {
-  color: #ff4d4f !important;
+  color: #cf1322 !important;
   background-color: transparent !important;
   border-color: transparent !important;
 }
-.ant-btn-variant-outlined.ant-btn-color-default:hover { color: #ff7872 !important; }
-.ant-btn-variant-outlined.ant-btn-color-default:active { color: #d9363e !important; }
+.ant-btn-variant-outlined.ant-btn-color-default:hover { color: #e84749 !important; }
+.ant-btn-variant-outlined.ant-btn-color-default:active { color: #a8071a !important; }
 .ant-btn-variant-outlined.ant-btn-color-default:disabled,
 .ant-btn-variant-outlined.ant-btn-color-default.ant-btn-disabled {
   color: rgba(0, 0, 0, 0.25) !important;
@@ -157,9 +174,9 @@ body.ant-scrolling-effect { width: auto !important; }
   border-color: #0958d9 !important;
 }
 /* 「非密」标注按钮：绿色（默认红→绿，覆盖 default 按钮红色口径） */
-.ant-btn.btn-green { color: #52c41a !important; }
-.ant-btn.btn-green:hover { color: #95de64 !important; }
-.ant-btn.btn-green:active { color: #389e0d !important; }
+.ant-btn.btn-green { color: #237804 !important; }
+.ant-btn.btn-green:hover { color: #389e0d !important; }
+.ant-btn.btn-green:active { color: #135200 !important; }
 .ant-table-column-sorter { display: none !important; }
 /* 原生文件选择器伪装成 antd primary 按钮（selected files 走 Tag 展示，原生文本置透明） */
 .file-pick { color: transparent; background: transparent; border: 0; padding: 0; }

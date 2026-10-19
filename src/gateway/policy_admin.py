@@ -341,7 +341,13 @@ def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = ""
     model / client_key / hour 对应 main._review_text ctx 的 model / client.key / time.hour
     （三者都可匹配了，2026-10-08）。留空则该字段为空串 / 当前小时——干跑传空 = 走默认，
     不再是「规则必然不命中」的假阴性。
+
+    findings 走 inspect_text(text)（2026-10-19）：此前恒填空，按
+    findings.weighted_pii_score 判的规则在干跑里永不命中——实测 AKIA 样本干跑报
+    「拦截密钥 block」，真实请求是「隐私加权转内网 route_local」（密钥类权重 85-100 ≥60）。
+    没有文件字节，故只带正文 findings（生产文件分支还会并 inspect_file 的 findings）。
     """
+    from .inspection import inspect_text
     ctx = {
         "text": text or "",
         "file": {
@@ -353,7 +359,7 @@ def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = ""
             "watermark": "",
             "size": int(size or 0),
         },
-        "findings": {},
+        "findings": inspect_text(text) if text else {},
         "session": {"confidential": False},
         "model": model or "",
         "client": {"key": client_key or ""},

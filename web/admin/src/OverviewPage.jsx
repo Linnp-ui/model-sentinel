@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip, Spin } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
-import { bj, avg } from './utils.js';
+import { bj, avg, wideSticky } from './utils.js';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './components/DailyHeatmap.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
@@ -51,7 +51,7 @@ function EventStreamCard({ events }) {
       {(events.recent || []).length === 0 ? (
         <Alert type="success" showIcon message="本窗口无降级事件（外发链路全绿：无流式降级、无本地路由、L2 正常）" />
       ) : (
-        <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" tableLayout="fixed" columns={cols} dataSource={events.recent}
+        <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" sticky={wideSticky()} tableLayout="fixed" columns={cols} dataSource={events.recent}
           pagination={false} scroll={{ y: 300 }} />
       )}
       </WheelGate>
@@ -179,7 +179,7 @@ export default function OverviewPage() {
     { name: 'P99', color: '#ff4d4f', dots: true, n: nArr, points: pts(ch.p99, false) },
   ] : [];
   const errColor = d && d.err != null
-    ? (d.err >= 0.05 ? '#ff4d4f' : d.err > 0 ? '#fa8c16' : '#52c41a') : undefined;
+    ? (d.err >= 0.05 ? '#cf1322' : d.err > 0 ? '#d46b08' : '#389e0d') : undefined;
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
@@ -221,13 +221,13 @@ export default function OverviewPage() {
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-block" title="拦截率"
             value={d && d.total > 0 ? (100 * d.blocked / d.total).toFixed(1) + '%' : '-'}
-            color="#ff4d4f"
+            color="#cf1322"
             go="/audit?action=block" hint="跳审计页：拦截明细（动作=block）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-route" title="本地路由率"
             value={d && d.total > 0 ? (100 * d.routeLocal / d.total).toFixed(1) + '%' : d ? '0.0%' : '-'}
-            color={d && d.routeLocal > 0 ? '#fa8c16' : undefined}
+            color={d && d.routeLocal > 0 ? '#d46b08' : undefined}
             go="/audit?action=route_local" hint="跳审计页：本地路由明细（机密内容降级，不出境）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>

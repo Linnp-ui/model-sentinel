@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Row, Col } from 'antd';
 import { api, errText, usePoll } from '../api.js';
+import { wideSticky } from '../utils.js';
 
 const { Text } = Typography;
 // ---------------- Provider 注册表（routing.yaml 读写；密钥仍只走 env） ----------------
@@ -89,13 +90,13 @@ function ProviderRegistryCard() {
   return (
     <Card title="注册表"
       extra={<Button type="primary" size="small" onClick={() => openModal(null)}>新增 provider</Button>}>
-      <Table size="small" rowKey="name" className="tbl-registry" pagination={false} tableLayout="fixed" dataSource={rows} columns={[
+      <Table size="small" sticky={wideSticky()} rowKey="name" className="tbl-registry" pagination={false} tableLayout="fixed" dataSource={rows} columns={[
         /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。Key 列已删（2026-10-16）：
            环境变量名+已配/缺 信息密度低，配/改 入口并入操作列 */
         { title: '名称', dataIndex: 'name', width: '14%', ellipsis: true },
         { title: 'base_url', dataIndex: 'base_url', width: '38%', ellipsis: true },
         { title: '类型', width: '12%', render: (_, r) => (
-          <Space size={4}>{r.local ? <Tag color="blue">内网</Tag> : <Tag>外网</Tag>}{r.kind === 'embedding' && <Tag color="purple">向量</Tag>}</Space>) },
+          <Space size={4}>{r.local ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>内网</Tag> : <Tag style={{ marginInlineEnd: 0 }}>外网</Tag>}{r.kind === 'embedding' && <Tag color="purple" style={{ marginInlineEnd: 0 }}>向量</Tag>}</Space>) },
         { title: '操作', width: '36%', render: (_, r) => (
           <Space>
             <Button type="link" size="small" onClick={async () => {
@@ -147,7 +148,7 @@ function ProviderRegistryCard() {
             <InputNumber min={1} max={600} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="local" label="内网 provider（local: true，内容不出境）" valuePropName="checked">
-            <Switch />
+            <Switch aria-label="内网 provider" />
           </Form.Item>
         </Form>
       </Modal>
@@ -188,7 +189,7 @@ export function ProviderHealthCard({ compact = false }) {
         {compact && <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/provider'; }}>Provider 管理 →</Button>}
         <Button size="small" loading={checking} onClick={() => check('')}>全部检查</Button>
       </Space>}>
-      <Table size="small" rowKey="name" pagination={false} tableLayout="fixed" dataSource={rows || []}
+      <Table size="small" sticky={wideSticky()} rowKey="name" pagination={false} tableLayout="fixed" dataSource={rows || []}
         locale={{ emptyText: '尚未检查，点右上角「全部检查」开始' }}
         columns={[
           /* 列宽 % + tableLayout=fixed：全量模式占比合计 100；compact 只留前两列，
@@ -227,7 +228,7 @@ function CircuitCard() {
   const rows = Object.entries(data?.providers || {}).map(([name, p]) => ({ name, ...p }));
   return (
     <Card title={<>熔断器 <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>（连续失败达阈值后短暂拒绝流量，防止故障扩散）</Text></>}>
-      <Table size="small" rowKey="name" className="tbl-circuit" pagination={false} tableLayout="fixed" dataSource={rows}
+      <Table size="small" sticky={wideSticky()} rowKey="name" className="tbl-circuit" pagination={false} tableLayout="fixed" dataSource={rows}
         columns={[
           /* 列宽用 % 自适应（灌数轮次表口径） */
           { title: 'Provider', dataIndex: 'name', width: '24%' },

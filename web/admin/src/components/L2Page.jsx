@@ -3,7 +3,7 @@ import {
   Alert, Button, Card, Input, Modal, Popconfirm, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import { api, errText } from '../api';
-import { bj } from '../utils.js';
+import { bj, wideSticky } from '../utils.js';
 import WheelGate from './WheelGate.jsx';
 
 const { Text } = Typography;
@@ -14,7 +14,7 @@ function CellsMatrix({ cells, agreeRate, testid }) {
   const cell = (v, bg, label) => (
     <div style={{ background: bg, borderRadius: 6, padding: '12px 8px', textAlign: 'center' }}>
       <div style={{ fontSize: 22, fontWeight: 700, color: '#fff' }}>{v}</div>
-      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.85)' }}>{label}</div>
+      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.95)' }}>{label}</div>
     </div>
   );
   return (
@@ -23,11 +23,11 @@ function CellsMatrix({ cells, agreeRate, testid }) {
       <div style={{ textAlign: 'center', fontSize: 14, color: '#666' }}>影判 密</div>
       <div style={{ textAlign: 'center', fontSize: 14, color: '#666' }}>影判 放</div>
       <div style={{ fontSize: 14, color: '#666', alignSelf: 'center' }}>主判 密</div>
-      {cell(cells.cc, '#52c41a', '一致')}
-      {cell(cells.cn, '#faad14', '漏报嫌疑')}
+      {cell(cells.cc, '#237804', '一致')}
+      {cell(cells.cn, '#ad4e00', '漏报嫌疑')}
       <div style={{ fontSize: 14, color: '#666', alignSelf: 'center' }}>主判 放</div>
-      {cell(cells.nc, '#ff4d4f', '误报嫌疑')}
-      {cell(cells.nn, '#1677ff', '一致')}
+      {cell(cells.nc, '#cf1322', '误报嫌疑')}
+      {cell(cells.nn, '#0958d9', '一致')}
     </div>
   );
 }
@@ -413,7 +413,7 @@ export default function L2Page() {
         </div>
       </Card>
        <Card title="灌数轮次" style={{ marginBottom: 12 }}>
-        <Table size="small" rowKey={(r) => r.started} dataSource={rounds} tableLayout="fixed"
+        <Table size="small" sticky={wideSticky()} rowKey={(r) => r.started} dataSource={rounds} tableLayout="fixed"
           pagination={false} locale={{ emptyText: '还没跑过 scripts/gray_flood.py' }}
           /* 百分比铺满卡片（antd 表格默认 width:100%）。不设 width 会被 auto 布局
              均分，实测「轮次」内容 75px 却分到 666px（占 55%）；钉死 px 又在窄屏溢出 */
@@ -501,7 +501,7 @@ export default function L2Page() {
           </Space>
         }>
         {shown.length ? (
-          <Table rowKey="req_id" className="tbl-divs" size="small" tableLayout="fixed" columns={cols} dataSource={shown}
+          <Table rowKey="req_id" className="tbl-divs" size="small" sticky={wideSticky()} tableLayout="fixed" columns={cols} dataSource={shown}
             pagination={{ pageSize: 20, showSizeChanger: false }} />
         ) : (
           <Alert type="info" showIcon

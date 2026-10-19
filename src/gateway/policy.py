@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+# 2026-10-19 红队：text 的 contains_any/matches_regex 只跑原文，零宽化「财\u200b务报表」
+# 「aws_\u200bsecret」/「sk-12…\u200b…f」全 miss。归一化（NFKC+零宽剥离）与 PII 层同一真源，
+# 避免两套正则漂移。inspection.py 仅依赖标准库，此处单向导入不成环。
+from .inspection import _normalize_for_pii as _normalize_text
+
 DEFAULT_POLICY = Path(__file__).parent.parent.parent / "policy.yaml"
 
 # ---------------------------------------------------------------------------
@@ -183,10 +188,22 @@ def _eval_cond(cond: Mapping[str, Any], ctx: Mapping[str, Any]) -> bool:
             return str(val) in str(v)
         if "contains_any" in k:
             field = k.split("contains_any")[0].strip()
-            return _contains_any(_get_field(ctx, field), v)
+            hay = _get_field(ctx, field)
+            if _contains_any(hay, v):
+                return True
+            if field == "text":
+                # 零宽拆分「财\u200b务报表」「aws_\u200bsecret」原文 miss ⇒ 归一化副本再跑
+                return _contains_any(_normalize_text(str(hay or "")), v)
+            return False
         if "matches_regex" in k:
             field = k.split("matches_regex")[0].strip()
-            return bool(re.search(v, str(_get_field(ctx, field) or "")))
+            raw = str(_get_field(ctx, field) or "")
+            if re.search(v, raw):
+                return True
+            if field == "text":
+                # 拦截密钥的裸正则跑原文可被零宽化绕过（sk-32hex/aws_secret 无 PII 兜底前）⇒ 归一化副本再跑
+                return bool(re.search(v, _normalize_text(raw)))
+            return False
         if ">=" in k:
             try: return float(_get_field(ctx, k.split(">=")[0].strip())) >= float(v)
             except (TypeError, ValueError): return False

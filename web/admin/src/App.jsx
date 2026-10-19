@@ -1,5 +1,5 @@
-import { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react';
-import { Layout, Menu, Tag, Tooltip, Typography, Spin, Button } from 'antd';
+import { lazy, Suspense, useEffect, useState, useCallback, useRef, Component } from 'react';
+import { Layout, Menu, Tag, Tooltip, Typography, Spin, Button, Alert, Space } from 'antd';
 import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
   FileSearchOutlined, CloudServerOutlined,
@@ -125,6 +125,41 @@ const PAGE_TITLES = {
   password: '管理员密码',
 };
 
+// ---------------- 懒加载失败兜底：防「偶发空白页」 ----------------
+// 新构建会删掉旧 chunk 文件，而长开标签页（bfcache 回退/未刷新）里跑的还是旧 bundle
+// ⇒ 切页时动态 import 指向已删哈希文件，浏览器只给 "Failed to fetch dynamically imported
+// module"。Suspense 不接异常：没有 boundary 时 React 会把整棵树卸载 = 白屏。
+// 识别出 chunk 加载失败就自动刷新一次（30s 内只刷一次，防真缺文件时死循环），
+// 刷不动则给可点刷新的提示，页面其余部分照常渲染。
+const CHUNK_RELOAD_KEY = 'gw-chunk-reload-at';
+const isChunkLoadError = (err) => /dynamically imported module|Importing a module script failed|Failed to fetch/i
+  .test(String((err && err.message) || err || ''));
+
+class PageBoundary extends Component {
+  state = { err: null };
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidCatch(err) {
+    if (!isChunkLoadError(err)) return;
+    const last = Number(sessionStorage.getItem(CHUNK_RELOAD_KEY) || 0);
+    if (Date.now() - last > 30000) {
+      sessionStorage.setItem(CHUNK_RELOAD_KEY, String(Date.now()));
+      window.location.reload();
+    }
+  }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div style={{ padding: 24 }}>
+        <Alert showIcon type="warning"
+          message="页面加载失败：网关刚更新过，这个标签页还挂着旧版本"
+          description="刷新即恢复（旧标签页里的代码指向了已被新构建删除的资源文件）。"
+          action={<Space><Button size="small" type="primary"
+            onClick={() => window.location.reload()}>刷新</Button></Space>} />
+      </div>
+    );
+  }
+}
+
 // 侧边栏菜单项（单一真源）；PAGE_ICONS 从它派生 页→图标，供标题栏标题左侧显示当前页图标
 const MENU_ITEMS = [
   { key: 'overview', icon: <DashboardOutlined />, label: '总览' },
@@ -194,7 +229,12 @@ export default function App() {
   const [topH, setTopH] = useState(0);
   useEffect(() => {
     if (!topRef.current) return undefined;
-    const measure = () => setTopH(topRef.current ? topRef.current.offsetHeight : 0);
+    const measure = () => {
+      const h = topRef.current ? topRef.current.offsetHeight : 0;
+      setTopH(h);
+      // 表头 sticky 吸附位（theme.css .ant-table-sticky-holder）
+      document.documentElement.style.setProperty('--app-topbar-h', `${h}px`);
+    };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(topRef.current);
@@ -209,7 +249,7 @@ export default function App() {
         height: '100vh', overflowY: 'auto', overflowX: 'hidden', zIndex: 11 }}>
           <div style={{ height: 63, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', fontWeight: 700, fontSize: 20 }}>
             {!menuCollapsed && '网关控制台'}
-            <Button type="text" size="large" icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />} onClick={() => onSiderCollapse(!collapsed)} />
+            <Button type="text" size="large" aria-label={collapsed ? '展开侧栏' : '收起侧栏'} icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />} onClick={() => onSiderCollapse(!collapsed)} />
           </div>
         <Menu mode="inline" inlineCollapsed={menuCollapsed} selectedKeys={[page]} onClick={(e) => nav(e.key)} items={MENU_ITEMS} />
       </Sider>
@@ -230,7 +270,9 @@ export default function App() {
         </div>
         <Content style={{ padding: '8px 0' }}>
           <Suspense fallback={<div style={{ padding: 64, textAlign: 'center' }}><Spin /></div>}>
-            <div key={page} className="page-enter"><Page /></div>
+            <PageBoundary key={page}>
+              <div key={page} className="page-enter"><Page /></div>
+            </PageBoundary>
           </Suspense>
         </Content>
       </Layout>

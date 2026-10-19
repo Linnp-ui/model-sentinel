@@ -22,32 +22,25 @@ def gen_excel():
     print("已生成 demo/salary_2024.xlsx")
 
 def gen_pdf():
-    try:
-        from pypdf import PdfWriter
-        from pypdf.generic import NameObject, TextStringObject
-    except ImportError:
-        print("pip install pypdf 后重试")
-        return
-    # 用最简方式生成一个含文本的PDF（依赖 reportlab 更好，这里手写最小PDF）
+    # 用 reportlab 生成含文本的PDF（pypdf 只读文本提取已由 pymupdf 接管，此处不需要）
     try:
         from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4
-        os.makedirs("demo", exist_ok=True)
-        c = canvas.Canvas("demo/drawing_A01.pdf", pagesize=A4)
-        c.setFont("Helvetica", 12)
-        c.drawString(100, 800, "Design Drawing - A01  Structural Plan")
-        c.drawString(100, 780, "Project: XX Commercial Complex")
-        c.drawString(100, 760, "Confidential - Internal Use Only")
-        c.drawString(100, 740, "Watermark: 机密 保密")
-        c.drawString(100, 720, "Drawing No: SM-2024-A01")
-        c.drawString(100, 700, "This document contains confidential design data, do not distribute.")
-        c.showPage()
-        c.save()
-        print("已生成 demo/drawing_A01.pdf")
     except ImportError:
-        # fallback: 空PDF
-        print("pip install reportlab 后可生成更逼真的图纸PDF，当前跳过")
-        open("demo/drawing_A01.pdf","wb").write(b"%PDF-1.4 minimal")
+        print("pip install reportlab 后重试")
+        return
+    os.makedirs("demo", exist_ok=True)
+    c = canvas.Canvas("demo/drawing_A01.pdf", pagesize=A4)
+    c.setFont("Helvetica", 12)
+    c.drawString(100, 800, "Design Drawing - A01  Structural Plan")
+    c.drawString(100, 780, "Project: XX Commercial Complex")
+    c.drawString(100, 760, "Confidential - Internal Use Only")
+    c.drawString(100, 740, "Watermark: 机密 保密")
+    c.drawString(100, 720, "Drawing No: SM-2024-A01")
+    c.drawString(100, 700, "This document contains confidential design data, do not distribute.")
+    c.showPage()
+    c.save()
+    print("已生成 demo/drawing_A01.pdf")
 
 if __name__ == "__main__":
     gen_excel()

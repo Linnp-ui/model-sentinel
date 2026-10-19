@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, List, InputNumber, Spin } from 'antd';
 import { StopOutlined, ThunderboltOutlined, SlidersOutlined } from '@ant-design/icons';
 import { api, errText, RANGES, usePoll } from '../api.js';
+import { wideSticky } from '../utils.js';
 
 const { Text } = Typography;
 // 按窗口阈值 map（{'*': v} 或 {24:..,168:..,720:..}）取 24h 代表值：'*' 优先，否则 24，否则第一个
@@ -284,7 +285,7 @@ export default function KeyRulesPage() {
         <Button type="primary" icon={<StopOutlined />} onClick={() => setModalOpen(true)}>添加规则</Button>
       </Space>
       <Card title="KEY 规则">
-      <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small" tableLayout="fixed"
+      <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small" sticky={wideSticky()} tableLayout="fixed"
         pagination={{ pageSize: 50, showSizeChanger: false }} />
       </Card>
       <Modal title="添加 KEY 规则" open={modalOpen} onOk={submit} onCancel={() => setModalOpen(false)}>

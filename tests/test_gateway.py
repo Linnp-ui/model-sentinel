@@ -72,38 +72,54 @@ def test_file_drawing_route_local():
     assert r.json()["gateway"]["action"] == "route_local"
 
 def test_rule_priority_suggestion_and_reorder(tmp_path, monkeypatch):
-    # 规则4：触发次数高的 L1 规则应排前面；一次算出全量顺序，一键应用全排到底后收敛
+    # 规则 4：按触发次数重排，但按 action 分组各排各的——block 组与 route_local 组
+    # 只在自己当前槽位内 permute，不跨组（2026-10-19：跨组混排会拦回 block 修复，
+    # 高频 PII route_local 把block_secrets挤到身后 ⇒ reject 403 失效）。
     import yaml
     from src.gateway import policy as _pol
     from src.gateway.admin_store import get_admin_store
     p = tmp_path / "policy.yaml"
     p.write_text(yaml.safe_dump({"policies": [
-        {"name": "rule_lo", "priority": 10, "action": "route_local",
-          "when": {"any": [{"text contains_any": ["lo"]}]},
-          "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
-        {"name": "rule_mid", "priority": 20, "action": "block",
-          "when": {"any": [{"text contains_any": ["mid"]}]}},
-        {"name": "rule_hi", "priority": 30, "action": "block",
-          "when": {"any": [{"text contains_any": ["hi"]}]}},
+        {"name": "rl_slow", "priority": 10, "action": "route_local",
+         "when": {"any": [{"text contains_any": ["rs"]}]},
+         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
+        {"name": "rl_fast", "priority": 20, "action": "route_local",
+         "when": {"any": [{"text contains_any": ["rf"]}]},
+         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
+        {"name": "b_slow", "priority": 30, "action": "block",
+         "when": {"any": [{"text contains_any": ["bs"]}]},
+         },
+        {"name": "b_fast", "priority": 40, "action": "block",
+         "when": {"any": [{"text contains_any": ["bf"]}]}},
     ]}, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(p))
     _pol.invalidate_policy_cache()
     store = get_admin_store()
     try:
+        # 同一 (provider,model) 对 ≤25 行——别抢同 session 其他用例的 Top1 槽（limit 用例 100 行）
         seed = lambda reason, n: [store.insert_request_log(
-            {"key_name": "pytest-reorder", "action": "block", "model": "m",
+            {"key_name": "pytest-reorder", "action": "block", "model": f"m{i % 4}",
              "provider": "p", "client_ip": "9.9.9.9", "blocked_reason": reason})
-            for _ in range(n)]
-        seed("l1:rule_hi", 30)
-        seed("l1:rule_lo", 20)
-        seed("l1:rule_mid", 10)
+            for i in range(n)]
+        # 两组各自错位：高频规则都排在组内靠后
+        seed("l1:rl_fast", 50)
+        seed("l1:rl_slow", 15)
+        seed("l1:b_fast", 25)
+        seed("l1:b_slow", 12)
         items = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
-        ro = [s for s in items if (s.get("apply") or {}).get("kind") == "reorder"]
-        assert len(ro) == 1 and ro[0]["apply"].get("order") == ["rule_hi", "rule_lo", "rule_mid"], items
-        r = client.post("/admin/api/suggestions/apply", json=ro[0]["apply"])
-        assert r.status_code == 200, r.text
+        ro = {s["id"]: s for s in items if (s.get("apply") or {}).get("kind") == "reorder"}
+        assert set(ro) == {"reorder:route_local", "reorder:block"}, items
+        assert ro["reorder:route_local"]["apply"]["order"] == ["rl_fast", "rl_slow"]
+        assert ro["reorder:block"]["apply"]["order"] == ["b_fast", "b_slow"]
+        # 不跨组：两组的 order 互不含对方规则
+        assert not (set(ro["reorder:route_local"]["apply"]["order"]) & {"b_fast", "b_slow"})
+        assert not (set(ro["reorder:block"]["apply"]["order"]) & {"rl_fast", "rl_slow"})
+        for s in ro.values():
+            r = client.post("/admin/api/suggestions/apply", json=s["apply"])
+            assert r.status_code == 200, r.text
         prio = {x.name: x.priority for x in _pol.load_policy()}
-        assert (prio["rule_hi"], prio["rule_lo"], prio["rule_mid"]) == (10, 20, 30), prio
+        # 各组只在自己槽位内 permute：route_local 占 {10,20}、block 占 {30,40}，组间边界不动
+        assert prio == {"rl_fast": 10, "rl_slow": 20, "b_fast": 30, "b_slow": 40}, prio
         items2 = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
         assert not [s for s in items2 if (s.get("apply") or {}).get("kind") == "reorder"], items2
     finally:
@@ -207,6 +223,191 @@ def test_circuit_breaker_trip_and_recover(monkeypatch):
     b.record_success(key)
     b.record_success(key)
     assert b.state(key) == "closed" and b.allow(key)
+
+def _cb_stub_upstream(monkeypatch, rt, behavior):
+    """假上游：behavior(idx, url) 返回 httpx.Response 或抛 httpx.HTTPError，返回调用记录。
+
+    只为「上游报错」这条分支存在：真连外网会 503 且不确定，连内网 mock 又走不到
+    record_failure；这里替换掉 httpx client，路由/熔断代码本身全部是真身。
+    """
+    calls = []
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Stub:
+        async def post(self, url, headers=None, json=None, timeout=None):
+            calls.append(url)
+            out = behavior(len(calls) - 1, url)
+            if isinstance(out, Exception):
+                raise out
+            return out
+
+        def stream(self, method, url, headers=None, json=None, timeout=None):
+            calls.append(url)
+            out = behavior(len(calls) - 1, url)
+            if isinstance(out, Exception):
+                raise out
+            return _Ctx(out)
+
+    monkeypatch.setattr(rt, "_get_client", lambda local=False: _Stub())
+    return calls
+
+
+def _prom_value(text, name):
+    for line in text.splitlines():
+        if line.startswith(name + " "):
+            return float(line.split()[1])
+    return 0.0
+
+
+def test_upstream_5xx_trips_breaker_then_failfast(monkeypatch):
+    # 「上游报错 → 熔断触发」的集成路径（线上只敢手动 open，跳闸走这层）：
+    # 5xx 记失败 → 达阈值跳闸 → 后续请求 fail-fast（不再打上游）+ 指标计数
+    import asyncio
+    import httpx
+    import pytest
+    from src.gateway import routing as _rt, circuit_breaker as _cb
+    from src.gateway.metrics import get_metrics
+    from src.gateway.providers import Provider
+
+    monkeypatch.setenv("AI_GATEWAY_CB_FAILURE_THRESHOLD", "2")
+    monkeypatch.setenv("AI_GATEWAY_CB_WINDOW_SECONDS", "60")
+    monkeypatch.setenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "600")
+    monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: False)
+    prov = Provider(name="pytest-cb-upstream-5xx", base_url="http://cb5xx.invalid",
+                    api_key_value="K")
+    url = "http://cb5xx.invalid/v1/chat/completions"
+    calls = _cb_stub_upstream(monkeypatch, _rt,
+                              lambda i, u: httpx.Response(500, text="upstream boom",
+                                                          request=httpx.Request("POST", u)))
+    b = _cb.get_breaker()
+    b.reset(prov.name)
+
+    async def _call():
+        return await _rt._post(prov, url, {"model": "m"}, "K")
+
+    tripped0 = _prom_value(get_metrics().render(), "gateway_circuit_tripped_total")
+    short0 = _prom_value(get_metrics().render(), "gateway_circuit_short_circuit_total")
+    try:
+        assert asyncio.run(_call()).status_code == 500
+        assert b.state(prov.name) == "closed", "1 次失败（阈值 2）不应跳闸"
+        assert asyncio.run(_call()).status_code == 500
+        assert b.state(prov.name) == "open", "连续 5xx 达阈值应跳闸"
+        assert b.snapshot()[prov.name]["failure_count_window"] == 2
+        assert _prom_value(get_metrics().render(), "gateway_circuit_tripped_total") == tripped0 + 1
+        n = len(calls)
+        with pytest.raises(_rt.RoutingError) as ei:
+            asyncio.run(_call())
+        assert ei.value.status_code == 503 and "circuit open" in str(ei.value)
+        assert len(calls) == n, "熔断打开后必须 fail-fast，不得再打上游"
+        assert _prom_value(get_metrics().render(),
+                           "gateway_circuit_short_circuit_total") == short0 + 1
+    finally:
+        b.reset(prov.name)
+
+
+def test_stream_upstream_5xx_trips_breaker(monkeypatch):
+    # 流式是生产主路径：status>=500 必须同样记失败（漏这条，主路径的熔断就是死的）
+    import asyncio
+    import httpx
+    import pytest
+    from src.gateway import routing as _rt, circuit_breaker as _cb
+    from src.gateway.providers import Provider
+
+    monkeypatch.setenv("AI_GATEWAY_CB_FAILURE_THRESHOLD", "1")
+    monkeypatch.setenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "600")
+    monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: False)
+    prov = Provider(name="pytest-cb-stream", base_url="http://cbs.invalid", local=True)
+    calls = _cb_stub_upstream(monkeypatch, _rt,
+                              lambda i, u: httpx.Response(500, text="upstream boom",
+                                                          request=httpx.Request("POST", u)))
+    b = _cb.get_breaker()
+    b.reset(prov.name)
+
+    async def _once():
+        async for _ in _rt._chat_stream_once({"model": "m", "messages": []},
+                                             {"action": "allow"}, prov=prov, model="m"):
+            pass
+
+    try:
+        with pytest.raises(_rt.RoutingError) as ei:
+            asyncio.run(_once())
+        assert ei.value.status_code == 500 and b.state(prov.name) == "open"
+        n = len(calls)
+        with pytest.raises(_rt.RoutingError) as ei2:
+            asyncio.run(_once())
+        assert ei2.value.status_code == 503 and "circuit open" in str(ei2.value)
+        assert len(calls) == n, "跳闸后流式请求也必须 fail-fast"
+    finally:
+        b.reset(prov.name)
+
+
+def test_upstream_network_error_trips_but_4xx_does_not(monkeypatch):
+    # 超时/拒连与 5xx 同等记失败；4xx 是上游正常工作（客户端错）⇒ 不计失败、不跳闸
+    import asyncio
+    import httpx
+    import pytest
+    from src.gateway import routing as _rt, circuit_breaker as _cb
+    from src.gateway.providers import Provider
+
+    monkeypatch.setenv("AI_GATEWAY_CB_FAILURE_THRESHOLD", "1")
+    monkeypatch.setenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "600")
+    monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: False)
+    prov = Provider(name="pytest-cb-net", base_url="http://cbnet.invalid", api_key_value="K")
+    url = "http://cbnet.invalid/v1/embeddings"
+    b = _cb.get_breaker()
+    b.reset(prov.name)
+    try:
+        _cb_stub_upstream(monkeypatch, _rt,
+                          lambda i, u: httpx.ConnectError("connection refused"))
+        with pytest.raises(_rt.RoutingError) as ei:
+            asyncio.run(_rt._post(prov, url, {"model": "m"}, "K"))
+        assert ei.value.status_code == 502 and "unreachable" in str(ei.value)
+        assert b.state(prov.name) == "open", "连不上上游应与 5xx 同等计失败"
+
+        b.reset(prov.name)
+        _cb_stub_upstream(monkeypatch, _rt,
+                          lambda i, u: httpx.Response(400, text="bad request",
+                                                      request=httpx.Request("POST", u)))
+        assert asyncio.run(_rt._post(prov, url, {"model": "m"}, "K")).status_code == 400
+        assert b.state(prov.name) == "closed" and b.allow(prov.name), "4xx 不该跳闸"
+    finally:
+        b.reset(prov.name)
+
+
+def test_alias_candidates_skip_open_candidate(monkeypatch):
+    # 别名组按 provider::model 记熔断：跳闸成员被跳过（切下一候选）；全组跳闸 → 无候选（上层 503）
+    from src.gateway import alias_router as _ar, circuit_breaker as _cb
+
+    monkeypatch.setenv("AI_GATEWAY_CB_FAILURE_THRESHOLD", "2")
+    monkeypatch.setenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "600")
+    b = _cb.get_breaker()
+    keys = [("pytest-alias-a", "ma"), ("pytest-alias-b", "mb")]
+    group = {"name": "AB", "candidates": [{"provider": "pytest-alias-a", "model": "ma"},
+                                          {"provider": "pytest-alias-b", "model": "mb"}]}
+    for p, m in keys:
+        b.reset(_ar._cb_key(p, m))
+    try:
+        assert [c["idx"] for c in _ar.alias_candidates(group)] == [0, 1]
+        for _ in range(2):
+            _ar.record_alias_result("pytest-alias-a", "ma", False)
+        assert [c["provider"] for c in _ar.alias_candidates(group)] == ["pytest-alias-b"]
+        assert _ar.alias_candidates(group, skip=2) == [], "候选用尽 → 无候选（上层给 503）"
+        for _ in range(2):
+            _ar.record_alias_result("pytest-alias-b", "mb", False)
+        assert _ar.alias_candidates(group) == [], "整组熔断 → 无候选，不静默转本地"
+    finally:
+        for p, m in keys:
+            b.reset(_ar._cb_key(p, m))
+
 
 def test_alias_candidates_get_own_provider_key(monkeypatch):
     # 凭据池是 per-provider 的：别名组切到候选 #2 时若沿用候选 #1 的 key，
@@ -459,6 +660,73 @@ def test_l1_rules_catch_obfuscated_negative_samples():
         assert inspect_text(t)["risk_score"] < 60, f"{t}: 被误判直转本地"
     assert "exec_schedule" not in inspect_text("行程单私发我,别发群里")["keyword_hits"]
     assert set(RISK_RULES) <= {"implied_amount", "raise_amount", "salary_pinyin", "exec_schedule"}
+
+def test_l1_rules_catch_keyword_split_and_key_zerowidth():
+    # 回归（2026-10-19 红队）：关键词层只跑原文，零宽/全角/空格拆分关键词 risk 归 0 直出外网；
+    # policy 的 text contains_any/matches_regex 也只跑原文，「sk-32hex」「aws_secret」零宽化
+    # 绕过block_secrets（这两个此前无 PII 权重兜底）。
+    # 修复：关键词/RISK_RULES 双跑紧凑副本（NFKC+零宽剥离+去空白）；policy text 视图
+    # 归一化副本再跑；deepseek_key PII 权重 90 兜底 sk-32hex。
+    from src.gateway.inspection import inspect_text
+    from src.gateway.policy import load_policy, decide
+    from src.gateway.main import _l2_gray_trigger
+
+    def l1(text):
+        f = inspect_text(text)
+        d = decide(load_policy(), {"text": text, "file": {}, "findings": f,
+                                   "session": {}, "tainted_file": {}})
+        return d, f
+
+    # 1) 零宽/全角/空格拆分关键词：至少进 L2 灰区（risk≥20），不得再 risk 0
+    for t in ("帮我看下工\u200b资表里的数据", "这是机\u200b密文件", "财\u200b务报表见附件",
+              "财 务 报 表 见附件", "机\n密\n文\n件", "ｓａｌａｒｙ 数据看下"):
+        f = inspect_text(t)
+        assert f["risk_score"] >= 20, f"{t!r}: 关键词拆分仍 risk=0 —— 会直出外网"
+        assert _l2_gray_trigger(f) is True, f"{t!r}: 未进 L2 门"
+
+    # 2) 空格拆分 RISK_RULES（salary_pinyin）
+    assert _l2_gray_trigger(inspect_text("我 到 手 12k,惨")) is True
+
+    # 3) DeepSeek sk-32hex 零宽化：PII 兜底（90）+ block_secrets p3 压过 p5，绝不 allow
+    #    （2026-10-19 block_secrets提到 priority 3：reject 模式对密钥可 403；
+    #     现网 on_block=fallback_local 下 block 降级 route_local，落点不变）
+    d, f = l1("sk-1234567890abcde\u200bf1234567890abcdef")
+    assert f["weighted_pii_score"] >= 90, "deepseek_key PII 兜底未命中"
+    assert d.action == "block"
+    # 明文同通道
+    d2, _ = l1("sk-1234567890abcdef1234567890abcdef")
+    assert d2.action == "block"
+
+    # 4) aws_secret 标签零宽化：block_secrets的 contains_any 跑归一化副本，仍 block
+    d3, _ = l1("aws_\u200bsecret: a1B2c3D4e5F6g7H8i9J0k1L2m3n4O5p6q7R8s9T0")
+    assert d3.action == "block", f"aws_secret 零宽化未 block: {d3.action}"
+
+def test_l1_keyword_in_decode_layer():
+    # 回归（2026-10-19 M2）：base64/hex 解码层此前只重扫 PII，整段无 PII 的机密文本
+    # 编码后 risk=0 ⇒ 不进灰区、无 L2 ⇒ 直出外网。关键词/RISK_RULES 须对解码层生效。
+    import base64
+    from src.gateway.inspection import inspect_text
+    from src.gateway.main import _l2_gray_trigger
+    secret = "财务部 2026 年预算与营收明细，绝对机密，不得外传"
+    blob = base64.b64encode(secret.encode()).decode()
+    assert "机密" not in blob and "财务" not in blob   # 编码形态无明文命中
+    f = inspect_text(f"看下这段（{blob}）")
+    assert f["risk_score"] >= 20, f"base64 关键词层未命中: {f}"
+    assert _l2_gray_trigger(f) is True
+    # hex 同口径（hex 串也命中 b64 run，b64 解出非 UTF-8 后落 hex 层）
+    f2 = inspect_text("看下这段（" + secret.encode().hex() + "）")
+    assert f2["risk_score"] >= 20, f"hex 关键词层未命中: {f2}"
+    # 原文与编码同现：同名关键词跨层只计一次
+    b1 = base64.b64encode("机密内部资料".encode()).decode()
+    both = inspect_text("机密 " + b1)
+    assert both["keyword_hits"].count("机密") == 1, both
+    # 解码层独有的命中必须直接 route_local：生产实测 L2 看 base64 判 NORMAL 放行
+    from src.gateway.main import _encoded_keyword_decision
+    assert f["encoded_keyword_hits"], f
+    assert _encoded_keyword_decision(f)["action"] == "route_local"
+    fp = inspect_text("机密文件")           # 原文命中仍走 L2 灰区，不抢判定权
+    assert not fp["encoded_keyword_hits"]
+    assert _encoded_keyword_decision(fp) is None
 
 def test_l2_config_suggest_window_roundtrip(tmp_path, monkeypatch):
     # /l2-config：两项阈值按窗口 {24/168/720} 存取；PUT 传 dict → env '24:20,168:100,720:500'
@@ -1689,3 +1957,30 @@ def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
                        json={"text": "x", "hour": 24}).status_code == 422
     # hour 缺省 = 当前小时（服务端回落，不是 0）
     assert client.post("/admin/api/policies/test", json={"text": "x"}).status_code == 200
+
+
+def test_policy_test_dryrun_carries_findings(tmp_path, monkeypatch):
+    """干跑必须带 findings，否则按 weighted_pii_score 判的规则永不命中（假阴性）。
+
+    复刻生产实况：AKIA 密钥样本 weighted_pii_score=90 ⇒ priority 5 的
+    「pii_weighted_route_local」route_local 先命中；干跑曾恒填 findings={} ⇒ 报成 priority 12
+    的密钥 block，与真实请求不一致。
+    """
+    from src.gateway.policy import invalidate_policy_cache
+
+    pol = tmp_path / "policy_dryrun_findings.yaml"
+    pol.write_text(
+        "policies:\n"
+        "  - name: pii-score-rule\n    priority: 5\n    action: route_local\n"
+        "    when:\n      any:\n      - findings.weighted_pii_score >=: 60\n"
+        "  - name: key-rule\n    priority: 12\n    action: block\n"
+        "    when:\n      any:\n      - text matches_regex: AKIA[0-9A-Z]{16}\n"
+        "  - name: base-allow\n    priority: 100\n    action: allow\n    when: always\n",
+        encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(pol))
+    invalidate_policy_cache()
+
+    r = client.post("/admin/api/policies/test",
+                    json={"text": "我的 AKIAIOSFODNN7EXAMPLE 泄露了"})
+    assert r.status_code == 200, r.text
+    assert r.json()["rule"] == "pii-score-rule", r.text

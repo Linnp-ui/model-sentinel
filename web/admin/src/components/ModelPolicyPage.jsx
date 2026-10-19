@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col, Tooltip } from 'antd';
 import { api, errText, usePoll } from '../api.js';
+import { wideSticky } from '../utils.js';
 
 const { Text } = Typography;
 import ExternalCandidateModal, { ExternalCandidateFormItems } from './ExternalCandidateBits.jsx';
@@ -87,6 +88,7 @@ function AliasGroupsCard() {
            extra={<Button type="primary"
                      onClick={() => { addForm.resetFields(); setEditing({ isNew: true, name: '', description: '', members: [] }); }}>新建别名组</Button>}>
       <Table
+        sticky={wideSticky()}
         loading={loading}
         rowKey={(g) => g.name}
         dataSource={groups}
@@ -164,14 +166,14 @@ function AliasGroupsCard() {
               <Button htmlType="submit">添加候选</Button>
               <Button onClick={() => setExtModal("new")}>＋新增外部候选</Button>
             </Form>
-            <Table rowKey={(_, i) => 'm' + i} size="small" pagination={false} tableLayout="fixed"
+            <Table rowKey={(_, i) => 'm' + i} size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed"
                    dataSource={editing.members}
                    columns={[
                      { title: '#', width: '6%', render: (_, __, i) => (i === 0 ? <Tag color="green">默认</Tag> : i + 1) },
                      { title: 'Provider', dataIndex: 'provider', width: '30%' },
                      { title: 'Model', dataIndex: 'model', width: '32%' },
                      { title: '启用', dataIndex: 'enabled', width: '10%', render: (v, _, i) => (
-                         <Switch size="small" checked={v} onChange={(ck) => {
+                         <Switch size="small" aria-label="启用该候选" checked={v} onChange={(ck) => {
                            const ms = [...editing.members]; ms[i] = { ...ms[i], enabled: ck }; setEditing({ ...editing, members: ms });
                          }} /> )},
                      { title: '操作', width: '22%', render: (_, __, i) => (
@@ -296,11 +298,11 @@ function ExternalCandidatesCard() {
         onClick={() => setModal({ mode: 'new' })}>新增候选</Button>}>
       <Space align="center" wrap style={{ display: 'flex', marginBottom: 12 }}>
         <Text style={{ marginLeft: 10 }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text>
-        <Switch size="small" loading={fbSaving}
+        <Switch size="small" aria-label="外网候选自动切换" loading={fbSaving}
           checked={!['0', 'false', 'no', 'off'].includes(String(envFlag?.AI_GATEWAY_MODEL_FALLBACK ?? 'true').toLowerCase())}
           onChange={setFallback} />
       </Space>
-      <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" pagination={false}
+      <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" sticky={wideSticky()} pagination={false}
         tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无外部候选，点「新增候选」添加' }}
@@ -495,7 +497,7 @@ function L2RuntimeSection() {
       </Space>
       <Space align="center" wrap style={{ marginTop: 12 }}>
         <Text title="qwen 权威、laya 并行打标（shadow_* 进审计），backend=laya 时不生效">影子双跑：</Text>
-        <Switch size="small" checked={!!cfg.AI_GATEWAY_L2_SHADOW}
+        <Switch size="small" aria-label="影子双跑" checked={!!cfg.AI_GATEWAY_L2_SHADOW}
           disabled={(cfg.AI_GATEWAY_L2_BACKEND || 'qwen') === 'laya'}
           onChange={(v) => set('AI_GATEWAY_L2_SHADOW', v)} />
         <Text>影子端点：</Text>
@@ -662,7 +664,7 @@ function InternalModelsCard() {
   return (
     <Card title="内部模型"
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增内部模型</Button>}>
-      <Table data-testid="mp-internal-table" rowKey={(r) => `${r.provider}/${r.model}`} size="small" pagination={false}
+      <Table data-testid="mp-internal-table" rowKey={(r) => `${r.provider}/${r.model}`} size="small" sticky={wideSticky()} pagination={false}
         tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无内部模型，点「新增内部模型」添加' }}
@@ -769,7 +771,7 @@ function ModelLimitsCard() {
   return (
     <Card title="模型限流"
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增限流</Button>}>
-      <Table rowKey="model" className="tbl-limits" size="small" pagination={false} tableLayout="fixed"
+      <Table rowKey="model" className="tbl-limits" size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '未配置限流（全部不限）' }}
         columns={[

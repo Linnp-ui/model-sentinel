@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, Slider, Checkbox, Tooltip, Radio } from 'antd';
+import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, Slider, Checkbox, Tooltip, Radio, Switch } from 'antd';
 import { RobotOutlined, DeleteOutlined } from '@ant-design/icons';
 import { api, errText, usePoll } from '../api.js';
+import { wideSticky } from '../utils.js';
 
 const { Text } = Typography;
 import { ruleZh } from '../ruleNames.jsx';
@@ -76,11 +77,6 @@ function L2RulesCard() {
   );
 }
 
-function whenSummary(when) {
-  if (when === 'always' || typeof when === 'string') return String(when);
-  return JSON.stringify(when);
-}
-
 export default function RulesPage() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -89,6 +85,26 @@ export default function RulesPage() {
   const [prioSort, setPrioSort] = useState('ascend'); // 优先级仅升/降两态，点击直接切换
   const [form] = Form.useForm();
   const [aiLoading, setAiLoading] = useState(false);
+  // 拦截模式 on_block：fallback_local（转内网回答）↔ reject（真实 403）；写 routing.yaml 热重载
+  const [onBlockMode, setOnBlockMode] = useState('fallback_local');
+  const [onBlockLoading, setOnBlockLoading] = useState(false);
+  const loadOnBlock = async () => {
+    try { const d = await api('/routing'); setOnBlockMode(d?.routing?.on_block || 'fallback_local'); }
+    catch (e) { /* 读失败保持默认，不打断页面 */ }
+  };
+  useEffect(() => { loadOnBlock(); }, []);
+  const toggleOnBlock = async (checked) => {
+    const mode = checked ? 'reject' : 'fallback_local';
+    setOnBlockLoading(true);
+    try {
+      await api('/routing/on-block', { method: 'PUT', body: JSON.stringify({ mode }) });
+      setOnBlockMode(mode);
+      message.success(mode === 'reject'
+        ? '已切到真实拒绝：block 规则命中时客户端收到 403（密钥不送入任何模型）'
+        : '已切到转内网兜底：block 规则命中时转内网本地模型回答（内容不出境）');
+    } catch (e) { message.error(errText(e)); }
+    finally { setOnBlockLoading(false); }
+  };
   // rule target dropdowns: providers from routing.yaml, models proxied upstream
   const [providers, setProviders] = useState([]);
   const [modelOptions, setModelOptions] = useState([]);
@@ -379,12 +395,11 @@ export default function RulesPage() {
   const cols = [
     /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。原 scroll.x=1070 定宽
        在窄屏撑出横向滚动；fixed 布局下 % 才是真·定比（auto 布局 % 只是建议值） */
-    { title: '优先级', dataIndex: 'priority', width: '8%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
+    { title: '优先级', dataIndex: 'priority', width: '10%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
     { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
-    { title: '动作', dataIndex: 'action', width: '10%',
+    { title: '动作', dataIndex: 'action', width: '12%',
       render: (v) => <Tag color={v === 'block' ? 'red' : v === 'route_local' ? 'orange' : 'green'}>{v}</Tag> },
-    { title: '条件', dataIndex: 'when', width: '35%', ellipsis: true, render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{whenSummary(v)}</Text> },
-    { title: '说明', dataIndex: 'description', width: '12%', ellipsis: true },
+    { title: '说明', dataIndex: 'description', width: '43%', ellipsis: true },
     // 操作列要装下 编辑+删除 两个默认尺寸按钮 + 24/24 cell padding，
     // 150 会撑出 wrapper 右缘（2026-10 实测）
     { title: '操作', width: '20%',
@@ -408,6 +423,7 @@ export default function RulesPage() {
         </Space>
       }>
         <Table rowKey="name" className="tbl-l1" columns={cols} dataSource={items} loading={loading} size="small"
+          sticky={wideSticky()}
           tableLayout="fixed"
           pagination={{ pageSize: 50, showSizeChanger: false }}
           onChange={(_p, _f, sorter, extra) => {
@@ -416,11 +432,24 @@ export default function RulesPage() {
           }} />
       </Card>
 
+      <Card title="拦截模式 on_block" size="small" style={{ marginTop: 12 }}>
+        <Space align="center" wrap>
+          <Switch checked={onBlockMode === 'reject'} loading={onBlockLoading}
+            onChange={toggleOnBlock}
+            checkedChildren="reject（真实 403）" unCheckedChildren="fallback_local（转内网回答）" />
+          <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+            {onBlockMode === 'reject'
+              ? 'block 规则命中时客户端直接收到 403，密钥不送入任何模型上下文'
+              : 'block 规则命中时转内网本地模型回答（内容不出境，审计记 downgraded_from: block）'}
+          </Text>
+        </Space>
+      </Card>
+
       <L2RulesCard />
 
       <Card title="历史版本（每次保存前快照；回滚走校验+原子落盘）" style={{ marginTop: 12 }}>
         {versions.length ? (
-          <Table rowKey="id" size="small" pagination={false} tableLayout="fixed" dataSource={versions} columns={[
+          <Table rowKey="id" size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed" dataSource={versions} columns={[
             /* 列宽全 % + tableLayout=fixed；操作列两个链接按钮，14% 够放 */
             { title: '时间', dataIndex: 'ts', width: '16%' },
             { title: '预览', dataIndex: 'yaml_text', width: '70%', ellipsis: true },

@@ -133,12 +133,12 @@ docker-compose.yml / Dockerfile
 
 | priority | 规则 | 行为 |
 |---|---|---|
+| 3 | block_secrets | AKIA/PEM私钥/ghp_/sk-ant/sk-32hex/aws_secret -> block（压过全部 route_local；`on_block: fallback_local` 时降本地） |
 | 5 | pii_weighted_route_local | PII 加权评分 >= 60 -> 本地 |
 | 10 | financial_local_only | 表头/表名/文件名财务关键词 -> 本地 |
-| 12 | session_route_local / tainted_file_ref | 会话已判密 / 提及已判密文件名 -> 本地 |
+| 12 | session_route_local | 会话已判密 -> 本地 |
 | 13 | unparsed_binary_route_local | 解析不出的二进制 -> 本地（fail-closed） |
-| 20 | pii_critical_block | 正文命中 AKIA/PEM私钥/ghp_/sk-ant 正则 -> block |
-| 25 | block_secrets | AKIA/私钥 -> block（`on_block: fallback_local` 时降本地） |
+| 20 | tainted_file_ref | 提及已判密文件名 -> 本地 |
 | 30 | ocr_empty_image_route_local | OCR 空结果图片 -> 本地（fail-closed） |
 | 40 | drawing_local_only | 扩展名/水印/内容含"机密/图纸" -> 本地 |
 | 100 | default_allow | 放行外网 |

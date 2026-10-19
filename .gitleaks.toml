@@ -1,0 +1,16 @@
+# 发布门禁：gitleaks 掃描配置（sync_public.sh 步骤 3 调用）
+# allowlist 只放"已知假值"（精确匹配），任何其它密钥形状仍会告警。
+[allowlist]
+paths = [
+  '''\.pytest_cache/''',
+  '''__pycache__/''',
+  '''\.log(\.|$)''',
+]
+regexes = [
+  # AWS 官方文档示例 key（测试固件，非真实凭据）
+  '''AKIAIOSFODNN7EXAMPLE''',
+  # 测试套件自带假 token（conftest 注册的隔离 key，仅走 mock）
+  '''sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o''',
+  '''sk-test-1234''',
+  '''sk-ant-123456789''',
+]

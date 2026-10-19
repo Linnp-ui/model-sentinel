@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
 import { SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
 import { api, errText, fetchJson, copyText, usePoll } from '../api.js';
+import { wideSticky } from '../utils.js';
 
 const { Text } = Typography;
 import { ruleZh, RULE_ZH } from '../ruleNames.jsx';
@@ -125,7 +126,7 @@ export default function AuditPage() {
   const setFld = (k) => (e) => { const next = { ...f, [k]: e.target.value }; setF(next); writeUrl(next); };
 
   /* 列宽全 % + tableLayout=fixed：表跟随容器、列按比例分配，窄屏不再撑横向滚动。
-     内容摘要给 25% 定比（原 auto 弹性列靠内容顶宽，fixed 下必须有显式宽度） */
+     用户query 给 25% 定比（原 auto 弹性列靠内容顶宽，fixed 下必须有显式宽度） */
   const cols = [
     /* 时间/Provider 加 ellipsis 防溢出；cell-center 必需——theme.css 把 ellipsis 列强制
        左对齐，align:center 会被压掉（同模型/动作列） */
@@ -145,12 +146,12 @@ export default function AuditPage() {
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
     { title: '客户端 IP', dataIndex: 'client_ip', width: '9%', align: 'center', render: (v) => v || '—' },
     { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
-    { title: '内容摘要', dataIndex: 'text_preview', width: '25%',
+    { title: '用户query', dataIndex: 'text_preview', width: '25%',
       render: (v) => (
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
             title={v}>{v || '—'}</span>
-          {v && <Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制内容摘要"
+          {v && <Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制用户query"
             onClick={() => copyText(v)} />}
         </span>
       ) },
@@ -180,15 +181,16 @@ export default function AuditPage() {
           <Card>
             <Space wrap style={{ marginLeft: 16, columnGap: 60, rowGap: 12 }}>
               <Statistic data-testid="audit-stat-total" title="命中总数" value={data.kpi.total} />
-              <Statistic data-testid="audit-stat-allow" title="放行" value={data.kpi.c_allow} valueStyle={{ color: '#52c41a' }} />
-              <Statistic data-testid="audit-stat-route" title="本地路由" value={data.kpi.c_route} valueStyle={{ color: '#faad14' }} />
-              <Statistic data-testid="audit-stat-block" title="阻断" value={data.kpi.c_block} valueStyle={{ color: '#ff4d4f' }} />
+              <Statistic data-testid="audit-stat-allow" title="放行" value={data.kpi.c_allow} valueStyle={{ color: '#389e0d' }} />
+              <Statistic data-testid="audit-stat-route" title="本地路由" value={data.kpi.c_route} valueStyle={{ color: '#d46b08' }} />
+              <Statistic data-testid="audit-stat-block" title="阻断" value={data.kpi.c_block} valueStyle={{ color: '#cf1322' }} />
             </Space>
           </Card>
         </>
       )}
       <Card title="审计日志">
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
+        sticky={wideSticky()}
         tableLayout="fixed"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}
         expandable={{ expandedRowRender: (rec) => <L2Detail rec={rec} />,

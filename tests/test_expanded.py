@@ -347,6 +347,29 @@ def test_embeddings_route():
     assert r.json()["gateway"]["provider"] == "bge_m3"
     assert r.json()["gateway"]["local"] is True
 
+def test_embeddings_runs_review_text_and_l2(monkeypatch):
+    """2026-10-19 收口：embeddings 走 _review_text —— 灰区关键词进 L2（此前恒不跑 L2）。"""
+    from src.gateway import main as _main
+    called = {}
+
+    async def _fake(text, **kw):
+        called["text"] = text
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest"}
+
+    monkeypatch.setattr(_main, "small_classify", _fake)
+    monkeypatch.setattr(_main, "_wl_l2_skip", lambda request: False)
+    r = client.post("/v1/embeddings", headers=H, json={"input": ["工资表里的数据"]})
+    assert r.status_code == 200, r.text
+    assert called, "embeddings 未进 L2 灰区"
+    assert r.json()["gateway"]["action"] == "route_local"
+
+def test_embeddings_body_cap(monkeypatch):
+    """2026-10-19 收口：embeddings 与 chat 同一 body 上限（此前裸解析无上限）。"""
+    monkeypatch.setenv("AI_GATEWAY_MAX_BODY_BYTES", "2048")
+    r = client.post("/v1/embeddings", headers=H, json={"input": ["x" * 5000]})
+    assert r.status_code == 413
+    assert r.json()["detail"]["type"] == "body_too_large"
+
 def test_anthropic_messages():
     r = client.post("/v1/messages", headers=H, json={"model":"claude-sonnet-4-5","max_tokens":50,"messages":[{"role":"user","content":"总结CAP定理"}]})
     assert r.status_code == 200
@@ -475,11 +498,13 @@ def test_tools_description_is_reviewed_anthropic():
     assert r.status_code == 200
     assert r.json()["gateway"]["action"] == "route_local"
 
-def test_review_text_budget_keeps_tail(monkeypatch):
-    """F1：超预算只保留尾部——最新内容(PII)仍触发，被截掉的历史区才放行"""
+def test_review_text_budget_overflow_fails_safe(monkeypatch):
+    """M1（2026-10-19）：超预算不再静默丢头部——整条 fail-safe 转本地；尾部 PII 仍触发。"""
     monkeypatch.setenv("AI_GATEWAY_REVIEW_TEXT_BUDGET", "4000")
     from src.gateway.main import _cap_review_text
-    assert _cap_review_text("x" * 9000) == "x" * 4000
+    tail, over = _cap_review_text("x" * 9000)
+    assert tail == "x" * 4000 and over is True
+    assert _cap_review_text("x" * 4000) == ("x" * 4000, False)
     filler = lambda n: [{"type": "message", "role": "user", "content": "a" * 5000}] * n
     head_only = {"model": "AB-flash", "input": [
         {"type": "message", "role": "user",
@@ -489,10 +514,52 @@ def test_review_text_budget_keeps_tail(monkeypatch):
          "content": "员工张三 身份证 110101199001011237" + "a" * 5000}]}
     r_head = client.post("/v1/responses", headers=H, json=head_only)
     assert r_head.status_code == 200
-    assert r_head.json()["gateway"]["action"] == "allow", "头部 PII 应被预算截掉（尾部保留语义）"
+    assert r_head.json()["gateway"]["action"] == "route_local", "超预算必须整条转本地（不能静默丢头部）"
+    assert r_head.json()["gateway"]["policy_rule"] == "review_text_overflow"
     r_tail = client.post("/v1/responses", headers=H, json=tail_hit)
     assert r_tail.status_code == 200
     assert r_tail.json()["gateway"]["action"] == "route_local", "尾部 PII 必须仍触发"
+
+def test_files_check_scans_beyond_5000_chars():
+    """M3（2026-10-19）：file.text 不再切前 5000 字符——长前置垫片不能把机密挤出审查。"""
+    body = "正常项目说明。" * 1000 + "绝对机密 财务报表"
+    r = client.post("/v1/files/check", headers=H,
+                    files={"file": ("notes.txt", body.encode(), "text/plain")})
+    assert r.status_code == 200, r.text
+    assert r.json()["gateway"]["action"] == "route_local"
+
+def test_files_check_encoded_keyword_route_local():
+    """M2 同口径（2026-10-19）：base64 编码的机密文件，预检必须与出站判决一致
+    （encoded_keyword ⇒ route_local），不得误报「审查通过：可走外网」。"""
+    import base64
+    secret = "财务部预算与营收明细，机密，不得外传"
+    body = base64.b64encode(secret.encode())   # bytes 直接当文件内容
+    r = client.post("/v1/files/check", headers=H,
+                    files={"file": ("notes.txt", body, "text/plain")})
+    assert r.status_code == 200, r.text
+    gw = r.json()["gateway"]
+    assert gw["action"] == "route_local" and gw["policy_rule"] == "encoded_keyword", gw
+
+def test_route_inspect_encoded_keyword_route_local():
+    """route-inspect 干跑与线上门同口径：base64 编码关键词直接判 route_local。"""
+    import base64
+    secret = "财务部预算与营收明细，机密，不得外传"
+    blob = base64.b64encode(secret.encode()).decode()
+    r = client.post("/admin/api/route-inspect", json={"model": "AB-flash",
+                                                      "text": "看下（" + blob + "）"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["final_action"] == "route_local" and d["final_rule"] == "encoded_keyword", d
+
+def test_mentioned_file_regex_is_linear():
+    """2026-10-19：长无点单词串曾让 _mentioned_data_filename O(n²) 卡死事件循环（单请求 DoS）。"""
+    import time
+    from src.gateway.main import _mentioned_data_filename
+    t0 = time.perf_counter()
+    assert _mentioned_data_filename("a" * 512000) == ""
+    el = time.perf_counter() - t0
+    assert el < 0.5, f"512KB 无点串耗时 {el:.2f}s（非线性回溯）"
+    assert _mentioned_data_filename("请核对 工资表.xlsx 的合计") == "工资表.xlsx"
 
 def test_oversize_body_413_and_bad_json_400(monkeypatch):
     """F1：超 body 上限 413；坏 JSON 400（原为未捕获 500）"""
@@ -648,6 +715,22 @@ def test_route_inspect_bad_channel():
     r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "channel": "bogus",
         "files": [{"filename": "a.txt", "file_data": _b64_data_url("text/plain", b"hi")}]})
     assert r.status_code == 422
+
+
+def test_route_inspect_reports_uncovered_dims():
+    """干跑自报覆盖不到的维度：会话粘性/污染标记恒假（规则真写了也命不中），
+    纯文本还漏文件解析类；带了文件就不该再把 file.text 算没覆盖。"""
+    d = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "text": "你好"}).json()
+    assert "session.confidential" in d["uncovered"], d
+    assert "tainted_file.hit" in d["uncovered"], d
+    assert "file.text" in d["uncovered"], d          # 纯文本：没有文件字节
+
+    buf, _ = _xlsx("工资表", ["姓名", "工资"], [["张三", "30000"]])
+    d2 = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "channel": "check",
+        "files": [{"filename": "salary.xlsx",
+                   "file_data": _b64_data_url("application/octet-stream", buf.getvalue())}]}).json()
+    assert "file.text" not in d2["uncovered"], d2    # check 通道真解析了正文
+    assert "session.confidential" in d2["uncovered"], d2
 
 # ---------- 10. 鉴权收紧：仅登记表放行 ----------
 def test_auth_missing_key_401():

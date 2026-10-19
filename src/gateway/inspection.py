@@ -14,6 +14,7 @@ PATTERNS = {
     "bankcard": re.compile(r"(?<!\d)\d{16,19}(?!\d)"),
     "gh_token": re.compile(r"ghp_[A-Za-z0-9]{36,}"),
     "ant_api_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    "deepseek_key": re.compile(r"sk-[0-9a-fA-F]{32}"),  # 2026-10-19 红队：sk-32hex 曾只靠 policy 原文裸正则，零宽化即绕过
 }
 
 # PII severity weights - higher means more sensitive
@@ -22,6 +23,7 @@ PII_WEIGHTS = {
     "aws_key": 90,        # 云访问密钥
     "ant_api_key": 90,    # Anthropic/类 API
     "gh_token": 85,       # GitHub PAT
+    "deepseek_key": 90,   # DeepSeek/类 sk- 密钥（2026-10-19 红队补：此前无 PII 权重，零宽化绕过 policy 裸正则后直出外网）
     "idcard": 70,         # 身份证 - L3
     "phone": 60,          # 手机号单命中即转本地（与银行卡同档；2026-09-20 补：此前无此 pattern，裸号曾原文出境）
     "bankcard": 60,       # 银行卡 (Luhn valid)
@@ -134,8 +136,9 @@ _INVISIBLE_RE = re.compile(
 
 def _normalize_for_pii(text: str) -> str:
     """Return a PII-friendly copy: NFKC + strip invisible/formatting chars.
-    Used only for regex matching of PII patterns (idcard/phone/email/AWS key etc.).
-    Keyword scan still runs against the original text.
+    Used for regex matching of PII patterns (idcard/phone/email/AWS key etc.),
+    and as the base of the keyword compact copy (zero-width/full-width/space-split
+    all resolve after this pass). policy.py 的 text 视图也复用本函数。
     """
     if not text:
         return ""
@@ -156,6 +159,12 @@ def _strip_pii_separators(text: str) -> str:
     Only for digit-cluster patterns (idcard/bankcard). Applied AFTER NFKC+invisible strip.
     """
     return _PII_SEP_RE.sub("", text)
+
+
+# 关键词专用紧凑副本：NFKC+零宽剥离之后的 pii_text 再去掉全部空白（含 NFKC 归一后的
+# 全角空格）。2026-10-19 红队：「工\u200b资」「ｓａｌａｒｙ」「财 务 报 表」原文匹配全 miss
+# ⇒ risk 0 ⇒ 不进灰区直出外网。跨词边界拼接的误报只会多进灰区（误报可接受，漏报不可）。
+_KW_WS_RE = re.compile(r"\s+")
 
 
 # --- Red-team corpus fix (2026-09-08): encoding-obfuscated PII ---
@@ -296,20 +305,44 @@ def inspect_text(text: str) -> Dict:
                 _emit(name, val, m.start(), via)
 
     _scan_layer(pii_text, "raw")
-    for dec_text, via in _decode_layers(pii_text):
+    decoded = _decode_layers(pii_text)
+    for dec_text, via in decoded:
         _scan_layer(dec_text, via)
 
     keyword_hits: List[str] = []
+    encoded_kw_hits: List[str] = []   # 只在解码层出现、原文不可见的命中
     keyword_score = 0
-    for kw, w in KEYWORD_WEIGHTS.items():
-        if kw in (text or ""):
-            keyword_hits.append(kw)
-            keyword_score += w
-    # 规则跑归一化副本（零宽/全角绕过），与 PII 层同一份，见 _normalize_for_pii
-    for name, pat in RISK_RULES.items():
-        if pat.search(pii_text):
+    # 2026-10-19 红队：关键词层此前只跑原文，零宽/全角/空格拆分关键词（工\u200b资、
+    # ｓａｌａｒｙ、财 务 报 表）risk 归 0 不进灰区直出外网。补紧凑副本（NFKC+零宽剥离+
+    # 去全部空白）双跑；原文保留作兜底（NFKC 对 CJK 是 no-op，ASCII 全角→半角只增命中）。
+    # 2026-10-19 M2：解码层（base64/hex）此前只重扫 PII，整段无 PII 的机密文本编码后
+    # risk 归 0 直出外网 —— 关键词/RISK_RULES 对每个解码层同样双跑，同名跨层去重；
+    # 解码层独有的命中单列 encoded_keyword_hits（L2 看编码串判不了，由调用侧定夺）。
+    def _scan_keywords(layer_text: str, encoded: bool = False) -> None:
+        nonlocal keyword_score
+
+        def _hit(name: str, w: int) -> None:
+            nonlocal keyword_score
+            if name in keyword_hits:
+                return
             keyword_hits.append(name)
-            keyword_score += 20
+            keyword_score += w
+            if encoded:
+                encoded_kw_hits.append(name)
+
+        norm = _normalize_for_pii(layer_text or "")
+        compact = _KW_WS_RE.sub("", norm)
+        for kw, w in KEYWORD_WEIGHTS.items():
+            if kw in layer_text or kw in compact:
+                _hit(kw, w)
+        # 规则跑归一化副本（零宽/全角绕过）+ 紧凑副本（空格拆分），与关键词层同一口径
+        for name, pat in RISK_RULES.items():
+            if pat.search(norm) or pat.search(compact):
+                _hit(name, 20)
+
+    _scan_keywords(text or "")
+    for dec_text, _via in decoded:
+        _scan_keywords(dec_text, encoded=True)
 
     risk_score = min(200, weighted_count + keyword_score)
 
@@ -319,6 +352,7 @@ def inspect_text(text: str) -> Dict:
         "weighted_pii_score": weighted_count,
         "keyword_score": keyword_score,
         "keyword_hits": keyword_hits,
+        "encoded_keyword_hits": encoded_kw_hits,
         "by_type": by_type,
         "risk_score": risk_score,
     }

@@ -774,6 +774,43 @@ def list_providers_api():
     return {"providers": items, "api_modes": list(SUPPORTED_MODES)}
 
 
+class OnBlockModeReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: str = Field(pattern="^(fallback_local|reject)$")
+
+
+@router.get("/routing")
+def get_routing_api():
+    """routing.yaml 的 routing 段（on_block 等），供管理台显示/切换拦截模式。"""
+    from src.gateway import providers as _pv
+    raw = _pv.load_raw()
+    r = raw.get("routing") if isinstance(raw.get("routing"), dict) else {}
+    return {"routing": {
+        "default_external": r.get("default_external"),
+        "default_local": r.get("default_local"),
+        "default_embedding": r.get("default_embedding"),
+        "on_block": r.get("on_block", "fallback_local"),
+        "on_missing_key": r.get("on_missing_key"),
+    }}
+
+
+@router.put("/routing/on-block")
+def set_on_block_api(body: OnBlockModeReq):
+    """切换 on_block：fallback_local（block 降本地，UX 好）↔ reject（block 真 403）。
+    原子写 routing.yaml + mtime 热重载；无版本快照表（routing 无 admin_store 版本），靠 git 回滚。"""
+    from src.gateway import providers as _pv
+    import yaml as _y
+    raw = _pv.load_raw()
+    raw.setdefault("routing", {})["on_block"] = body.mode
+    p = _pv._routing_path()
+    text = _y.safe_dump(raw, allow_unicode=True, sort_keys=False)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
+    _pv.invalidate_cache()
+    return {"ok": True, "mode": body.mode}
+
+
 class ProviderUpsertReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     base_url: str = Field(min_length=4, max_length=512)
@@ -1946,8 +1983,44 @@ class RouteInspectReq(BaseModel):
     files: List[RouteInspectFile] = Field(default=[])
 
 
+def _route_inspect_blind_fields(policies, has_files: bool, channel: str) -> List[str]:
+    """本次干跑无法生效的规则维度（只回「当前策略真的用到了」的那些）。
+
+    干跑不产生请求侧上下文：会话粘性/污染标记恒假，model/client/hour 不进 ctx；
+    file.watermark 任何通道都不填；check 通道 file.ext 恒空。规则若写了这些条件，
+    在这里必然不命中——必须明说，否则会被读成「规则写错了/没生效」。
+    """
+    from src.gateway.policy_admin import _COND_RE
+    refs: set = set()
+
+    def walk(w) -> None:
+        if not isinstance(w, dict):
+            return
+        for k, v in w.items():
+            if k in ("any", "all") and isinstance(v, list):
+                for c in v:
+                    walk(c)
+            else:
+                m = _COND_RE.fullmatch(str(k).strip())
+                if m:
+                    refs.add(m.group("field"))
+
+    for p in policies:
+        walk(p.get("when") if hasattr(p, "get") else getattr(p, "when", None))
+    blind = {"session.confidential", "tainted_file.hit", "model", "client.key",
+             "time.hour", "file.watermark"}
+    if not has_files:
+        # 纯文本干跑没有文件字节：文件解析类维度全空
+        blind |= {"file.sheet_names", "file.headers", "file.ext", "file.text",
+                  "findings.unparsed_binary", "findings.parse_failed",
+                  "findings.ocr_empty_and_image"}
+    elif channel == "check":
+        blind.add("file.ext")
+    return sorted(refs & blind)
+
+
 def _route_inspect_finish(decision, l1_out, l2_out, files_out, channel, model, _rt, provider_keys,
-                          shadow=None):
+                          shadow=None, uncovered=None):
     """route-inspect 收口：resolve 去向 + 统一响应（含 files/channel/shadow 归因）。"""
     try:
         prov, _model, notes = _rt.resolve(decision, {"model": model or ""}, None, kind="chat")
@@ -1975,6 +2048,7 @@ def _route_inspect_finish(decision, l1_out, l2_out, files_out, channel, model, _
         "routing": rout,
         "channel": channel,
         "files": files_out,
+        "uncovered": uncovered or [],
     }
 
 
@@ -2025,6 +2099,8 @@ async def route_inspect_api(body: RouteInspectReq):
     if not (body.text or "").strip() and not (body.model or "").strip() and not files:
         raise HTTPException(422, "text 或 model 或 files 至少填一个")
     text = body.text or ""
+    # 本次干跑覆盖不到的规则维度（只列当前策略真用到的），随响应回给 UI
+    uncovered = _route_inspect_blind_fields(_pol.load_policy(), bool(files), channel)
 
     def _dec(s: str):
         """data-URL/裸 base64 → bytes；None=没传；b""=解码失败。"""
@@ -2089,7 +2165,7 @@ async def route_inspect_api(body: RouteInspectReq):
         findings.update(extra_findings)
         ctx = {"text": merged,
                "file": {"ext": "", "filename": " ".join(fnames), "headers": hdrs,
-                        "sheet_names": sheets, "text": ftext[:5000],
+                        "sheet_names": sheets, "text": ftext,
                         "watermark": "", "size": size},
                "findings": findings, "session": {"confidential": False}}
         ctx["file"]["findings_text"] = str(extra_findings)
@@ -2163,11 +2239,14 @@ async def route_inspect_api(body: RouteInspectReq):
         _fn = " ".join((f.filename or "").strip() for f in files if (f.filename or "").strip())
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel or "text",
                                      body.model, _rt, provider_keys,
-                                     shadow=await _shadow_of(text, _fn))
+                                     shadow=await _shadow_of(text, _fn), uncovered=uncovered)
 
     if channel == "check" and files:
         # ctx/findings 已在上分支建成（含文件合并）；文件式 L2（files/check 同款：allow 即审，分块聚合）
         l1 = _pol.decide(_pol.load_policy(), ctx)
+        _enc = _m._encoded_keyword_decision(findings)
+        if _enc and l1.get("action") == "allow":
+            l1 = _enc
         l1_out = {
             "rule": l1.get("name"),
             "action": l1.get("action"),
@@ -2224,13 +2303,17 @@ async def route_inspect_api(body: RouteInspectReq):
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel,
                                      body.model, _rt, provider_keys,
                                      shadow=await _shadow_of(
-                                         text, (file_l2 or {}).get("filename", "")))
+                                         text, (file_l2 or {}).get("filename", "")),
+                                     uncovered=uncovered)
 
     # 纯文本旧逻辑（零改动）
     findings = _insp.inspect_text(text) if text else {}
     ctx = {"text": text, "file": {}, "findings": findings,
            "session": {"confidential": False}}
     l1 = _pol.decide(_pol.load_policy(), ctx)
+    _enc = _m._encoded_keyword_decision(findings)
+    if _enc and l1.get("action") == "allow":
+        l1 = _enc
     l1_out = {
         "rule": l1.get("name"),
         "action": l1.get("action"),
@@ -2262,7 +2345,7 @@ async def route_inspect_api(body: RouteInspectReq):
 
     return _route_inspect_finish(decision, l1_out, l2_out, [], "text",
                                  body.model, _rt, provider_keys,
-                                 shadow=await _shadow_of(text))
+                                 shadow=await _shadow_of(text), uncovered=uncovered)
 
 
 class ProviderCheckReq(BaseModel):
