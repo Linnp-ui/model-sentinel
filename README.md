@@ -43,6 +43,8 @@
   切换影子权重；管理台 L2 页含影子趋势/分歧标注/导出；`scripts/l2_check.py` 一条命令体检候选版本
 - **会话级机密粘性**：`X-Session-ID` 下文件/内联图命中机密后，同会话后续请求强制本地
 - **协议桥**：OpenAI chat / Anthropic Messages / OpenAI Responses 互转，推理流（reasoning）透传
+- **HTTPS + 内网 CA**：uvicorn 直结 TLS（自签内网 CA），`/ca.crt` `/ca.crl` 提供证书与吊销列表下载，
+  客户端一次性装 CA 即免浏览器告警（见 `docs/https-cert-install.md`）
 - **运维**：三态熔断（provider + prov::model 两级）、令牌桶限流（客户端级 + **模型级全局 RPM**：
   `model_policy.model_limits`，按最终路由到的模型计，别名/前缀重写不逃限，超限 429）、
   外发域名/路径白名单（`AI_GATEWAY_STRICT_EGRESS`）、24h 指标环 + Prometheus `/admin/metrics`
@@ -86,14 +88,14 @@ curl -s http://localhost:8080/v1/chat/completions -H "Authorization: Bearer <你
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"总结CAP定理"}]}'
 # -> "gateway":{"action":"allow","policy_rule":"default_allow"}
 
-# 财务表格 -> route_local 内网
+# 财务表格 -> route_local 内网（自备一张含 姓名/身份证号/工资 列的 xlsx）
 curl -s http://localhost:8080/v1/files/check -H "Authorization: Bearer <你的key>" \
-  -F "file=@demo/salary_2024.xlsx"
+  -F "file=@/path/to/工资表.xlsx"
 # -> "action":"route_local","policy_rule":"financial_local_only"
 
-# 图纸 PDF -> route_local（先生成示例：python demo/generate_samples.py）
+# 图纸 PDF -> route_local（tests/fixtures 里有现成样例）
 curl -s http://localhost:8080/v1/files/check -H "Authorization: Bearer <你的key>" \
-  -F "file=@demo/drawing_A01.pdf"
+  -F "file=@tests/fixtures/drawing_confidential.pdf"
 ```
 
 ## 测试
@@ -116,8 +118,7 @@ src/gateway/       网关主服务（main/policy/routing/inspection/file_inspect
 tests/             pytest 套件（零出境隔离，fixtures/ 含图纸 PDF 与安全测试集 jsonl）
 static/            管理台前端构建产物（/admin 直服，须与 web/admin 同提交）
 web/admin/         管理台前端源码（React+antd+uPlot，npm run build 输出到 static/admin）
-demo/              示例财务表格/图纸的生成脚本与样例文件
-docs/              用户说明书 / 管理台操作手册
+docs/              用户说明书 / 管理台操作手册 / 内网 CA 安装说明（docs/https-cert-install.md）
 agents/            分层运维文档（部署 / vLLM 主机 / 策略路由 / env / 坑位记录）
 scripts/           内网 vLLM/Laya systemd 模板、L2 数据集/微调/评估（OOD/留出）、
                    候选体检 l2_check.py、标注挖掘 mine_audit_labels.py、影子轮次 shadow_pulse.py、灰区灌数

@@ -2,59 +2,86 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip, Spin } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
-import { bj, avg, wideSticky } from './utils.js';
+import { bj, avg } from './utils.js';
+import { ACTION_INFO, RuleZh } from './ruleNames.jsx';
+import { Tip } from './terms.jsx';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './components/DailyHeatmap.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
 import { SuggestionCard } from './components/KeyRulesPage.jsx';
-import WheelGate from './components/WheelGate.jsx';
 
 // ---------------- 降级事件流：流式降级 / 本地路由 / L2 不可用（数据源 audit_logs） ----------------
+// Tag 用 antd 预设色名（浅底深字，AA 达标）；计数文字用语义色变量（深浅各自达标）——
+// 原先直接用裸 hex（#faad14 等），浅底上只有 1.9:1，且 Tag 是实底白字 2.4:1。
 const EV_META = [
-  ['degrade', '流式降级', '#ff4d4f'],
-  ['route_local', '本地路由', '#fa8c16'],
-  ['l2_unavailable', 'L2 不可用', '#faad14'],
+  ['degrade', '流式降级', 'red', 'var(--gw-red-text)', 'degrade'],
+  ['route_local', '本地路由', 'orange', 'var(--gw-orange-text)', 'route_local'],
+  ['l2_unavailable', 'L2 不可用', 'gold', 'var(--gw-orange-text)', 'l2_unavailable'],
 ];
 
-function EventStreamCard({ events }) {
-  // 三计数（金丝雀：今天外发链路/安全降级正不正常）+ 明细表（预筛的最近事件）。
+// 概览只留最近 5 条：明细在审计页看（点上方「本地路由率」卡片跳过去）
+const EV_RECENT_MAX = 5;
+
+function EventStreamCard({ events, go }) {
+  // 三计数（金丝雀：今天外发链路/安全降级正不正常）+ 最近几条事件。
   // 时间线散点已删：~5 条/天频率下近乎恒空，信息量≈0，表格已能看时间分布（2026-10-12 拍板）
+  // 明细表只列最近 5 条：概览页是"看一眼"的地方，逐条排查走审计页（2026-10-21 拍板）
   const s = events.summary || {};
+  const recent = (events.recent || []).slice(0, EV_RECENT_MAX);
+  // 跳转入口放卡片 extra（同「Provider 管理 →」link 按钮），目标与「本地路由率」卡一致：
+  // 降级三类事件落库 action 基本都是 route_local
+  const nav = () => { window.location.hash = go; };
   const cols = [
     /* 列宽用 % 自适应（灌数轮次表口径）；时间为纯文本，窄列溢出需 ellipsis 裁切 */
-    { title: '时间 (北京时间)', dataIndex: 'ts', width: '16%', ellipsis: true, render: (v) => bj(v) },
-    { title: '事件', dataIndex: 'kinds', width: '20%',
-      render: (ks) => (ks || []).map((k) => {
-        const m = EV_META.find(([id]) => id === k);
-        return <Tag key={k} color={m ? m[2] : 'default'} style={{ marginInlineEnd: 4 }}>{m ? m[1] : k}</Tag>;
-      }) },
-    { title: '明细', width: '22%',
-      render: (_, r) => (
-        <Tooltip title={`${r.rule || '-'} / ${r.downgraded_from || '-'} / ${r.provider || '-'}${r.model ? ':' + r.model : ''}`}>
-          <span>{[r.downgraded_from, r.rule].filter(Boolean).join(' · ') || '-'}</span>
-        </Tooltip>
-      ) },
-    { title: '内容', dataIndex: 'text_preview', width: '42%', ellipsis: true },
+    { title: '时间', dataIndex: 'ts', width: '16%', ellipsis: true, render: (v) => bj(v),
+      align: 'center', className: 'cell-center' },
+    /* 与审计页同款「动作 / 规则」列：Tag 底色按 action、文字是规则名；
+       降级来源/模型（原「明细」列内容）收进 title，不再单占一列 */
+    { title: '动作 / 规则', width: '22%', align: 'center', ellipsis: true, className: 'cell-center',
+      render: (_, r) => {
+        const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
+        const extra = [r.downgraded_from ? `降级来源：${r.downgraded_from}` : '',
+          r.provider ? (r.model ? `${r.provider}:${r.model}` : r.provider) : ''].filter(Boolean).join('｜');
+        return (
+          <Tag color={color}
+            title={`动作：${name}｜规则：${r.rule || '—'}${extra ? '｜' + extra : ''}`}
+            style={{ marginInlineEnd: 0 }}>
+            {r.rule ? <RuleZh name={r.rule} /> : name}
+          </Tag>
+        );
+      } },
+    { title: '用户query', dataIndex: 'text_preview', width: '62%', ellipsis: true,
+      align: 'center', className: 'cell-center' },
   ];
   return (
-    <Card title="降级事件流"
+    <Card
+      title={<>降级事件流<Tip text="降级 = 请求没有按原样出去，而是换了条路：转内网回答、或由本地兜底。这里的三条就是常见的三种降级原因。" /></>}
       extra={
-        <Space size="large">
-          {EV_META.map(([id, label, color]) => (
-            <span key={id}><Typography.Text style={{ color, fontWeight: 600 }}>{s[id] ?? 0}</Typography.Text>
-              <Typography.Text type="secondary"> {label}</Typography.Text></span>
-          ))}
+        <Space>
+          <Space size="large">
+            {EV_META.map(([id, label, , textColor, term]) => (
+              <span key={id}><Typography.Text style={{ color: textColor, fontWeight: 600 }}>{s[id] ?? 0}</Typography.Text>
+                <Typography.Text type="secondary"> {label}</Typography.Text><Tip term={term} /></span>
+            ))}
+          </Space>
+          {/* 跳转入口与「Provider 健康检查」卡的「Provider 管理 →」同款：link 按钮放 extra */}
+          <Tooltip title="跳审计页：降级事件明细（本地路由 / 流式降级 / L2 不可用，同一时间窗）">
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={nav}>审计明细 →</Button>
+          </Tooltip>
         </Space>
       }>
-      {/* 明细表是总览页唯一嵌套滚动容器：滚轮让位页面（表仍可拖细滚动条翻），见 WheelGate */}
-      <WheelGate>
-      {(events.recent || []).length === 0 ? (
+      {/* 只列最近 5 条（EV_RECENT_MAX），不需要嵌套滚动容器 */}
+      {recent.length === 0 ? (
         <Alert type="success" showIcon message="本窗口无降级事件（外发链路全绿：无流式降级、无本地路由、L2 正常）" />
       ) : (
-        <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" sticky={wideSticky()} tableLayout="fixed" columns={cols} dataSource={events.recent}
-          pagination={false} scroll={{ y: 300 }} />
+        <>
+          <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" tableLayout="fixed" columns={cols} dataSource={recent}
+            pagination={false} />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            本时间窗内最近 {recent.length} 条（最多 {EV_RECENT_MAX} 条）；逐条明细点右上「审计明细 →」进审计页
+          </Typography.Text>
+        </>
       )}
-      </WheelGate>
     </Card>
   );
 }
@@ -68,11 +95,16 @@ const { Text: T } = Typography;
 
 // KPI tile：固定 104px 等高（不带 Card head，避免 56px head 撑出参差）
 function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {
+  const nav = () => { window.location.hash = go; };
   const card = (
-    <Card data-testid={testid} hoverable={!!go} onClick={go ? () => { window.location.hash = go; } : undefined}
+    <Card data-testid={testid} hoverable={!!go}
+      role={go ? 'link' : undefined} tabIndex={go ? 0 : undefined}
+      aria-label={go ? `${title}，跳详情` : undefined}
+      onClick={go ? nav : undefined}
+      onKeyDown={go ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); nav(); } } : undefined}
       style={{ borderLeft: `3px solid ${bar ?? color ?? '#e2e4ea'}`, cursor: go ? 'pointer' : 'default' }}
       styles={{ body: { height: 96, padding: '12px 16px', display: 'flex', flexDirection: 'column' } }}>
-      <T type="secondary" style={{ fontSize: 14, height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 4, fontSize: 20, lineHeight: 1, position: 'relative', top: -1, color: '#1677ff' }}>→</span>}</T>
+      <T type="secondary" style={{ fontSize: 14, height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 4, fontSize: 20, lineHeight: 1, position: 'relative', top: -1, color: 'var(--gw-primary)' }}>→</span>}</T>
       {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看 */}
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
         <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
@@ -84,9 +116,13 @@ function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {
   return go ? <Tooltip title={hint}>{card}</Tooltip> : card;
 }
 
-function ChartPanel({ title, go, children }) {
+function ChartPanel({ title, go, children, fill }) {
   return (
-    <Card title={title} style={{ height: '100%' }} extra={go ? (
+    <Card title={title}
+      style={fill ? { height: '100%', display: 'flex', flexDirection: 'column' } : { height: '100%' }}
+      // fill：卡片体变成纵向 flex，内容（热力图）才能拉满卡高
+      styles={fill ? { body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } } : undefined}
+      extra={go ? (
       <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>) : null}>
       {children}
     </Card>
@@ -180,6 +216,10 @@ export default function OverviewPage() {
   ] : [];
   const errColor = d && d.err != null
     ? (d.err >= 0.05 ? '#cf1322' : d.err > 0 ? '#d46b08' : '#389e0d') : undefined;
+  // 跳审计页带上与总览一致的时间窗（同一 RANGES 表 → since 参数），否则明细口径与卡片数字对不上
+  const range = RANGES.find((r) => r.hours === hours);
+  const since = range ? range.since : '';
+  const rangeLabel = range ? range.label : `最近 ${hours} 小时`;
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
@@ -192,6 +232,7 @@ export default function OverviewPage() {
               <li>先在「API KEY 管理」登记客户端 KEY —— 未登记的 key 调 /v1/* 直接 401</li>
               <li>快速验证：「路由检查」页干跑（文本 / 文件都支持，不落审计），或 README 的三行 curl</li>
               <li>改规则 / 路由后先到「路由检查」页干跑验证（生产同款决策链，不产生真实流量）</li>
+              <li>看不懂的词？鼠标悬停标题旁的 <span style={{ color: 'var(--gw-faint)' }}>ⓘ</span> 看白话解释（L1/L2、provider、熔断、影子…）</li>
             </ul>
           }
           onClose={() => setGuideSessionHidden(true)} />
@@ -208,30 +249,30 @@ export default function OverviewPage() {
       <Spin spinning={loading}>
       <Row gutter={[16, 16]}>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-qps" title="当前 QPS" bar="#1677ff"
+          <Kpi testid="ov-qps" title={<>当前 QPS<Tip term="qps" /></>} bar="#1677ff"
             value={d && d.qps != null ? d.qps.toFixed(1) : '-'} suffix="req/s"
             go="/stats" hint="跳统计页：QPS 趋势 / 分位延迟 / 运行指标" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-err" title="错误率 5xx+429（近10tick）"
+          <Kpi testid="ov-err" title={<>错误率 5xx+429（近10tick）<Tip text="5xx = 网关或上游自己出错；429 = 请求太密集被限流。取最近 10 个采样点（约几分钟）的平均值。" /></>}
             value={d && d.err != null ? (d.err * 100).toFixed(1) + '%' : '-'}
             color={errColor} bar="#722ed1" go="/stats"
             hint="跳统计页：错误率趋势（5xx+429 近 10 tick 口径）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-block" title="拦截率"
+          <Kpi testid="ov-block" title={<>拦截率<Tip term="block" /></>}
             value={d && d.total > 0 ? (100 * d.blocked / d.total).toFixed(1) + '%' : '-'}
             color="#cf1322"
-            go="/audit?action=block" hint="跳审计页：拦截明细（动作=block）" />
+            go={`/audit?action=block&since=${since}`} hint={`跳审计页：拦截明细（动作=block，${rangeLabel}）`} />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-route" title="本地路由率"
+          <Kpi testid="ov-route" title={<>本地路由率<Tip term="route_local" /></>}
             value={d && d.total > 0 ? (100 * d.routeLocal / d.total).toFixed(1) + '%' : d ? '0.0%' : '-'}
             color={d && d.routeLocal > 0 ? '#d46b08' : undefined}
-            go="/audit?action=route_local" hint="跳审计页：本地路由明细（机密内容降级，不出境）" />
+            go={`/audit?action=route_local&since=${since}`} hint={`跳审计页：本地路由明细（机密内容降级，不出境，${rangeLabel}）`} />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-tokens" title="Token 用量" bar="#13c2c2"
+          <Kpi testid="ov-tokens" title={<>Token 用量<Tip term="token" /></>} bar="#13c2c2"
             value={d && d.tokens ? d.tokens.toLocaleString() : '-'} go="/stats?focus=billing"
             hint="跳统计页并定位：Token 计费（KEY × 金额 / 每日金额）" />
         </Col>
@@ -240,7 +281,7 @@ export default function OverviewPage() {
       <Spin spinning={loading}>
       <Row gutter={[16, 16]}>
         <Col span={12} style={{ minWidth: 0 }}>
-          <ChartPanel title="QPS">
+          <ChartPanel title={<>QPS<Tip term="qps" /></>} fill>
             {qpsEmpty ? (
               <Alert type="info" showIcon message={qpsEmpty} />
             ) : hours <= 24 ? (
@@ -250,13 +291,13 @@ export default function OverviewPage() {
                 <T type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 8 }}>
                   窗口 {winCalls} 次调用 · {(ch.ts || []).length} 桶仅 {nzBuckets} 桶有流量 → 日粒度（北京时区）
                 </T>
-                <DailyHeatmap points={dailyCounts} testid="ov-qps-daily" />
+                <DailyHeatmap points={dailyCounts} testid="ov-qps-daily" fill />
               </>
             )}
           </ChartPanel>
         </Col>
         <Col span={12} style={{ minWidth: 0 }}>
-          <ChartPanel title="网关延迟分位 P50/P95/P99">
+          <ChartPanel title={<>网关延迟分位<Tip term="p95" /></>}>
             {latEmpty ? (
               <Alert type="info" showIcon message={latEmpty} />
             ) : (
@@ -274,7 +315,9 @@ export default function OverviewPage() {
       </Spin>
       {d.events && (
         <Spin spinning={loading}>
-        <EventStreamCard events={d.events} />
+        {/* 跳转目标与「本地路由率」KPI 卡一致：降级三类事件（流式降级/本地路由/L2 不可用）
+            落库 action 基本都是 route_local，审计页同一筛选即可见 */}
+        <EventStreamCard events={d.events} go={`/audit?action=route_local&since=${since}`} />
         </Spin>
       )}
       <Row gutter={[16, 16]}>

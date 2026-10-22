@@ -123,7 +123,14 @@ class RoutingConfig:
     def get(self, name: str | None) -> Provider | None:
         if not name:
             return None
-        return self.providers.get(name)
+        p = self.providers.get(name)
+        if p is None:
+            # provider 名大小写不敏感：routing.yaml 用小写键（deepseek/vllm_local），
+            # 别名组成员常是展示名（Deepseek/Vllm_Local）——查不到就成运行期 503
+            # unknown provider（2026-10-21 线上事故根因）。
+            p = next((v for k, v in self.providers.items()
+                      if k.lower() == str(name).lower()), None)
+        return p
 
     def local_provider(self) -> Provider | None:
         return self.get(self.default_local) or self._first(local=True, kind="chat")
@@ -156,7 +163,7 @@ def _builtin_providers() -> Dict[str, Provider]:
             name="vllm_local",
             base_url=os.getenv("OLLAMA_BASE_URL", "http://10.0.0.10:8000/v1"),
             api_key_env="OLLAMA_API_KEY",
-            default_model="Qwen3.8-AB",
+            default_model="qwen2.5:7b",
             local=True,
             timeout=120,
         ),

@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>网关管理控制台</title>
+    <script>
+      // 主题首屏前置：<html data-theme> 必须在首帧前定好（React 挂载前），
+      // 否则深色用户会闪一下白底。口径与 src/theme.jsx 一致（gw-theme：system/light/dark）。
+      (function () {
+        var m = 'system';
+        try { m = localStorage.getItem('gw-theme') || 'system'; } catch (e) { /* 隐私模式读不了 */ }
+        var dark = m === 'dark'
+          || (m === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

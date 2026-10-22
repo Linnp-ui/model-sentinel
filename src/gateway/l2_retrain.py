@@ -346,6 +346,92 @@ async def _call_qwen_free(system: str, user: str) -> str:
     return resp.json()["choices"][0]["message"]["content"] or ""
 
 
+# ---------------- 分歧样本：内网模型自动标注（只出草稿，写库仍走人工 /label） ----------------
+# l2_labels 是训练 ground truth（build_laya_dataset 里人标最高优先级），所以模型判断
+# 只作为「建议」返回给页面：人工点「采纳」才写库。模型判错直接落库 = 往后每版都带毒。
+AUTO_LABEL_SYSTEM = (
+    "你是数据安全分级审核员。判断给定待审文本是否包含公司机密或敏感信息"
+    "（财务报表、薪酬人事、客户名单、密钥凭据、并购合同、未公开经营数据等）。"
+    "只输出一行 JSON，不要任何解释："
+    '{"label": 1, "confidence": 0.9, "reason": "不超过20字"}。'
+    "label=1 表示机密（禁止出境），label=0 表示普通内容。"
+)
+
+
+async def _auto_label_one(client, url: str, model: str, headers: dict, item: dict) -> dict:
+    text = (item.get("text") or "").strip()
+    fn = (item.get("filename") or "").strip()
+    user = (f"文件名：{fn}\n\n{text}" if fn else text)[:4000]
+    resp = await client.post(url, headers=headers, timeout=90.0, json={
+        "model": model,
+        "messages": [{"role": "system", "content": AUTO_LABEL_SYSTEM},
+                     {"role": "user", "content": user}],
+        "temperature": 0.0,
+        "max_tokens": 300,
+        # Qwen3 系（vllm_local/qwen2.5:7b）默认开思考：思考把 token 预算吃光后 content 是
+        # 空串（实测 finish=length、completion=200、content=''），整行判不出标签。关思考直出 JSON。
+        # 模板不认这个 kwarg 的模型会忽略它，无副作用。
+        "chat_template_kwargs": {"enable_thinking": False},
+    })
+    resp.raise_for_status()
+    choice = resp.json()["choices"][0]
+    raw = choice["message"]["content"] or ""
+    # raw_decode 取第一个完整 JSON 对象：模型常在 JSON 后补说明文字，贪婪正则会把尾随文字一起吞进来
+    obj: dict = {}
+    i = raw.find("{")
+    if i >= 0:
+        try:
+            obj = json.JSONDecoder().raw_decode(raw[i:])[0]
+        except json.JSONDecodeError:
+            obj = {}
+    if obj.get("label") is None:
+        # 模型偶发吐畸形前缀（实测 '{"label":  "label": 0, ...}'）——整段解不动时按字段正则兜底
+        m = re.search(r'"label"\s*:\s*"?([01])"?', raw)
+        if m:
+            c = re.search(r'"confidence"\s*:\s*([0-9.]+)', raw)
+            r = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+            obj = {"label": m.group(1), "confidence": c.group(1) if c else 0,
+                   "reason": r.group(1) if r else ""}
+    try:
+        label = int(obj.get("label"))
+    except (TypeError, ValueError):
+        label = None
+    out = {"req_id": item["req_id"],
+           "label": label if label in (0, 1) else None,
+           "confidence": round(float(obj.get("confidence") or 0), 3),
+           "reason": str(obj.get("reason") or "")[:60]}
+    if out["label"] is None:
+        out["error"] = (f"模型输出无法解析（finish={choice.get('finish_reason')}，"
+                        f"content={len(raw)} 字）")
+    return out
+
+
+def auto_label(items: list[dict], provider, concurrency: int = 4) -> list[dict]:
+    """并发打内网 chat 模型给分歧样本出标注草稿（**不写 l2_labels**）。
+    单条失败只记 error，不让整批失败；返回顺序与入参一致。"""
+    import asyncio as _aio
+    import httpx
+
+    url = provider.endpoint("chat")
+    if not url:
+        raise RuntimeError(f"provider {provider.name} 缺 base_url")
+    headers = provider.headers()
+    model = provider.model_for("chat") or provider.name
+
+    async def run():
+        sem = _aio.Semaphore(concurrency)
+        async with httpx.AsyncClient() as client:
+            async def one(it):
+                async with sem:
+                    try:
+                        return await _auto_label_one(client, url, model, headers, it)
+                    except Exception as e:  # 单条超时/解析失败不影响其余
+                        return {"req_id": it["req_id"], "error": repr(e)[:120]}
+            return await _aio.gather(*[one(i) for i in items])
+
+    return _aio.run(run())
+
+
 def latest_prompt_fix() -> dict:
     """最近一次候选 prompt 修补：盘上持久化，重启/切页不丢。无记录返回 {}。"""
     try:

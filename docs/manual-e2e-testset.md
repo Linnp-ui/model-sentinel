@@ -8,11 +8,11 @@
 
 | 项 | 值 |
 |---|---|
-| 网关地址 | `http://10.0.0.10:8080` |
-| codex `Base URL` | `http://10.0.0.10:8080/v1`（`wire_api=responses` 或 `chat` 都行） |
-| workbuddy `base_url` | `http://10.0.0.10:8080/v1` |
+| 网关地址 | `https://10.0.0.10:8080` |
+| codex `Base URL` | `https://10.0.0.10:8080/v1`（`wire_api=responses` 或 `chat` 都行） |
+| workbuddy `base_url` | `https://10.0.0.10:8080/v1` |
 | API Key | 用管理台登记过的 key（`.env` 的 `AI_GATEWAY_DEV_API_KEY` 亦可，未登记 key 直接 401） |
-| 模型名 | `ext-flash`（默认外网 deepseek）/ `ext-pro` / `local-model` |
+| 模型名 | `AB-flash`（默认外网 deepseek）/ `AB-pro` / `local-model` |
 
 **关键：怎么判断走没走本地**（客户端界面上看不出来，必须查审计）：
 
@@ -114,14 +114,14 @@
 
 ## 11. 文件附件（两个客户端都试）
 
-路径都在仓库根目录。workbuddy 走「上传文件 + 一句话提问」，codex 用 `@文件` 或 `input_file`。
+路径除 11.5 外均为自备样例（`demo/` 样本目录已移除，重建见 git 历史）。
 
 | # | 文件 | 提问 | 期望 | 实际 |
 |---|---|---|---|---|
-| 11.1 | `demo/salary_2024.xlsx` | 这个表里研发部平均工资多少 | `route_local` / `financial_local_only`（L1，纯关键词） | |
-| 11.2 | `demo/complex_financial.xlsx` | 汇总一下各 sheet 的关键信息 | `route_local` / `pii_weighted_route_local` | |
-| 11.3 | `demo/complex_drawing.pdf` | 复核这张图的配筋 | `route_local` / `drawing_local_only` | |
-| 11.4 | `demo/扫描件_机密_拦截测试.pdf` | 这份扫描件写了什么 | `route_local` / `pii_weighted_route_local`（走 OCR） | |
+| 11.1 | 自备 `salary_2024.xlsx`（含 姓名/身份证号/工资 列） | 这个表里研发部平均工资多少 | `route_local` / `financial_local_only`（L1，纯关键词） | |
+| 11.2 | 自备多 sheet 财务 `complex_financial.xlsx` | 汇总一下各 sheet 的关键信息 | `route_local` / `pii_weighted_route_local` | |
+| 11.3 | 自备图纸 `complex_drawing.pdf`（含「机密」水印） | 复核这张图的配筋 | `route_local` / `drawing_local_only` | |
+| 11.4 | 自备图片型扫描件 `扫描件_机密_拦截测试.pdf` | 这份扫描件写了什么 | `route_local` / `pii_weighted_route_local`（走 OCR） | |
 | 11.5 | `tests/fixtures/drawing_normal.pdf` | 这张图的标题是什么 | `allow` / `default_allow` → 走外网 | |
 
 补充检查（两条已实测）：

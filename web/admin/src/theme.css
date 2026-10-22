@@ -1,10 +1,55 @@
 html { scrollbar-gutter: stable; }
 body.ant-scrolling-effect { width: auto !important; }
 
+/* ---------------- 表面色 token（深浅两套，<html data-theme> 切换） ----------------
+   浅色下 antd 走默认算法、深色走 darkAlgorithm（theme.jsx），但页面里仍有
+   「自己写死的表面/文字色」（卡片底、分隔线、条形轨道、轴文字…）——这些在深色下
+   不可读，一律改走下面的变量，切换只在这一处生效。
+   深色规则用 [data-theme='dark'] 选择器（不是媒体查询）：手动切换主题时
+   媒体查询不跟随，故一律以 <html data-theme> 为准（theme.jsx 写入）。 */
+:root {
+  --gw-primary: #2f54eb;
+  --gw-primary-active: #1d39c4;
+  --gw-bg: #f5f6f8;       /* 页面底（Content 背景） */
+  --gw-surface: #ffffff;   /* 卡片/顶栏底 */
+  --gw-border: #f0f0f0;     /* 分隔线 */
+  --gw-track: #f5f5f5;     /* 条形图轨道底 */
+  --gw-muted: #666666;     /* 次要文字 */
+  --gw-faint: #999999;     /* 弱文字（刻度/轴） */
+  --gw-empty: #fafafa;     /* 空态底 */
+  --gw-text: rgba(0, 0, 0, 0.88);
+  --gw-text-2: rgba(0, 0, 0, 0.6);
+  --gw-red-text: #cf1322;   /* 语义色文字：深底上要换亮档，见下方暗色块 */
+  --gw-orange-text: #ad4e00;
+}
+[data-theme='dark'] {
+    --gw-primary: #597ef7;
+    --gw-primary-active: #3c6ff0;
+    --gw-bg: #141414;       /* 页面底 */
+    --gw-surface: #1f1f1f;
+    --gw-border: #303030;
+    --gw-track: #262626;
+    --gw-muted: #a6a6a6;
+    --gw-faint: #8c8c8c;
+    --gw-empty: #1a1a1a;
+    --gw-text: rgba(255, 255, 255, 0.88);
+    --gw-text-2: rgba(255, 255, 255, 0.65);
+    --gw-red-text: #ff7875;
+    --gw-orange-text: #ffc069;
+  }
+
+/* body 底/字色：antd 只改组件色不改 body —— 深色下 body 还是黑字深底（不可读） */
+body { background: var(--gw-bg); color: var(--gw-text); } 
+
+/* 深色下 antd 深色 Sider 的默认底是藏青 #001529，与页面底(#141414) 不搭（顶部「网关控制台」
+   条是透明底、直接露 Sider 底色，看着像一条蓝带）—— 覆盖成页面底色，侧栏整块黑底；
+   浅色不动（Sider 白底，与卡片一致） */
+[data-theme='dark'] .ant-layout-sider.ant-layout-sider-dark { background: var(--gw-bg); }
+
 /* 顶部常驻块：状态条在上 + 标题在下。真 fixed（sticky 在 body 滚动 + flex 下每帧重算会抖，
    与侧边栏同因）；left:180 只是兜底，实际由 App.jsx 内联覆盖随侧栏收起/展开联动，
    高度由 App.jsx 实测后内容区 paddingTop 让位 */
-.app-topbar { position: fixed; top: 0; left: 180px; right: 0; z-index: 10; background: #fff; }
+.app-topbar { position: fixed; top: 0; left: 180px; right: 0; z-index: 10; background: var(--gw-surface); }
 /* 注：页面工具栏统一用 Portal 挂标题右侧（#page-toolbar-slot），不跟内容滚动，无需吸顶 */
 
 /* 状态灯异常：红色 Tag 脉冲提示（系统偏好减动效时关闭） */
@@ -31,7 +76,7 @@ body.ant-scrolling-effect { width: auto !important; }
    折行；ellipsis 列本就 nowrap+省略号，不受影响 */
 .ant-table-cell { white-space: nowrap; }
 /* 空表提示是用户要读的正文（如「尚未检查，点右上角…」），antd 默认 0.25 在白底仅 1.83:1 */
-.ant-table-tbody > tr.ant-table-placeholder > td { color: rgba(0, 0, 0, 0.6) !important; }
+.ant-table-tbody > tr.ant-table-placeholder > td { color: var(--gw-text-2) !important; }
 /* code 字号统一 12px：antd 默认 0.85em 会随父级缩到 10.2/11.9px（表内 URL、key 掩码、规则上下文名） */
 code { font-size: 12px !important; }
 /* 每列最窄列宽：rc-table 默认 tableLayout=fixed，列宽只认 col 的 %，单元格
@@ -57,7 +102,8 @@ code { font-size: 12px !important; }
 .tbl-keys col:nth-child(5) { min-width: 180px; }
 .tbl-ext col:nth-child(8) { min-width: 150px; }
 .tbl-limits col:nth-child(5) { min-width: 150px; }
-.tbl-circuit col:nth-child(5) { min-width: 170px; }
+.tbl-circuit col:nth-child(2) { min-width: 150px; }
+.tbl-circuit col:nth-child(6) { min-width: 170px; }
 /* sticky 模式下 rc-table 把表头拆成独立 <table>：表头列是实测 px 宽、表体仍走 % 宽，
    上面这些 col min-width 只会夹住表头（px 列才吃 min-width）⇒ 表头/表体列错位
    （实测 rules 7px、L2 分歧表 45px）。表头宽度本就是按表体实测回填的，无需再夹一遍 */
@@ -81,11 +127,10 @@ code { font-size: 12px !important; }
    !important 必需——antd 的 css-xxx 内联类会压掉普通 text-align。 */
 .ant-table thead > tr > th,
 .ant-table tbody > tr > td { text-align: center !important; }
-/* 例外：会截断省略的列（antd 自带 .ant-table-cell-ellipsis）左对齐。这类列内容长度
-   可变——长时占满整列、短时只占一半，居中会让每行文字左右跳。省略号居中更难认。 */
-.ant-table tbody > tr > td.ant-table-cell-ellipsis { text-align: left !important; }
-/* 列显式要求居中且带省略号时（审计表规则/模型列）：覆盖上面的左对齐例外 */
-.ant-table tbody > tr > td.ant-table-cell-ellipsis.cell-center { text-align: center !important; }
+/* 例外：会截断省略的列（antd 自带 .ant-table-cell-ellipsis）原本左对齐
+   （内容长度可变，居中会左右跳）——2026-10-21 起按要求统一居中：
+   删掉这条左对齐例外后，上面那条全局居中规则对省略号列同样生效。
+   （各列 def 上的 className="cell-center" 保留：语义标注，样式已由全局规则兜住） */
 
 /* 审计表 10 列且窄（最小 110px），表头挤在左边认不出对应哪列：左右留白对称。
    只审计表需要，用组件根 class 限定作用域，别改全局 .ant-table-cell。 */
@@ -129,61 +174,120 @@ code { font-size: 12px !important; }
    加深到绿 8 / 橙 8（5.4/5.2:1）。红/蓝预设本就达标，不动 */
 .ant-tag-green, .ant-typography-success { color: #237804 !important; }
 .ant-tag-orange, .ant-tag-gold, .ant-typography-warning { color: #ad4e00 !important; }
+/* 暗色：antd 深色算法把 tag 底换成深色，浅底专用的深字色就反了（对比度反向），
+   换同色系亮档（绿 9 / 橙 9） */
+[data-theme='dark'] .ant-tag-green, [data-theme='dark'] .ant-typography-success { color: #95de64 !important; }
+[data-theme='dark'] .ant-tag-orange, [data-theme='dark'] .ant-tag-gold, [data-theme='dark'] .ant-typography-warning { color: #ffc069 !important; }
+  /* 其余预设 tag：antd 深色档在深底上只有 3.3:1，逐个提亮 */
+[data-theme='dark'] .ant-tag-blue { color: #91caff !important; }
+[data-theme='dark'] .ant-tag-cyan { color: #5cdbd3 !important; }
+[data-theme='dark'] .ant-tag-purple { color: #d3adf7 !important; }
+[data-theme='dark'] .ant-tag-volcano { color: #ffa39e !important; }
+[data-theme='dark'] .ant-tag-magenta { color: #ff85c0 !important; }
+  /* link 按钮：antd 的 colorLink 是派生 token（取色阶第 6 档），深色下落到
+     #4f6ed5 —— 对 #141414 只有 3.97:1（14px 不达 AA），提到亮档 */
+[data-theme='dark'] .ant-btn-variant-link:not(.ant-btn-dangerous):not(.ant-btn-disabled):not(.ant-btn-loading) { color: #91caff !important; }
+[data-theme='dark'] .ant-btn-variant-link:not(.ant-btn-dangerous):not(.ant-btn-disabled):not(.ant-btn-loading):hover { color: #69b1ff !important; }
+[data-theme='dark'] .ant-typography a { color: #91caff; }
+  /* 分页页码是链接（antd 派生的 colorLink 偏暗） */
+[data-theme='dark'] .ant-pagination .ant-pagination-item a, [data-theme='dark'] .ant-pagination .ant-pagination-jump-prev, [data-theme='dark'] .ant-pagination .ant-pagination-jump-next { color: #91caff !important; }
+  /* 选中菜单项：深色下 antd 用暗蓝底 + 暗蓝字（2.6:1）⇒ 白字 */
+[data-theme='dark'] .ant-menu-item-selected { color: #fff !important; }
+
 @media (prefers-reduced-motion: reduce) {
   .page-enter { animation: none; }
   .app-statusbar .ant-tag { transition: none; }
 }
 
-/* default（outlined）按钮视觉口径统一 = type="link" danger（红字无底无边）。
-   按 antd 的 variant/color 类一次性收口全局，不必逐个源码改 type；border 置透明
-   而非置 0，按钮占位不变、不引发布局跳动。hover/active/禁用态与 antd 红链接对齐。 */
-.ant-btn-variant-outlined.ant-btn-color-default,
-.ant-btn-variant-outlined.ant-btn-color-default:hover,
-.ant-btn-variant-outlined.ant-btn-color-default:focus {
-  color: #cf1322 !important;
-  background-color: transparent !important;
-  border-color: transparent !important;
+/* 卡片 extra 里的文字型小按钮（跳转 link「审计明细 →」「Provider 管理 →」、
+   「全部检查」等）行高对齐 Typography 的 22px：antd small button 默认
+   line-height:normal(18px)，文字比旁边正文高约 1.25px（基线错位，实测墨迹行差 1.25px）。
+   排除 primary（实底按钮有自己的居中口径，改行高会把文字压低）。 */
+.ant-card-extra .ant-btn-sm:not(.ant-btn-primary) { line-height: 22px !important; }
+
+/* default（outlined）普通按钮 = 中性描边（正文色 + 卡片底 + 描边）。
+   红只留给 danger（删除/移除/回滚/打开熔断…，源码里都是
+   type="link" danger）—— 早前把 default 描边按钮全局刷成「红字无底无边」，那是照着
+   当时表格里的删除按钮做的；后来删除/移除全改 type="link" danger，这条规则只剩误伤：
+   全部检查、模型自动标注、复制、上移、还原默认、晋升指定版本… 全被涂成危险红。
+   红=危险，普通动作不该红。深浅两套走 --gw-* 变量，暗色不用单写覆盖。
+   放过 antd 自带的 Input.Search 放大镜按钮（属输入框组，有 antd 自己的边框口径）。 */
+.ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button) {
+  color: var(--gw-text) !important;
+  background-color: var(--gw-surface) !important;
+  border-color: var(--gw-border) !important;
 }
-.ant-btn-variant-outlined.ant-btn-color-default:hover { color: #e84749 !important; }
-.ant-btn-variant-outlined.ant-btn-color-default:active { color: #a8071a !important; }
-.ant-btn-variant-outlined.ant-btn-color-default:disabled,
-.ant-btn-variant-outlined.ant-btn-color-default.ant-btn-disabled {
+.ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button):hover { color: var(--gw-primary) !important; border-color: var(--gw-primary) !important; }
+.ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button):active { color: var(--gw-primary-active) !important; border-color: var(--gw-primary-active) !important; }
+.ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button):disabled,
+.ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button).ant-btn-disabled {
   color: rgba(0, 0, 0, 0.25) !important;
   background-color: transparent !important;
-  border-color: transparent !important;
+  border-color: var(--gw-border) !important;
 }
+[data-theme='dark'] .ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button):disabled,
+[data-theme='dark'] .ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button).ant-btn-disabled { color: rgba(255, 255, 255, 0.3) !important; }
+/* antd 自带 Input.Search 放大镜按钮：输入框组的一部分，保持 antd 自己的边框口径（不套按钮口径） */
+.ant-btn.ant-input-search-button { background-color: transparent !important; border-color: transparent !important; }
 /* danger 描边按钮去掉边框/底色（视觉口径 = type="link" danger）；layout 不变 */
 .ant-btn-variant-outlined.ant-btn-color-dangerous {
   background-color: transparent !important;
   border-color: transparent !important;
 }
-/* 中性描边按钮例外（如阈值）：恢复 antd 默认描边，不走全局红色口径 */
-.ant-btn.btn-neutral.ant-btn-color-default,
-.ant-btn.btn-neutral.ant-btn-color-default:hover,
-.ant-btn.btn-neutral.ant-btn-color-default:focus {
-  color: rgba(0, 0, 0, 0.88) !important;
-  background-color: #ffffff !important;
-  border-color: #d9d9d9 !important;
+/* 「非密」标注按钮：绿色（默认红→绿，覆盖 default 按钮红色口径）。
+   放在 default 描边规则之后，且带 .ant-btn-color-default 限定，保证优先级高于
+   上面那条 default 描边口径（:not() 会加权，不限定会被它压掉）。 */
+.ant-btn.btn-green.ant-btn-color-default { color: #237804 !important; }
+.ant-btn.btn-green.ant-btn-color-default:hover { color: #389e0d !important; }
+.ant-btn.btn-green.ant-btn-color-default:active { color: #135200 !important; }
+/* 选中态（type=primary）时 antd 给蓝底白字 → 覆盖成浅绿底深绿字。白字在浅绿底上
+   只有 1.9:1 不可读，故字色用深绿 #135200（绿-9） */
+.ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green {
+  background: #d9f7be !important;
+  border-color: #b7eb8f !important;
+  color: #135200 !important;
 }
-.ant-btn.btn-neutral.ant-btn-color-default:hover {
-  color: #4096ff !important;
-  border-color: #4096ff !important;
+.ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green:hover {
+  background: #b7eb8f !important;
+  border-color: #95de64 !important;
+  color: #135200 !important;
 }
-.ant-btn.btn-neutral.ant-btn-color-default:active {
-  color: #0958d9 !important;
-  border-color: #0958d9 !important;
+.ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green:active {
+  background: #95de64 !important;
+  border-color: #73d13d !important;
+  color: #135200 !important;
 }
-/* 「非密」标注按钮：绿色（默认红→绿，覆盖 default 按钮红色口径） */
-.ant-btn.btn-green { color: #237804 !important; }
-.ant-btn.btn-green:hover { color: #389e0d !important; }
-.ant-btn.btn-green:active { color: #135200 !important; }
+/* 暗色：底色变深 ⇒ 上面的深字色/白底按钮不可读，逐条换亮档 */
+[data-theme='dark'] .ant-btn.btn-green.ant-btn-color-default { color: #95de64 !important; }
+[data-theme='dark'] .ant-btn.btn-green.ant-btn-color-default:hover { color: #b7eb8f !important; }
+[data-theme='dark'] .ant-btn.btn-green.ant-btn-color-default:active { color: #73d13d !important; }
+/* 选中态同浅色：浅绿底深绿字（暗底上选中指示仍然醒目、可读） */
+[data-theme='dark'] .ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green,
+[data-theme='dark'] .ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green:hover {
+  background: #d9f7be !important;
+  border-color: #b7eb8f !important;
+  color: #135200 !important;
+}
+[data-theme='dark'] .ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green:active {
+  background: #95de64 !important;
+  border-color: #73d13d !important;
+  color: #135200 !important;
+}
+  /* uPlot 框选遮罩：默认 rgba(0,0,0,0.07) 在深底上等于没有 */
+[data-theme='dark'] .u-select { background: rgba(255, 255, 255, 0.12) !important; }
+
+/* 搜索框放大镜图标（L2 分歧样本，全管理台唯一 Input.Search）：antd 默认灰不醒目，
+   走主题主色（--gw-primary 深浅两套已定义，自动切换）。作用域挂「分歧样本」卡
+   （.card-divs）：该版本 Input.Search 没有 wrapperClassName，类只能挂 Card */
+.card-divs .anticon-search { color: var(--gw-primary); }
+
 .ant-table-column-sorter { display: none !important; }
 /* 原生文件选择器伪装成 antd primary 按钮（selected files 走 Tag 展示，原生文本置透明） */
 .file-pick { color: transparent; background: transparent; border: 0; padding: 0; }
 .file-pick::file-selector-button {
   height: 32px; padding: 0 15px; border: 1px solid transparent; border-radius: 8px;
-  background: #2f54eb; color: #fff; font-size: 14px; line-height: 1.5714; cursor: pointer;
+  background: var(--gw-primary); color: #fff; font-size: 14px; line-height: 1.5714; cursor: pointer;
   box-shadow: 0 2px 0 rgba(5, 5, 5, 0.06);
 }
 .file-pick::file-selector-button:hover { background: #597ef7; color: #fff; }
-.file-pick::file-selector-button:active { background: #1d39c4; color: #fff; }
+.file-pick::file-selector-button:active { background: var(--gw-primary-active); color: #fff; }

@@ -15,7 +15,7 @@ sys.path.insert(0, ROOT)
 from src.gateway.inspection import inspect_text  # noqa: E402
 
 KEY = os.environ["AI_GATEWAY_DEV_API_KEY"]
-URL = "http://127.0.0.1:8080/v1/chat/completions"
+URL = "https://127.0.0.1:8080/v1/chat/completions"
 
 
 def _utc(ts):
@@ -105,7 +105,7 @@ CANDIDATES = [
 
 
 def send(text):
-    body = json.dumps({"model": "vllm_local/Qwen3.8-AB", "max_tokens": 8,
+    body = json.dumps({"model": "vllm_local/qwen2.5:7b", "max_tokens": 8,
                        "messages": [{"role": "user", "content": text}]}).encode()
     req = urllib.request.Request(URL, data=body,
                                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"})
@@ -173,7 +173,7 @@ def report_round(since, keep):
     """打印本轮（since 之后）新增分歧：方向/主→影/影p/标注。"""
     want_of = {t: w for t, w, _ in keep}
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8080/admin/api/l2-divergences?hours=1&limit=500",
+        with urllib.request.urlopen("https://127.0.0.1:8080/admin/api/l2-divergences?hours=1&limit=500",
                                     timeout=60) as r:
             items = json.load(r)["items"]
     except Exception as e:

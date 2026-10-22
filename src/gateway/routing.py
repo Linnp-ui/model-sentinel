@@ -32,7 +32,7 @@ from .provider_keys import (
     note_rejected as _note_rejected,
     note_exhausted as _note_exhausted,
 )
-from .circuit_breaker import get_breaker
+from .circuit_breaker import get_breaker, key_for
 from .user_models import find_provider
 from .llms.registry import get_llm_handler
 from .llms.bridges import (
@@ -61,7 +61,7 @@ _CLIENTS: Dict[Tuple[Optional[asyncio.AbstractEventLoop], bool, Optional[str]], 
 
 _UPSTREAM_PROXY_ENV = "AI_GATEWAY_UPSTREAM_PROXY"
 
-# 默认 max_tokens：本地 thinking 模型（Qwen3.8-AB）的思考链会长到吃光 300 token，
+# 默认 max_tokens：本地 thinking 模型（qwen2.5:7b）的思考链会长到吃光 300 token，
 # 导致 finish_reason=length 且 content=None（客户端显示"无返回内容"）。
 # 取 32768 与 vLLM 侧同量级（`--max-model-len 1010000` 是 prompt+输出**总预算**，
 # 不能把 max_tokens 设成它 —— 实测会被 vLLM 直接 400 拒绝）。
@@ -402,6 +402,37 @@ def _cand_key(rc: str, prov) -> str:
     return rc or _gateway_upstream_key(_current_identity(), prov)
 
 
+def _internal_model_target(cfg, model_name: str):
+    """裸模型名 → (provider, model)：命中 model_policy 登记的**内网 chat**模型才返回。
+
+    非 chat 协议（如 laya 的 /classify 决策模型）不返回 —— 它不是能对话的模型。
+    provider 不在 routing.yaml 或不是内网 provider 时也不返回（保持原路由）。
+    """
+    hit, _ = _internal_model_lookup(cfg, model_name)
+    return hit
+
+
+def _internal_model_lookup(cfg, model_name: str):
+    """裸模型名 → ((provider, model) | None, known_non_chat: bool)。
+
+    known_non_chat=True 表示「网关知道这个名字，但它不是对话模型」（如 laya 的
+    /classify 决策模型）⇒ 调用方应 404，而不是把它当普通模型名转给外网上游
+    （那等于把内容发给一个根本不是这个模型的上游）。
+    """
+    try:
+        from .model_policy import load_model_policy
+        for im in load_model_policy().internal_models:
+            if not im.enabled or im.model != model_name:
+                continue
+            cand = cfg.get(im.provider) or find_provider(im.provider)
+            if cand is not None and cand.local and cand.kind != "embedding":
+                return (im.provider, im.model), False
+            return None, True
+    except Exception:
+        return None, False
+    return None, False
+
+
 def resolve(
     decision: Dict[str, Any],
     payload: Dict[str, Any] | None = None,
@@ -463,12 +494,27 @@ def resolve(
         model = hdr_model
 
     # ③ 精确模型名 = 用户自定义模型名（注册后可直接当 model 用）
+    #    ③b 裸模型名命中「内网登记模型」（model_policy.internal_models，如 qwen2.5:7b）
+    #        ⇒ 钉回它登记的内网 provider。
+    #        2026-10-21 巡检发现：这些名字在 /v1/models 对外可见（"内网主力模型，
+    #        可直连点名"），此前却落 default_external ⇒ 客户端以为走内网、实际内容
+    #        出境（上游对未知模型名照答不误，静默用别的模型顶替）。钉回后列表与行为一致。
+    #        未登记的名字仍按原样保留交给上游（不改成 404：线上确有客户端用
+    #        上游真实名/历史名请求，贸然 404 会打断正在用的链路）。
     if not force_local and "/" not in req_model and req_model:
         cand = find_provider(req_model)
         if cand is not None:
             name, model = req_model, cand.default_model
         elif not model:
-            model = req_model  # 裸模型名保留
+            hit, known_non_chat = _internal_model_lookup(cfg, req_model)
+            if hit is not None:
+                name, model = hit
+            elif known_non_chat:
+                raise RoutingError(
+                    f"模型 {req_model} 不是对话模型（内部 L2 判定用），请用 /v1/models 里的模型名",
+                    404, type_="model_not_chat")
+            else:
+                model = req_model  # 裸模型名保留（未登记的名字仍交上游）
 
     prov = cfg.get(name) or find_provider(name)
 
@@ -561,30 +607,33 @@ def _mock_chat(prov: Provider, model: str, decision: Dict[str, Any]) -> Dict[str
     }
 
 
-async def _post(prov: Provider, url: str, body: Dict[str, Any], api_key_override: str = "") -> httpx.Response:
+async def _post(prov: Provider, url: str, body: Dict[str, Any], api_key_override: str = "",
+                model: str = "") -> httpx.Response:
     client = _get_client(prov.local)
     breaker = get_breaker()
-    if not breaker.allow(prov.name):
+    # 熔断键 = provider::model：别名组候选与点名请求共用一份状态
+    cb_key = key_for(prov.name, model)
+    if not breaker.allow(cb_key):
         from .metrics import get_metrics
         get_metrics().inc_circuit_short()
-        s = breaker.snapshot().get(prov.name, {})
+        s = breaker.snapshot().get(cb_key, {})
         # compute retry_after
         recovery = int(os.getenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "30"))
         retry_after = max(0.0, recovery - (time.time() - (s.get("opened_at") or 0)))
         raise RoutingError(
-            f"circuit open for {prov.name} (failures={s.get('failure_count_window', 0)}, retry after {retry_after:.0f}s)",
+            f"circuit open for {cb_key} (failures={s.get('failure_count_window', 0)}, retry after {retry_after:.0f}s)",
             503,
         )
     try:
         resp = await client.post(url, headers=prov.headers(api_key_override), json=body,
                              timeout=_upstream_timeout(prov))
     except httpx.HTTPError as exc:
-        breaker.record_failure(prov.name)
+        breaker.record_failure(cb_key)
         raise RoutingError(f"{prov.name} unreachable: {exc}", 502) from exc
     if resp.status_code >= 500:
-        breaker.record_failure(prov.name)
+        breaker.record_failure(cb_key)
     else:
-        breaker.record_success(prov.name)
+        breaker.record_success(cb_key)
     return resp
 
 
@@ -723,7 +772,7 @@ async def route_chat(
             body["model"] = model
             body = _apply_local_model_defaults(body, prov)
             try:
-                r = await _post(prov, prov.endpoint("chat", model=model), handler.transform_request(body, model), ukey)
+                r = await _post(prov, prov.endpoint("chat", model=model), handler.transform_request(body, model), ukey, model)
                 if r.status_code >= 400:
                     raise RoutingError(f"{prov.name} {r.status_code}: {r.text[:300]}", r.status_code)
             except RoutingError as e2:
@@ -732,13 +781,11 @@ async def route_chat(
             exc = RoutingError(_err, 503, type_="provider_not_configured")
         if exc is None:
             if alias is not None:
-                from .alias_router import record_alias_result
-                record_alias_result(prov.name, model, True, local=prov.local)
+                from .alias_router import record_alias_ok
+                record_alias_ok(prov.name, model, local=prov.local)
             return handler.transform_response(r.json(), model)
         tried.append(f"{prov.name}/{model}")
         if alias is not None:
-            from .alias_router import record_alias_result
-            record_alias_result(prov.name, model, False)
             _alias_ctx_failover(f"{prov.name}/{model}")
         reason = classify_failure(exc.status_code, str(exc))
         nxt = None
@@ -893,14 +940,15 @@ async def _chat_stream_once(
         raise RoutingError(_err, 503, type_="provider_not_configured")
 
     breaker = get_breaker()
-    if not breaker.allow(prov.name):
+    cb_key = key_for(prov.name, model)
+    if not breaker.allow(cb_key):
         from .metrics import get_metrics
         get_metrics().inc_circuit_short()
-        s = breaker.snapshot().get(prov.name, {})
+        s = breaker.snapshot().get(cb_key, {})
         recovery = int(os.getenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "30"))
         retry_after = max(0.0, recovery - (time.time() - (s.get("opened_at") or 0)))
         raise RoutingError(
-            f"circuit open for {prov.name} (failures={s.get('failure_count_window', 0)}, retry after {retry_after:.0f}s)",
+            f"circuit open for {cb_key} (failures={s.get('failure_count_window', 0)}, retry after {retry_after:.0f}s)",
             503,
         )
 
@@ -912,17 +960,14 @@ async def _chat_stream_once(
             if r.status_code >= 400:
                 # 流式上下文里 body 未 read，直接访问 r.text 会抛 ResponseNotRead
                 if r.status_code >= 500:
-                    breaker.record_failure(prov.name)
-                    if (_alias_ctx_now() or {}).get("name"):
-                        from .alias_router import record_alias_result as _rar
-                        _rar(prov.name, model, False)
+                    breaker.record_failure(cb_key)
                 raw = await r.aread()
                 detail = raw.decode("utf-8", errors="replace")[:300]
                 raise RoutingError(f"{prov.name} {r.status_code}: {detail}", r.status_code)
-            breaker.record_success(prov.name)
+            breaker.record_success(cb_key)
             if (_alias_ctx_now() or {}).get("name"):
-                from .alias_router import record_alias_result as _rar
-                _rar(prov.name, model, True, local=prov.local)
+                from .alias_router import record_alias_ok as _rao
+                _rao(prov.name, model, local=prov.local)
             if handler.stream_passthrough:
                 async for chunk in r.aiter_bytes():
                     yield chunk
@@ -932,10 +977,7 @@ async def _chat_stream_once(
                     if out:
                         yield out
     except httpx.HTTPError as exc:
-        breaker.record_failure(prov.name)
-        if (_alias_ctx_now() or {}).get("name"):
-            from .alias_router import record_alias_result as _rar
-            _rar(prov.name, model, False)
+        breaker.record_failure(cb_key)
         raise RoutingError(f"{prov.name} unreachable: {exc}", 502) from exc
 
 
@@ -962,7 +1004,7 @@ async def route_embeddings(
 
     body = {k: v for k, v in payload.items() if k != "model"}
     body["model"] = model
-    r = await _post(prov, prov.endpoint("embedding", model=model), body, ukey)
+    r = await _post(prov, prov.endpoint("embedding", model=model), body, ukey, model)
     if r.status_code >= 400:
         raise RoutingError(f"{prov.name} {r.status_code}: {r.text[:300]}", r.status_code)
     return r.json()
@@ -986,7 +1028,7 @@ async def route_messages(
         # 凭据逐候选解析（凭据池 per-provider）：候选共用一次解析会把 default_external
         # 的 key 打到候选 #2 的 provider 上（401，且审计里看不出来源）。
         rc = _request_credential(headers)
-        from .alias_router import alias_candidates, record_alias_result
+        from .alias_router import alias_candidates, record_alias_ok
         _alias_ctx_start(alias["name"])
         cands = alias_candidates(alias)
         if not cands:
@@ -1002,10 +1044,9 @@ async def route_messages(
                 continue
             try:
                 out = await _messages_once(pcfg, cand["model"], body, ukey)
-                record_alias_result(pcfg.name, cand["model"], True, local=pcfg.local)
+                record_alias_ok(pcfg.name, cand["model"], local=pcfg.local)
                 return out
             except RoutingError as e:
-                record_alias_result(pcfg.name, cand["model"], False)
                 _alias_ctx_failover(f"{pcfg.name}/{cand['model']}")
                 last_exc = e
                 continue
@@ -1053,14 +1094,14 @@ async def _messages_once(prov, model: str, body: Dict[str, Any], ukey: str | Non
     if prov.api_mode == "anthropic":
         out = {k: v for k, v in body.items() if k != "model"}
         out["model"] = model
-        r = await _post(prov, prov.endpoint("chat"), out, ukey)
+        r = await _post(prov, prov.endpoint("chat"), out, ukey, model)
         if r.status_code >= 400:
             raise RoutingError(f"{prov.name} {r.status_code}: {r.text[:300]}", r.status_code)
         data = r.json()
         data["model"] = model
         return data
 
-    r = await _post(prov, prov.endpoint("chat"), _anthropic_to_openai(body, model), ukey)
+    r = await _post(prov, prov.endpoint("chat"), _anthropic_to_openai(body, model), ukey, model)
     if r.status_code >= 400:
         raise RoutingError(f"{prov.name} {r.status_code}: {r.text[:300]}", r.status_code)
     return _openai_to_anthropic(r.json(), model)
@@ -1269,7 +1310,7 @@ async def route_responses(
             _r = None
             try:
                 _r = await _post(prov, prov.endpoint("proxy", custom_path="responses"),
-                                 body, "" if prov.local else ukey)
+                                 body, "" if prov.local else ukey, model)
             except RoutingError:
                 _r = None
             if _r is not None:
@@ -1289,7 +1330,7 @@ async def route_responses(
     while True:
         ukey = _cand_key(rc, prov)
         body = {**body, "model": model}
-        r = await _post(prov, prov.endpoint("proxy", custom_path="responses"), body, ukey)
+        r = await _post(prov, prov.endpoint("proxy", custom_path="responses"), body, ukey, model)
         if r.status_code in (404, 405, 501):
             obody = _responses_to_chat(body, model)
             return _chat_to_responses(await route_chat(obody, decision, headers), model)

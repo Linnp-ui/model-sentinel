@@ -1,6 +1,6 @@
 """模拟真实流量-生成：高温度本地 27B 批量生成贴近真实客户端分布的请求样本。
 
-经网关全链路调用（dev-key + vllm_local/Qwen3.8-AB 斜杠写法，内容不出境），
+经网关全链路调用（dev-key + vllm_local/qwen2.5:7b 斜杠写法，内容不出境），
 审计自动落地。输出 ~/models/sim-traffic/traffic_<ts>.jsonl（纯合成虚构数据，
 不进仓库）。用法: .venv/bin/python scripts/sim_traffic_gen.py [--per-call 8] [--calls 2]
 """
@@ -21,8 +21,8 @@ load_dotenv(os.path.join(ROOT, ".env"))
 sys.path.insert(0, ROOT)
 
 KEY = os.environ["AI_GATEWAY_DEV_API_KEY"]
-URL = "http://127.0.0.1:8080/v1/chat/completions"
-MODEL = "vllm_local/Qwen3.8-AB"
+URL = "https://127.0.0.1:8080/v1/chat/completions"
+MODEL = "vllm_local/qwen2.5:7b"
 TEMP = 1.15
 TOP_P = 0.95
 OUT_DIR = os.path.expanduser("~/models/sim-traffic")

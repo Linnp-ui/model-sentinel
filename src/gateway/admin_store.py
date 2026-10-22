@@ -1496,7 +1496,10 @@ class AdminStore:
         rows = self._log_rows(since, until)
         agg: dict = {}
         for r in rows:
-            label = (r.get(dim) or "").strip() or "(unknown)"
+            raw = (r.get(dim) or "").strip()
+            if dim == "provider" and not raw:
+                continue  # 空 provider = 没到上游（拦截/未路由），不进 provider 分布
+            label = raw or "(unknown)"
             g = agg.setdefault(label, {"label": label, "calls": 0, "tokens": 0,
                                        "blocked": 0, "local_routed": 0, "errors": 0})
             g["calls"] += 1
@@ -1678,10 +1681,12 @@ class AdminStore:
                 dur_n += 1
             tp += p
             tc += c
-            # 分组 ×3（口径同 stats_group）
+            # 分组 ×3（口径同 stats_group）；provider 空值（拦截/未路由）不进调用分布
             for agg, raw in ((g_key, r.get("key_name")),
                              (g_prov, r.get("provider")),
                              (g_rule, r.get("blocked_reason"))):
+                if agg is g_prov and not (raw or "").strip():
+                    continue
                 label = (raw or "").strip() or "(unknown)"
                 g = agg.setdefault(label, {"label": label, "calls": 0, "tokens": 0,
                                            "blocked": 0, "local_routed": 0, "errors": 0})

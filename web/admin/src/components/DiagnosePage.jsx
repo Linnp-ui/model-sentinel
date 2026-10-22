@@ -1,6 +1,8 @@
 import { useState, useRef } from 'react';
 import { Button, Input, Select, Tag, Space, message, Typography, Alert, Card, Tooltip } from 'antd';
 import { api, errText } from '../api.js';
+import { RuleZh } from '../ruleNames.jsx';
+import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
 // ---------------- 运维诊断：路由检查器（L1→L2→路由 全链干跑） ----------------
@@ -49,7 +51,7 @@ export default function RouteInspectCard() {
   const actTag = (a) => a === 'allow' ? <Tag color="green">allow</Tag>
     : a === 'route_local' ? <Tag color="orange">route_local</Tag> : <Tag color="red">{a}</Tag>;
   return (
-    <Card title={<Tooltip title="生产同款 L1→L2→路由 决策链；不落审计、不限流、不真实出境">路由检查器</Tooltip>}>
+    <Card title={<Tooltip title="用和线上一样的流程走一遍：先过 L1 关键词关，再看要不要过 L2 语义关，最后告诉你这条内容会去哪（放行 / 拦截 / 转内网）。只做演练：不落审计、不限流、不真的发出去。"><span style={{ cursor: 'help' }}>路由检查器</span></Tooltip>}>
       <Space direction="vertical" style={{ width: '100%' }} size="small">
         <Input.TextArea rows={5} placeholder="待审查文本（L1 命中即返回；L1 放行且风险分 ≥20 才触发 L2，灰区强制 L2）"
           value={text} onChange={(e) => setText(e.target.value)} />
@@ -59,6 +61,7 @@ export default function RouteInspectCard() {
             { value: 'chat', label: '文件通道：workbuddy image_url 内联图' },
             { value: 'responses', label: '文件通道：codex input_file 块' },
           ]} />
+          <Tip text="通道 = 客户端把文件/图片送进来的方式，不同客户端格式不一样；选错可能解析不出内容。" />
           <input ref={fileRef} className="file-pick" type="file" multiple aria-label="选择文件" onChange={pickFiles} />
           {picked.length > 0 && <Tag color="blue">已选 {picked.length} 个：{picked.map((f) => f.filename).join('、')}</Tag>}
           {picked.length > 0 && <Button size="small" onClick={clearFiles}>清除文件</Button>}
@@ -66,11 +69,11 @@ export default function RouteInspectCard() {
         </div>
         {res && (
           <Alert type={res.final_action === 'allow' ? 'success' : res.final_action === 'route_local' ? 'warning' : 'error'}
-            showIcon message={<span>终判：{actTag(res.final_action)}（{res.final_rule || '-'}）</span>}
+            showIcon message={<span>终判：{actTag(res.final_action)}（<RuleZh name={res.final_rule} />）</span>}
             description={
               <Space direction="vertical" size={4}>
                 <Space size="small" wrap>
-                  <span>L1：{res.l1.rule || '-'} {actTag(res.l1.action)}</span>
+                  <span>L1：<RuleZh name={res.l1.rule} /> {actTag(res.l1.action)}</span>
                   {res.l2.triggered
                     ? <span>L2：{res.l2.label} conf={res.l2.confidence}（{res.l2.latency_ms}ms）</span>
                     : <span>L2 跳过：{res.l2.skipped || '-'}</span>}

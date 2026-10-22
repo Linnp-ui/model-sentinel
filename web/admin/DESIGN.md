@@ -35,6 +35,46 @@ antd 5 默认视觉即扁平企业风；不引入任何装饰性风格（玻璃�
 | 表头底 | `#FAFAFA` | Table header |
 | 正文/次要 | antd 默认 88%/45% 黑 | 次要文字 ≥12px 时对比度 4.5:1（AA 达标） |
 
+### 2.1 主题（跟随系统 / 浅色 / 深色，2026-10-20）
+
+- **三态**：跟随系统（默认）→ 浅色 → 深色，顶栏最右按钮循环切换（图标=当前状态，
+  tooltip/aria-label 写当前态与下一态）。选择存 `localStorage['gw-theme']`。
+- **单一判定源**：`src/theme.jsx` 的 `ThemeProvider`（`useTheme()` 取
+  `{ mode, isDark, setMode }`）。antd 算法（ConfigProvider）、CSS 变量层、
+  Sider 主题、uPlot 轴色、热力图合成底色全从这里取——**别处各自
+  `matchMedia` 会走偏**（主题可手动选，系统色不再是唯一依据）。
+- **CSS 切换靠 `<html data-theme>`**（值 `light`/`dark`），不是媒体查询：
+  媒体查询不跟随手动选择。`theme.css` 的深色规则一律 `[data-theme='dark'] …`，
+  表面色走 CSS 变量（`:root` 浅色值 + `[data-theme='dark']` 深色值）：
+
+  | 变量 | 浅色 | 深色 | 用途 |
+  |---|---|---|---|
+  | `--gw-surface` | `#ffffff` | `#1f1f1f` | 卡片/顶栏底 |
+  | `--gw-border` | `#f0f0f0` | `#303030` | 分隔线 |
+  | `--gw-track` | `#f5f5f5` | `#262626` | 条形图轨道底 |
+  | `--gw-muted` | `#666666` | `#a6a6a6` | 次要文字 |
+  | `--gw-faint` | `#999999` | `#8c8c8c` | 刻度/轴文字 |
+  | `--gw-empty` | `#fafafa` | `#1a1a1a` | 空态底 |
+  | `--gw-text` / `--gw-text-2` | `rgba(0,0,0,.88/.6)` | `rgba(255,255,255,.88/.65)` | 正文/次要 |
+  | `--gw-red-text` / `--gw-orange-text` | `#cf1322` / `#ad4e00` | `#ff7875` / `#ffc069` | 语义色文字 |
+  | `--gw-primary` | `#2f54eb` | `#597ef7` | 主色（图表箭头/文件选择按钮） |
+
+- **首屏不闪**：`index.html` 里有同口径的内联脚本，在 React 挂载**前**写好
+  `data-theme`（否则深色用户闪一下白底）。改主题判定口径时，脚本与
+  `theme.jsx` 要一起改。
+- **antd**：`theme.darkAlgorithm` + 深色档语义色（主色 `#597ef7`、成功
+  `#95de64`、警告 `#ffc069`、错误 `#ff7875`、底 `#141414`）——浅底上的深色文字
+  在深底上对比度是反的，不能沿用。
+- **antd 派生 token 的坑**：`colorLink` 是派生 token（取色阶第 6 档），深色下落到
+  `#4f6ed5`（对 `#141414` 仅 3.97:1）⇒ 深色下用 CSS 覆盖链接/分页/选中菜单项/
+  预设 Tag 的字色到亮档。
+- **图表**：uPlot 轴文字默认纯黑、网格 7% 黑 ⇒ 按深浅给 `stroke`/`grid.stroke`
+  （`UPlotChart` 建图 effect 依赖 `isDark`，切主题 ⇒ 图表重建重绘）；
+  热力图格子文字按「合成色亮度」选黑/白（深色下低 alpha 格子合成后接近卡片底）。
+- **验收**：playwright 双主题跑 10 个页面截图 + DOM 对比度自动检查（正文 4.5:1、
+  大字 3:1），有不足项必须清零；切主题另测一遍（三态循环/刷新持久化/图表重绘/
+  控制台无报错）。
+
 **状态灯规范**（Tag，全局统一，颜色+文字双通道，禁纯颜色表意）：
 
 | 语义 | Tag | 文案示例 |
@@ -210,26 +250,61 @@ antd 5 默认视觉即扁平企业风；不引入任何装饰性风格（玻璃�
 ### Phase 3 —— 可选（按需立项）
 
 - ~~总览页做默认落地页~~ **已做**（`OverviewPage.jsx`，菜单首项 + 默认路由）。
-- 审计表 >50 行虚拟滚动（若分页已够快则不做）。
-- 暗色模式（OLED 风，token 已分层时成本低）——运维夜班场景再说。
+- ~~审计表 >50 行虚拟滚动（若分页已够快则不做）~~ **不做**（2026-10-20 实测：
+  服务端分页 50 行/页，接口 25ms、响应 20KB，DOM 只有 50 行 ⇒ 虚拟滚动没有收益，
+  反而多一层滚动同步 bug 风险；口径：真要上万行再谈）。
+- ~~暗色模式（OLED 风，token 已分层时成本低）~~ **已做**（2026-10-20，见 §2.1：
+  跟随系统 / 浅色 / 深色三态，顶栏可切；表面色走 CSS 变量，antd 走 darkAlgorithm）。
 
-### Token 落点：`main.jsx` ConfigProvider
+### 落点：`src/theme.jsx` ThemeProvider
+
+主题判定与 antd token 只有这一处；页面组件用 `useTheme()` 取 `{ mode, isDark, setMode }`。
 
 ```jsx
+// main.jsx
+import { ThemeProvider } from './theme.jsx';
+<ThemeProvider><App /></ThemeProvider>
+
+// theme.jsx（节选）
+const isDark = mode === 'dark' || (mode === 'system' && sysDark);
+useEffect(() => {
+  document.documentElement.dataset.theme = isDark ? 'dark' : 'light';
+}, [isDark]);
+
 <ConfigProvider locale={zhCN} theme={{
+  algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
   token: {
-    colorPrimary: '#2f54eb',
-    colorBgLayout: '#f5f6f8',
+    colorPrimary: isDark ? '#597ef7' : '#2f54eb',
+    colorBgLayout: isDark ? '#141414' : '#f5f6f8',
     fontSize: 14,
     fontSizeSM: 13,            // 数据密集表格
     borderRadius: 8,
     motionDurationMid: '0.2s',
   },
   components: {
-    Table: { headerBg: '#FAFAFA' },
+    Table: { headerBg: isDark ? '#1d1d1d' : '#FAFAFA' },
     Card:  { paddingLG: 16 },
   },
 }}>
 ```
 
 其余 token 一律用 antd 默认 —— 不改就没有 bug。
+
+### 交付（首屏）口径 —— 2026-10-20 定
+
+管理台是内网工具，但首屏仍要传几百 KB ⇒ 交付侧三条硬规矩：
+
+1. **分包**（`vite.config.js`）：`manualChunks` 只留 `react`/`react-dom`（稳定
+   vendor 141KB，跨版本缓存命中）；**antd 不进 vendor**——整包进 vendor 会让首屏
+   下载「全站所有页面用到的 antd 并集」（实测 1089KB）。antd 交给 Rollup 按页
+   自然拆分：首屏只带 shell 用的组件，页面各自/共享 chunk 随页懒载。
+2. **传输压缩**（服务端 `src/gateway/main.py`）：`GZipMiddleware(minimum_size=1024,
+   compresslevel=6)`。starlette 默认排除 `text/event-stream`、流式响应不压 ⇒
+   管理台状态条 SSE 不受影响。实测首屏 JS 传输 1139KB → 384KB（-66%）。
+3. **缓存头**（服务端 `_AdminStaticFiles`）：`assets/` 是内容哈希文件名 ⇒
+   `public, max-age=31536000, immutable`；入口（index.html）`no-cache`（旧入口
+   引用已删 chunk 会 404）。
+
+> 改前端后验收：`npm run build`（含 eslint）→ 核对 entry 引用的 chunk 都在磁盘
+> → playwright 无头实测（首屏 JS 传输量 + 关键交互 + 双主题对比度）。
+

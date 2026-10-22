@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Row, Col } from 'antd';
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
+import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
 // ---------------- Provider 注册表（routing.yaml 读写；密钥仍只走 env） ----------------
@@ -88,14 +89,14 @@ function ProviderRegistryCard() {
 
   const rows = data?.providers || [];
   return (
-    <Card title="注册表"
+    <Card title={<>注册表<Tip term="provider" /></>}
       extra={<Button type="primary" size="small" onClick={() => openModal(null)}>新增 provider</Button>}>
       <Table size="small" sticky={wideSticky()} rowKey="name" className="tbl-registry" pagination={false} tableLayout="fixed" dataSource={rows} columns={[
         /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。Key 列已删（2026-10-16）：
            环境变量名+已配/缺 信息密度低，配/改 入口并入操作列 */
         { title: '名称', dataIndex: 'name', width: '14%', ellipsis: true },
-        { title: 'base_url', dataIndex: 'base_url', width: '38%', ellipsis: true },
-        { title: '类型', width: '12%', render: (_, r) => (
+        { title: <>{'base_url'}<Tip term="base_url" /></>, dataIndex: 'base_url', width: '38%', ellipsis: true },
+        { title: <>{'类型'}<Tip term="local_provider" /></>, width: '12%', render: (_, r) => (
           <Space size={4}>{r.local ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>内网</Tag> : <Tag style={{ marginInlineEnd: 0 }}>外网</Tag>}{r.kind === 'embedding' && <Tag color="purple" style={{ marginInlineEnd: 0 }}>向量</Tag>}</Space>) },
         { title: '操作', width: '36%', render: (_, r) => (
           <Space>
@@ -120,12 +121,12 @@ function ProviderRegistryCard() {
           <Form.Item name="name" label="名称" rules={[{ required: true, pattern: /^[A-Za-z0-9_-]+$/, message: '仅字母/数字/_/-' }]}>
             <Input placeholder="如 oneapi" />
           </Form.Item>
-          <Form.Item name="base_url" label="base_url" rules={[{ required: true }]}>
+          <Form.Item name="base_url" label={<>{'base_url'}<Tip term="base_url" /></>} rules={[{ required: true }]}>
             <Input placeholder="https://api.example.com/v1" />
           </Form.Item>
           <Row gutter={8}>
             <Col span={12}>
-              <Form.Item name="api_mode" label="接口类型">
+              <Form.Item name="api_mode" label={<>{'接口类型'}<Tip term="api_mode" /></>}>
                 <Select options={(data?.api_modes || ['openai']).map((m) => ({ value: m, label: ({
                   openai: 'OpenAI Compatible',
                   openai_responses: 'OpenAI Responses',
@@ -147,7 +148,7 @@ function ProviderRegistryCard() {
           <Form.Item name="timeout" label="超时（秒）" rules={[{ required: true }]}>
             <InputNumber min={1} max={600} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="local" label="内网 provider（local: true，内容不出境）" valuePropName="checked">
+          <Form.Item name="local" label={<>{'内网 provider（local: true，内容不出境）'}<Tip term="local_provider" /></>} valuePropName="checked">
             <Switch aria-label="内网 provider" />
           </Form.Item>
         </Form>
@@ -197,8 +198,8 @@ export function ProviderHealthCard({ compact = false }) {
           { title: 'Provider', dataIndex: 'name', width: '24%' },
           { title: '状态', width: '12%', render: (_, r) => r.ok ? <Tag color="green">正常</Tag> : <Tag color="red">异常</Tag> },
           ...(!compact && [
-            { title: '延迟(ms)', dataIndex: 'latency_ms', width: '16%' },
-            { title: '模型数', dataIndex: 'model_count', width: '16%' },
+            { title: <>{'延迟(ms)'}<Tip text="这次健康检查往返用了多久（毫秒）。越大说明上游越慢或网络越绕。" /></>, dataIndex: 'latency_ms', width: '16%' },
+            { title: <>{'模型数'}<Tip text="这个上游当前对外提供几个模型可选。" /></>, dataIndex: 'model_count', width: '16%' },
             { title: '操作', width: '32%', render: (_, r) => (
               <Button type="link" size="small" loading={checking} onClick={() => check(r.name)}>检查</Button>) },
           ] || []),
@@ -226,19 +227,26 @@ function CircuitCard() {
     setBusy('');
   };
   const rows = Object.entries(data?.providers || {}).map(([name, p]) => ({ name, ...p }));
+  const cfg = data?.config || {};
   return (
-    <Card title={<>熔断器 <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>（连续失败达阈值后短暂拒绝流量，防止故障扩散）</Text></>}>
+    <Card title={<>熔断器<Tip term="circuit" /></>}>
+      {/* 口径说明常驻小字：每格都要能回答「这一格是什么、为什么是这个值」 */}
+      <Typography.Paragraph type="secondary" style={{ fontSize: 12, lineHeight: 1.8, marginBottom: 10 }}>
+        <div>· <b>打开</b>：滑动窗口 <b>{cfg.window_seconds ?? '—'}s</b> 内失败 ≥ <b>{cfg.failure_threshold ?? '—'}</b> 次即 <b>OPEN</b>（熔断键 = provider::模型，别名组候选与点名请求共用一份状态），该组合之后直接 fail-fast 返回 503（不真实出境）；别名组则跳过该候选顺延下一候选，组内全不可用才 503。</div>
+        <div>· <b>冷却与恢复</b>：OPEN 后冷却 <b>{cfg.recovery_seconds ?? '—'}s</b>（冷却剩余秒数见下表）自动转 <b>HALF_OPEN</b> 放行探针流量，成功 <b>{cfg.success_threshold ?? '—'}</b> 次回 <b>CLOSED</b>（清空失败计数）；探针再失败立刻重新 OPEN 并重新计时。</div>
+      </Typography.Paragraph>
       <Table size="small" sticky={wideSticky()} rowKey="name" className="tbl-circuit" pagination={false} tableLayout="fixed" dataSource={rows}
         columns={[
           /* 列宽用 % 自适应（灌数轮次表口径） */
-          { title: 'Provider', dataIndex: 'name', width: '24%' },
-          { title: '状态', dataIndex: 'state', width: '16%', render: (v) => v === 'open'
+          { title: 'Provider', dataIndex: 'provider', width: '16%' },
+          { title: '模型', dataIndex: 'model', width: '18%', render: (v) => v || '-' },
+          { title: '状态', dataIndex: 'state', width: '12%', render: (v) => v === 'open'
             ? <Tag color="red">OPEN</Tag> : v === 'half_open' ? <Tag color="orange">HALF_OPEN</Tag> : <Tag color="green">CLOSED</Tag> },
-          { title: '窗口内失败', dataIndex: 'failure_count_window', width: '16%' },
-          { title: '冷却剩余(s)', dataIndex: 'cooldown_remaining_s', width: '16%' },
-          { title: '操作', width: '28%', render: (_, r) => (
+          { title: '窗口内失败', dataIndex: 'failure_count_window', width: '12%' },
+          { title: '冷却剩余(s)', dataIndex: 'cooldown_remaining_s', width: '12%' },
+          { title: '操作', width: '30%', render: (_, r) => (
             <Space>
-              <Popconfirm title={`手动打开 ${r.name} 熔断？该 provider 请求将 fail-fast（不真实出境）：别名组切链内下一候选（跳过内网候选），点名请求直接 503；整组不可用即 503，不会静默转本地`}
+              <Popconfirm title={`手动打开 ${r.provider}${r.model ? '::' + r.model : ''} 熔断？该组合的请求将 fail-fast（不真实出境）：别名组切链内下一候选（跳过内网候选），点名请求直接 503；整组不可用即 503，不会静默转本地`}
                 onConfirm={() => setState(r.name, 'open')}>
                 <Button type="link" size="small" danger loading={busy === r.name}>打开</Button>
               </Popconfirm>

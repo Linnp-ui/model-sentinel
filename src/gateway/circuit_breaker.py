@@ -7,6 +7,16 @@ from collections import deque
 from typing import Dict, Optional
 
 
+def key_for(provider: str, model: str) -> str:
+    """熔断键 = provider::model。
+
+    别名组候选与「点名某个模型」的请求必须共用同一份状态：否则上游挂了时，
+    点名请求已熔断、别名组照打同一 provider（熔断形同虚设）。
+    provider 名不含 "::"（路由配置里限 [A-Za-z0-9_-]），不会与模型名撞键。
+    """
+    return f"{provider}::{model}"
+
+
 class CircuitBreaker:
     """Per-provider circuit breaker.
 
@@ -21,6 +31,7 @@ class CircuitBreaker:
         AI_GATEWAY_CB_RECOVERY_SECONDS      (default 30) OPEN -> HALF_OPEN cooldown
         AI_GATEWAY_CB_SUCCESS_THRESHOLD     (default 2)  successes in HALF_OPEN to close
 
+    键 = provider::model（见 key_for）：别名组与点名请求共用一份状态。
     Thread-safe. Lock granularity: one lock per provider (dict of locks).
     """
     STATE_CLOSED = "closed"

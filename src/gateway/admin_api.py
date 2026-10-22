@@ -185,7 +185,11 @@ class KeysImportReq(BaseModel):
 
 @router.post("/keys/import")
 def import_keys_api(body: KeysImportReq):
-    """批量导入：每行 名称,key 逗号分隔（全角逗号兼容），# 起头为注释。逐行返回结果，响应不含完整 key。"""
+    """批量导入（手写 key）：每行一条，`名称,key` 逗号分隔（全角逗号兼容）。
+
+    只写 key 不写名称也收 —— 名称自动取 `导入-<行号>`（统计归因用；手头只有 key 时用）。
+    `#` 起头为注释。逐行返回结果，响应不含完整 key（只回掩码）。
+    """
     results = []
     added = 0
     for idx, raw in enumerate(body.text.splitlines(), 1):
@@ -197,8 +201,7 @@ def import_keys_api(body: KeysImportReq):
         elif "，" in line:
             name, key = line.split("，", 1)
         else:
-            results.append({"line": idx, "key_masked": "", "status": "invalid", "message": "缺少逗号分隔"})
-            continue
+            name, key = "", line  # 只给了 key：名称按行号自动生成
         key = key.strip()
         name = name.strip()
         if name.startswith("sk-") or name.startswith("pk_"):
@@ -208,14 +211,13 @@ def import_keys_api(body: KeysImportReq):
             results.append({"line": idx, "key_masked": (key if "*" in key else mask_key(key)), "status": "invalid", "message": "key 至少 8 位"})
             continue
         if not name:
-            results.append({"line": idx, "key_masked": (key if "*" in key else mask_key(key)), "status": "invalid", "message": "缺少名称"})
-            continue
+            name = f"导入-{idx:02d}"
         if len(name) > 128:
             results.append({"line": idx, "key_masked": (key if "*" in key else mask_key(key)), "status": "invalid", "message": "名称过长"})
             continue
         try:
             get_admin_store().create_api_key(key, name)
-            results.append({"line": idx, "key_masked": (key if "*" in key else mask_key(key)), "status": "ok", "message": ""})
+            results.append({"line": idx, "key_masked": (key if "*" in key else mask_key(key)), "status": "ok", "message": name})
             added += 1
         except ValueError as e:
             msg = str(e)
@@ -644,7 +646,7 @@ def build_public_models() -> list:
     main.list_models 与管理端 /models/public 共用，两端保证一致。
     """
     from .model_policy import load_model_policy
-    from .user_models import get_store
+    from .user_models import find_provider, get_store
     data: list = []
     now = int(time.time())
     seen: set = set()
@@ -668,8 +670,16 @@ def build_public_models() -> list:
             },
         })
     try:
+        from .routing import load_routing
+        _rcfg = load_routing()
         for im in load_model_policy().internal_models:
             if not im.enabled or im.model in seen:
+                continue
+            # 只暴露「能对话的内网模型」：provider 须在 routing.yaml 里且是 chat。
+            # laya 是 /classify 决策模型（非 chat 协议，model_policy 注释即写「不暴露」），
+            # 暴露出去只会让客户端拿它当对话模型调 → 落回外网上游。
+            _cand = _rcfg.get(im.provider) or find_provider(im.provider)
+            if _cand is None or _cand.kind != "chat":
                 continue
             seen.add(im.model)
             data.append({
@@ -679,7 +689,7 @@ def build_public_models() -> list:
                 "owned_by": "gateway",
                 "gateway": {
                     "kind": "chat",
-                    "local": True,
+                    "local": bool(_cand.local),
                     "provider": im.provider,
                     "model": im.model,
                     "configured": True,
@@ -713,6 +723,59 @@ def public_models_api():
     return {"data": build_public_models()}
 
 
+def _same_provider(a: str | None, b: str | None) -> bool:
+    """provider 名比较：大小写不敏感。
+
+    别名成员 / 策略规则 target 里存的名字可能是展示名（Deepseek），而 routing.yaml 的
+    键是小写（deepseek）——改名级联与删除保护都靠这个比较，大小写敏感就会漏掉引用。
+    """
+    x = str(a or "").strip().lower()
+    y = str(b or "").strip().lower()
+    return bool(x) and x == y
+
+
+def _normalize_alias_providers(members: list) -> list[dict]:
+    """把别名成员的 provider 归一成 routing.yaml 的规范键，并挡住解析不到的名字。
+
+    2026-10-21：别名组曾存 'Deepseek'/'Vllm_Local' 展示名，而 routing.yaml 的键是小写、
+    查找又大小写敏感 ⇒ 走别名路径必然 503（unknown provider）。现在：解析得到就归一成规范键
+    （库里从此只存规范名 ⇒ 改名级联/删除保护的精确匹配永远命中）；解析不到直接 422，
+    并列出可用 provider，不让它进库变运行期 503。
+    """
+    from .providers import load_routing
+    from .user_models import find_provider
+    cfg = load_routing()
+    out: list[dict] = []
+    bad: list[str] = []
+    for m in members:
+        item = m.model_dump() if hasattr(m, "model_dump") else dict(m)
+        pr = str(item.get("provider") or "").strip()
+        if not pr:
+            out.append(item)
+            continue
+        canon = None
+        if pr in cfg.providers:
+            canon = pr
+        else:
+            for k in cfg.providers:
+                if k.lower() == pr.lower():
+                    canon = k
+                    break
+        if canon is None and find_provider(pr) is not None:
+            canon = pr          # 用户自注册模型：名字自定，不归一
+        if canon is None:
+            if pr not in bad:
+                bad.append(pr)
+            out.append(item)
+            continue
+        item["provider"] = canon
+        out.append(item)
+    if bad:
+        raise ValueError(
+            f"provider 不存在：{'、'.join(bad)}；可用：{'、'.join(sorted(cfg.providers))}")
+    return out
+
+
 @router.put("/aliases/{name}")
 def update_alias_group_api(name: str, body: AliasGroupSaveReq):
     """整组保存别名成员（按 priority 升序重排为 10,20,...；最小者为默认）。
@@ -720,9 +783,10 @@ def update_alias_group_api(name: str, body: AliasGroupSaveReq):
     body.new_name 非空且 ≠ URL 组名 → 整组重命名（目标名撞名 422），返回的
     group 为最终名。"""
     try:
+        members = _normalize_alias_providers(body.members)
         saved = get_admin_store().update_alias_group(
             name,
-            [m.model_dump() for m in body.members],
+            members,
             description=body.description,
             new_name=body.new_name,
         )
@@ -847,20 +911,20 @@ def _provider_refs(name: str) -> List[str]:
     for field_, val in (("routing.default_external", cfg.default_external),
                         ("routing.default_local", cfg.default_local),
                         ("routing.default_embedding", cfg.default_embedding)):
-        if val == name:
+        if _same_provider(val, name):
             refs.append(f"{field_}")
     pol = _mp.load_model_policy()
     for c in pol.external_candidates:
-        if c.provider == name:
+        if _same_provider(c.provider, name):
             refs.append(f"外部候选 {name}/{c.model}")
     for c in pol.internal_models:
-        if c.provider == name:
+        if _same_provider(c.provider, name):
             refs.append(f"内部模型 {name}/{c.model}")
     for g in get_admin_store().list_alias_groups():
-        if any(m.get("provider") == name for m in g.get("members", [])):
+        if any(_same_provider(m.get("provider"), name) for m in g.get("members", [])):
             refs.append(f"别名组 {g.get('name')}")
     for rule in _pa.list_policies():
-        if ((rule.get("target") or {}) or {}).get("provider") == name:
+        if _same_provider((rule.get("target") or {}).get("provider"), name):
             refs.append(f"策略规则 {rule.get('name')}")
     seen, out = set(), []
     for r in refs:
@@ -919,10 +983,10 @@ def update_provider_api(request: Request, name: str, body: ProviderUpsertReq):
             mp_doc = _y.safe_load(mp_path.read_text(encoding="utf-8")) or {}
             mp = mp_doc.get("model_policy", mp_doc) if isinstance(mp_doc, dict) else {}
             for c in (mp.get("external_candidates") or []):
-                if c.get("provider") == name:
+                if _same_provider(c.get("provider"), name):
                     c["provider"] = target
             for m in (mp.get("internal_models") or []):
-                if m.get("provider") == name:
+                if _same_provider(m.get("provider"), name):
                     m["provider"] = target
             mp_doc["model_policy" if "model_policy" in mp_doc else "model_policy"] = mp
             # 保持原结构
@@ -939,13 +1003,28 @@ def update_provider_api(request: Request, name: str, body: ProviderUpsertReq):
                 changed = False
                 members = [dict(m) for m in (g.get("members") or [])]
                 for m in members:
-                    if m.get("provider") == name:
+                    if _same_provider(m.get("provider"), name):
                         m["provider"] = target
                         changed = True
                 if changed:
                     store.update_alias_group(g.get("name"), members, description=g.get("description") or "")
-        except Exception:
-            pass
+        except Exception as e:
+            raise HTTPException(422, f"别名组引用更新失败：{e}")
+        # policy 规则 target（不改则规则静默指向已不存在的 provider ⇒ 行为漂移）
+        try:
+            from src.gateway import policy_admin as _pa
+            _op = _operator(request)
+            for rule in _pa.list_policies():
+                tgt = rule.get("target") or {}
+                if not _same_provider(tgt.get("provider"), name):
+                    continue
+                new_rule = dict(rule)
+                new_rule["target"] = {**tgt, "provider": target}
+                _pa.upsert_policy(new_rule, original_name=rule.get("name"), operator=_op)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(422, f"policy 规则 target 更新失败：{e}")
     # move provider entry
     if name in provs:
         entry = provs.pop(name)
@@ -1265,35 +1344,52 @@ class L2ConfigPutReq(BaseModel):
     AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD: Optional[Union[int, Dict[str, int]]] = None
     AI_GATEWAY_SUGGEST_ERROR_RATE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     # 其余建议引擎阈值（原只能改 env 文件；此处补齐后管理台可调 + 落盘重启仍生效）
-    AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS: Optional[int] = Field(default=None, ge=1)
-    AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK: Optional[int] = Field(default=None, ge=1)
-    AI_GATEWAY_KEYTIER_MIN_VIOLATIONS: Optional[int] = Field(default=None, ge=0)
-    AI_GATEWAY_KEYTIER_VIOLATION_RATE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE: Optional[int] = Field(default=None, ge=1)
-    AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS: Optional[int] = Field(default=None, ge=0)
+    AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS: Optional[Union[int, Dict[str, int]]] = None
+    AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK: Optional[Union[int, Dict[str, int]]] = None
+    AI_GATEWAY_KEYTIER_MIN_VIOLATIONS: Optional[Union[int, Dict[str, int]]] = None
+    AI_GATEWAY_KEYTIER_VIOLATION_RATE: Optional[Union[float, Dict[str, float]]] = None
+    AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE: Optional[Union[int, Dict[str, int]]] = None
+    AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS: Optional[Union[int, Dict[str, int]]] = None
     AI_GATEWAY_KEYTIER_WINDOW_HOURS: Optional[float] = Field(default=None, gt=0, le=8760)
-    AI_GATEWAY_SUGGEST_REORDER_MIN_HITS: Optional[int] = Field(default=None, ge=1)
-    AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS: Optional[int] = Field(default=None, ge=1)
+    AI_GATEWAY_SUGGEST_REORDER_MIN_HITS: Optional[Union[int, Dict[str, int]]] = None
+    # 规则7 的两个 AND 条件：累计调用数（0 = 该条件不参与判断）、峰值分钟调用数
+    AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS: Optional[Union[int, Dict[str, int]]] = None
+    # 加限流建议的 AND 条件二：峰值分钟调用数下限（0 = 关闭该条件）
+    AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK: Optional[Union[int, Dict[str, int]]] = None
+    # 建议条数上限：每规则 N 条 / 整卡 N 条
+    AI_GATEWAY_SUGGEST_MAX_PER_RULE: Optional[int] = Field(default=None, ge=1, le=100)
+    AI_GATEWAY_SUGGEST_MAX_TOTAL: Optional[int] = Field(default=None, ge=1, le=200)
+    # 规则4/5/6 独立窗口（0 = 跟随 KEY 分级窗口）
+    AI_GATEWAY_SUGGEST_RULE_WINDOW_HOURS: Optional[float] = Field(default=None, ge=0, le=8760)
+    # 运行态维度规则阈值（0 = 关闭对应规则）
+    AI_GATEWAY_SUGGEST_LATENCY_P95_MS: Optional[int] = Field(default=None, ge=0, le=600000)
+    AI_GATEWAY_SUGGEST_DEGRADE_RATE: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    AI_GATEWAY_SUGGEST_TOKEN_GROWTH: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    # L2 灰区下限（即时生效；上限 20：再高则 25/30 档关键词单命中不再进灰区）
+    AI_GATEWAY_L2_GRAY_FLOOR: Optional[int] = Field(default=None, ge=0, le=20)
     AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS: Optional[int] = Field(default=None, ge=0)
 
 
-def _ser_window_map(v, lo: int, hi: int, key: str) -> str:
-    """按窗口阈值序列化：int=全窗口同值；{hours: value} → '24:20,168:100,720:500'。"""
-    pairs = {}
-    if isinstance(v, int) and not isinstance(v, bool):
-        pairs = {24: v, 168: v, 720: v}
+def _ser_base(v, lo, hi, key: str, cast=int) -> str:
+    """次数类阈值：一律存**基准值**（24 小时窗口口径），各窗口的等比放大由后端算。
+
+    dict 形态（历史分档值）取 **24h 档**当基准 ⇒ 老配置不用手改，保存后自动收敛成基准值。
+    """
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        x = cast(v)
     else:
-        for h, x in (v or {}).items():
+        d = {}
+        for h, val in (v or {}).items():
             try:
-                h_i, x_i = int(h), int(x)
+                d[int(h)] = val
             except (TypeError, ValueError):
                 raise HTTPException(422, f"{key} 窗口/取值非法")
-            if not (lo <= x_i <= hi):
-                raise HTTPException(422, f"{key} 取值须 {lo}-{hi}")
-            pairs[h_i] = x_i
-    if not pairs:
-        raise HTTPException(422, f"{key} 不能为空")
-    return ",".join(f"{h}:{x}" for h, x in sorted(pairs.items()))
+        if not d:
+            raise HTTPException(422, f"{key} 不能为空")
+        x = cast(d.get(24, d[min(d, key=lambda k: abs(k - 24))]))
+    if not (lo <= x <= hi):
+        raise HTTPException(422, f"{key} 取值须 {lo}-{hi}")
+    return x
 
 
 class L2PromptsPutReq(BaseModel):
@@ -1307,9 +1403,9 @@ class L2PromptsPutReq(BaseModel):
 def l2_config_get():
     from src.gateway import small_model as _sm
     from src.gateway import stats_service as _st
+    from src.gateway import main as _m
     from src.gateway.main import wl_l2_sample as _wl
     th = _st._thresholds()
-    win3 = lambda m, d: {str(h): _st.pick_window(m, h, d) for h in (24, 168, 720)}
     return {
         "SMALL_MODEL_ENABLED": _sm.l2_enabled(),
         "SMALL_MODEL_TIMEOUT": _sm.l2_timeout(),
@@ -1320,19 +1416,28 @@ def l2_config_get():
         "AI_GATEWAY_L2_SHADOW": (os.getenv("AI_GATEWAY_L2_SHADOW") or "").strip().lower() == "true",
         "AI_GATEWAY_L2_SHADOW_URL": (os.getenv("AI_GATEWAY_L2_SHADOW_URL") or "").strip(),
         "AI_GATEWAY_WL_L2_SAMPLE": _wl(),
-        "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": win3(th["violation_map"], 20),
-        "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD": win3(th["volume_map"], 1000),
+        "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": th["violation_base"],
+        "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD": th["volume_base"],
         "AI_GATEWAY_SUGGEST_ERROR_RATE": th["error_rate"],
         # 建议引擎其余阈值（与 _thresholds() 同键，弹窗一次取全）
-        "AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS": th["error_min_calls"],
-        "AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK": th["kt_black_calls"],
-        "AI_GATEWAY_KEYTIER_MIN_VIOLATIONS": th["kt_black_min_violations"],
+        # 次数类一律回传**基准值**（24h 口径），各窗口的等比放大由后端算（UI 只显示）
+        "AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS": th["error_min_calls_base"],
+        "AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK": th["kt_black_calls_base"],
+        "AI_GATEWAY_KEYTIER_MIN_VIOLATIONS": th["kt_black_min_violations_base"],
         "AI_GATEWAY_KEYTIER_VIOLATION_RATE": th["kt_violation_rate"],
-        "AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE": th["kt_white_calls"],
-        "AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS": th["kt_revoke_violations"],
+        "AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE": th["kt_white_calls_base"],
+        "AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS": th["kt_revoke_violations_base"],
         "AI_GATEWAY_KEYTIER_WINDOW_HOURS": th["kt_window_hours"],
-        "AI_GATEWAY_SUGGEST_REORDER_MIN_HITS": th["reorder_min_hits"],
+        "AI_GATEWAY_SUGGEST_REORDER_MIN_HITS": th["reorder_min_hits_base"],
         "AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS": th["limit_min_calls"],
+        "AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK": th["limit_min_peak"],
+        "AI_GATEWAY_SUGGEST_MAX_PER_RULE": th["max_per_rule"],
+        "AI_GATEWAY_SUGGEST_MAX_TOTAL": th["max_total"],
+        "AI_GATEWAY_SUGGEST_RULE_WINDOW_HOURS": th["rule_window_hours"],
+        "AI_GATEWAY_SUGGEST_LATENCY_P95_MS": th["latency_p95_ms"],
+        "AI_GATEWAY_SUGGEST_DEGRADE_RATE": th["degrade_rate"],
+        "AI_GATEWAY_SUGGEST_TOKEN_GROWTH": th["token_growth"],
+        "AI_GATEWAY_L2_GRAY_FLOOR": _m._l2_gray_floor(),
         "AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS": th["silent_grace_days"],
         # T46: PUT 落盘 l2_overrides.yaml，启动时由 l2_overrides.apply_overrides 应用
         "persisted": _l2ov.load_overrides(),
@@ -1350,9 +1455,23 @@ def l2_config_put(req: L2ConfigPutReq):
         if k == "AI_GATEWAY_L2_BACKEND":
             v = str(v).strip().lower()
         if k == "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD":
-            v = _ser_window_map(v, 1, 1000, k)
+            v = _ser_base(v, 1, 1000, k)
         elif k == "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD":
-            v = _ser_window_map(v, 1, 100000, k)
+            v = _ser_base(v, 1, 100000, k)
+        elif k == "AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS":
+            v = _ser_base(v, 1, 100000, k)
+        elif k in ("AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK", "AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE"):
+            v = _ser_base(v, 1, 1000000, k)
+        elif k in ("AI_GATEWAY_KEYTIER_MIN_VIOLATIONS", "AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS"):
+            v = _ser_base(v, 0, 100000, k)
+        elif k == "AI_GATEWAY_KEYTIER_VIOLATION_RATE":
+            v = _ser_base(v, 0.0, 1.0, k, float)
+        elif k == "AI_GATEWAY_SUGGEST_REORDER_MIN_HITS":
+            v = _ser_base(v, 1, 100000, k)
+        elif k == "AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS":
+            v = _ser_base(v, 0, 10000000, k)
+        elif k == "AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK":
+            v = _ser_base(v, 0, 100000, k)
         os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
         applied[k] = v
     persisted = _l2ov.save_overrides(applied) if applied else _l2ov.load_overrides()
@@ -1762,6 +1881,49 @@ def l2_divergences_label(req: L2LabelReq):
     return {"ok": True, "labeled": len(ids) if ids else 1}
 
 
+@router.get("/l2/auto-label/models")
+def l2_auto_label_models():
+    """自动标注可选模型：只列内网 chat provider（分歧样本是真实审计内容，不出境）。"""
+    from src.gateway import providers as _prov
+    out = [{"value": n, "label": f"{n}（{p.default_model or '?'}）"}
+           for n, p in (_prov.load_routing().providers or {}).items()
+           if getattr(p, "local", False) and getattr(p, "kind", "chat") == "chat"]
+    return {"models": out}
+
+
+class AutoLabelReq(BaseModel):
+    req_ids: list[str] = Field(default_factory=list)
+    model: str = Field(default="vllm_local", max_length=64)
+
+
+@router.post("/l2-divergences/auto-label")
+def l2_divergences_auto_label(req: AutoLabelReq):
+    """内网模型给分歧样本出标注**建议**（不写库，人工采纳才走 /label）。
+
+    l2_labels 是训练真值（标错即投毒），模型判断不能直接落库；这里只返回
+    {req_id, label, confidence, reason} 草稿，由页面「采纳」触发正式写入。"""
+    from src.gateway import l2_retrain as _l2r
+    from src.gateway import providers as _prov
+
+    provider = (_prov.load_routing().providers or {}).get(req.model)
+    if provider is None:
+        raise HTTPException(404, f"provider 不存在：{req.model}")
+    if not provider.local or getattr(provider, "kind", "chat") != "chat":
+        raise HTTPException(400, "自动标注只允许内网 chat 模型（审计文本不出境）")
+
+    ids = {x for x in req.req_ids if x}
+    rows = [x for x in _l2_divergence_rows(720) if not ids or x["req_id"] in ids]
+    seen: dict[str, dict] = {}
+    for x in rows:                      # 同文本只问一次（与列表去重口径一致）
+        seen.setdefault(_div_group_key(x), x)
+    rows = list(seen.values())[:60]     # 单次上限 60：并发 4、单条 ~2s
+    if not rows:
+        return {"total": 0, "items": []}
+    items = [{"req_id": x["req_id"], "text": x["text_preview"], "filename": x["filename"]}
+             for x in rows]
+    return {"total": len(items), "items": _l2r.auto_label(items, provider)}
+
+
 @router.get("/l2-divergences/export")
 def l2_divergences_export(hours: int = 168, cell: str = "", labeled: str = "all"):
     """导出分歧样本 JSONL（含标注），喂 build_laya_dataset / 离线分析。"""
@@ -1843,8 +2005,12 @@ def events_api(hours: int = 24):
 
 @router.get("/rule-hits")
 def rule_hits_api(hours: int = 168):
-    """L1 规则命中统计：audit_logs 窗口按 rule 聚合（排除 默认放行，含改名前旧名 default_allow
-    的历史行），带 action 分布 + 最后命中（UTC）。沉默规则判断的页面内证据（建议规则 5）。
+    """规则命中统计：audit_logs 窗口按 rule 聚合（排除 默认放行，含改名前旧名 default_allow
+    的历史行）。L2 判决（l2_confidential/l2_unavailable）与系统内置 fail-safe 判定
+    （encoded_keyword/review_text_overflow/first_chunk_fallback/prompt_too_long_fallback）
+    都计入——审计页要显示，规则命中榜保持同一集合，界面上由 ruleZh 标「（系统内置）」，
+    用户一眼能看出它不是可配置规则。带 action 分布 + 最后命中（UTC）。
+    沉默规则判断的页面内证据（建议规则 5）。
     2026-10-14 规则名改中文：改名前历史行按旧英文名出现，窗口滑过后自然消失。"""
     import datetime as _dt
     from src.gateway.audit_store import get_audit_store
@@ -2376,32 +2542,55 @@ def providers_check_api(body: ProviderCheckReq):
 
 @router.get("/circuit")
 def circuit_api():
-    """熔断器逐 provider 明细（state 为已应用 OPEN→HALF_OPEN 自动迁移的有效态）。"""
+    """熔断器逐 provider::model 明细（state 为已应用 OPEN→HALF_OPEN 自动迁移的有效态）。
+
+    熔断键 = provider::model（别名组候选与点名请求共用一份状态），所以这里按
+    「provider + 模型」两列展示；键里带 "::" 的是 provider::model，裸键是 L2
+    小模型那种伪 provider（small_model）。
+    """
     import time as _t
 
-    from src.gateway.circuit_breaker import get_breaker
+    from src.gateway.circuit_breaker import get_breaker, key_for
 
     b = get_breaker()
     now = _t.time()
     recovery = int(os.getenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "30"))
     from src.gateway.providers import load_routing
-    # 全量 provider（含从未跳闸的，默认 closed），便于 UI 直接对任一 provider 手动置位
     snap = b.snapshot()
-    names = list(load_routing().providers)
-    for n in snap:
-        if n not in names:
-            names.append(n)
+    # 已知 (provider, 模型) 组合：routing 默认模型 + 别名组成员 + 外部候选 + 已有状态
+    entries: dict = {}
+    for k in snap:
+        prov_name, sep, m = k.partition("::")
+        entries[k] = (prov_name, m) if sep else (k, "")
+    for name, p in load_routing().providers.items():
+        dm = getattr(p, "default_model", "") or ""
+        entries.setdefault(key_for(name, dm), (name, dm))
+    try:
+        from src.gateway.admin_store import get_admin_store
+        for g in get_admin_store().list_alias_groups():
+            for m in g.get("members") or []:
+                entries.setdefault(key_for(m["provider"], m["model"]), (m["provider"], m["model"]))
+    except Exception:
+        pass
+    try:
+        from src.gateway.model_policy import external_candidates
+        for c in external_candidates():
+            entries.setdefault(key_for(c["provider"], c["model"]), (c["provider"], c["model"]))
+    except Exception:
+        pass
     providers = {}
-    for name in names:
-        s = snap.get(name) or {"state": "closed", "opened_at": 0.0,
-                                       "last_failure": 0.0, "failure_count_window": 0,
-                                       "half_open_successes": 0}
+    for key, (prov_name, m) in sorted(entries.items()):
+        s = snap.get(key) or {"state": "closed", "opened_at": 0.0,
+                              "last_failure": 0.0, "failure_count_window": 0,
+                              "half_open_successes": 0}
         d = dict(s)
-        d["state"] = b.state(name)
+        d["provider"] = prov_name
+        d["model"] = m
+        d["state"] = b.state(key)
         d["cooldown_remaining_s"] = (
-            round(recovery - (now - s["opened_at"]), 1)
+            round(max(0.0, recovery - (now - s["opened_at"])), 1)
             if s["state"] == "open" and s["opened_at"] else 0.0)
-        providers[name] = d
+        providers[key] = d
     return {
         "providers": providers,
         "config": {

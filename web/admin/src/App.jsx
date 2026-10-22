@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useState, useCallback, useRef, Component } from 'react';
 import { Layout, Menu, Tag, Tooltip, Typography, Spin, Button, Alert, Space } from 'antd';
+import { ThemeToggle, useTheme } from './theme.jsx';
 import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
   FileSearchOutlined, CloudServerOutlined,
@@ -63,34 +64,34 @@ function StatusBar() {
   );
   return (
     <div className="app-statusbar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 24px',
-      background: '#fff', borderBottom: '1px solid #f0f0f0', flexWrap: 'wrap' }}>
+      background: 'var(--gw-surface)', borderBottom: '1px solid var(--gw-border)', flexWrap: 'wrap' }}>
       <span style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, flexWrap: 'wrap' }}>
       <Text type="secondary" style={{ fontSize: 12 }}>网关运行状态</Text>
       {node(st.l2On ? 'green' : 'red', !st.l2On,
-        `权威后端 ${st.l2Backend}｜影子 ${st.l2Shadow ? '开（并行打标，不改路由）' : '关'}｜关闭时 L2 不可用将放行（AI_GATEWAY_L2_FAIL_MODE）`,
+        `内容审查小模型（L2：判断内容是不是机密）｜当前用 ${st.l2Backend}｜影子 ${st.l2Shadow ? '开（并行打标，不改路由）' : '关'}｜审查小模型不可用时按配置放行或转内网`,
         `L2 审查·${st.l2Backend}${st.l2On && st.l2Shadow ? '·影子开' : ''}`)}
       {node((st.extMissing.length || st.extDown.length) ? 'orange' : 'green', false,
         [st.extDown.length
-          ? `外网 provider 失联（上游/网络，30s 探测）：${st.extDownTip.join('、')}`
+          ? `外网模型服务连不上（上游或网络问题，30s 探测一次）：${st.extDownTip.join('、')}`
           : '',
           st.extMissing.length
-            ? `未配网关 key：${st.extMissing.join(', ')}（Provider 管理页可一键配置）`
+            ? `这几个外网服务还没配网关用的 key：${st.extMissing.join(', ')}（到「Provider 管理」页可一键配置）`
             : (!st.extDown.length ? '全部外网 provider 在线且 key 已配置' : ''),
         ].filter(Boolean).join('；'),
         `外网 key ${st.extTotal - st.extMissing.length}/${st.extTotal}${st.extDown.length ? ` 失联:${st.extDown.join(',')}` : ''}`)}
       {node((st.localDown.length || st.localMissing.length) ? 'red' : 'blue',
         st.localDown.length > 0 || st.localMissing.length > 0,
         st.localDown.length
-          ? `内网 provider 失联（模型没起来，30s 探测）：${st.localDownTip.join('、')}`
+          ? `内网模型服务连不上（模型没起来，30s 探测一次）：${st.localDownTip.join('、')}`
           : st.localMissing.length
-            ? `未配置（缺 base_url）的内网 provider：${st.localMissing.join(', ')}`
+            ? `这几个内网服务还没填地址（缺 base_url）：${st.localMissing.join(', ')}`
             : '内网 provider 均已配置且在线',
         `内网 ${st.localName}${st.localDown.length ? ` 失联:${st.localDown.join(',')}` : st.localMissing.length ? ` 缺${st.localMissing.join(',')}` : ''}`)}
       {st.open.length
         ? node('red', true, `熔断 open：${st.open.join(', ')}`, `熔断 ${st.open.length}（${st.open.join(', ')}）`)
         : node('green', false, '全部熔断闭合', '熔断正常')}
       {node(st.dropped > 0 ? 'orange' : st.auditBad ? 'red' : 'green',
-        st.dropped > 0 || st.auditBad, st.auditTip,
+        st.dropped > 0 || st.auditBad, `审计日志（每次调用的记录）写入情况：${st.auditTip}`,
         st.dropped > 0 ? `审计丢行 ${st.dropped}` : st.auditBad ? '审计/DB 异常' : '审计/DB 正常')}
       </span>
     </div>
@@ -196,6 +197,7 @@ const readPage = () => {
 
 export default function App() {
   const [page, setPage] = useState(readPage);
+  const { isDark } = useTheme();
   // 侧栏收起/展开（Sider 底部触发条切换）；收起 64 只留图标
   const [collapsed, setCollapsed] = useState(false);
   // 展开=折叠倒放：先保持图标模式扩宽度（200ms=Sider 宽度过渡），到位后菜单/标题才出现；
@@ -243,7 +245,8 @@ export default function App() {
   return (
     <Layout style={{ minHeight: '100vh' }}>
       {/* 真 fixed：sticky 在 body 滚动 + flex 下每帧重算会抖，fixed 一次定位不再动 */}
-       <Sider theme="light" width={180} collapsedWidth={64} collapsible collapsed={collapsed}
+       {/* Sider 主题跟当前深浅：深色下仍用 theme="light"，继承文字色是黑色（深底上不可见） */}
+       <Sider theme={isDark ? 'dark' : 'light'} width={180} collapsedWidth={64} collapsible collapsed={collapsed}
         trigger={null}
         onCollapse={onSiderCollapse} style={{ position: 'fixed', left: 0, top: 0, bottom: 0,
         height: '100vh', overflowY: 'auto', overflowX: 'hidden', zIndex: 11 }}>
@@ -257,7 +260,7 @@ export default function App() {
         {/* 顶部常驻块：标题在上、状态条在下。真 fixed（sticky 滚动抖），高度实测后内容区让位。
             left 随侧栏宽度联动（CSS 里 180 只是兜底） */}
         <div className="app-topbar" ref={topRef} style={{ left: siderW, transition: 'left 0.2s' }}>
-        <Header className="app-header" style={{ background: '#fff', borderBottom: '1px solid #f0f0f0',
+        <Header className="app-header" style={{ background: 'var(--gw-surface)', borderBottom: '1px solid var(--gw-border)',
           fontSize: 18, height: 48, lineHeight: '48px', display: 'flex', alignItems: 'center', padding: '0px 24px 0px 36px' }}>
           {/* 当前页图标（派生自侧边栏菜单）在标题左侧 */}
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
@@ -265,6 +268,8 @@ export default function App() {
           </span>
           {/* 各页工具栏插槽（StatsPage 用 Portal 把控件挂到标题右边，随页卸载自动清空） */}
           <div id="page-toolbar-slot" style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }} />
+          {/* 主题切换（跟随系统 → 浅色 → 深色 三态循环） */}
+          <ThemeToggle />
         </Header>
         <StatusBar />
         </div>

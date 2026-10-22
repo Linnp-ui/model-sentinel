@@ -107,7 +107,7 @@ docker compose up -d gateway redis
 L1 allow **且** `risk_score >= 20`（下限 env `AI_GATEWAY_L2_GRAY_FLOOR`，**无上界**）**且**
 （机密会话 **或** 非白名单豁免）→ L2（2026-09-23 起取消字数触发，只看风险分）；
 白名单 key 95% 跳 L2（5% 抽样）；
-`/v1/embeddings` 永不 L2。
+`/v1/embeddings` 同样走 `_review_text`（与 chat 同源：灰区 L2 / 文件名污染 / body 上限同口径）。
 **全本地别名组**（启用候选 provider 全内网，如 `local-model`，`main._all_local_alias`）
 跳过 L1/L2 直接 allow：内容不可能出境（所有故障切换路径跳过 local 候选，全组失败 fail-loud）。
 
@@ -129,7 +129,7 @@ L1 allow **且** `risk_score >= 20`（下限 env `AI_GATEWAY_L2_GRAY_FLOOR`，**
 **门逻辑没动**——20 档恰落灰区下界、判密仍归 L2）；回归
 `test_l1_rules_catch_obfuscated_negative_samples`。历史（原缺口实测 / 版本矩阵 / 漏网数）见 `agents/gotchas.md`。
 
-block 只由 priority 20/25 两条正则规则决定，与分值无关
+block 只由 `block_secrets`（priority 3，排在所有 route_local 之前）一条规则决定，与分值无关
 （`severity` / `RISK_THRESHOLD_BLOCK` 曾是死字段，2026-09-29 从未读过，
 2026-10-09 已从 `inspection.py` 删除 —— 别再加回来）。
 **灰区探针/压测只许 `vllm_local/qwen2.5:7b` 斜杠写法**：`local-model` 别名走

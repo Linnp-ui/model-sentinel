@@ -7,13 +7,28 @@
 # 数值比较必须写成 "- 字段 >=: 值"（裸 "- 字段 >= 值" 会被 YAML 解析成字符串）。
 # 完整规则语义见 README「策略说明」；管理台规则页可增删改并干跑测试。
 policies:
-- name: pii_weighted_route_local
-  priority: 5
-  action: route_local
-  description: PII 加权评分 >= 60 转内网 (身份证 70/银行卡 Luhn 60; 密钥类 90+)
+- name: block_secrets
+  priority: 3
+  action: block
+  description: 密钥/私钥 直接拦截（DeepSeek sk-+32hex / AWS AKIA / PEM / Anthropic / GitHub
+    / aws_secret）。priority 3 压过全部 route_local 规则：block 的安全语义优先于命中频率序—— 否则 PII 加权 p5
+    抢先命中，reject 模式（on_block=reject）对密钥永远 403 不了（2026-10-19 红队）
   when:
     any:
-    - findings.weighted_pii_score >=: 60
+    - text matches_regex: AKIA[0-9A-Z]{16}
+    - text matches_regex: '-----BEGIN (RSA )?PRIVATE KEY-----'
+    - text matches_regex: sk-[0-9a-fA-F]{32}
+    - text contains_any:
+      - sk-ant-
+      - ghp_
+      - aws_secret
+- name: tainted_file_ref
+  priority: 5
+  action: route_local
+  description: 文件名污染（客户端无感的会话替代）：同一 key 下曾判机密的文件名被正文提及即走本地，TTL 同 session
+  when:
+    any:
+    - tainted_file.hit == true: true
   target:
     provider: vllm_local
     model: qwen2.5:7b
@@ -69,21 +84,6 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
-- name: block_secrets
-  priority: 3
-  action: block
-  description: '密钥/私钥 直接拦截（DeepSeek sk-+32hex / AWS AKIA / PEM / Anthropic /
-    GitHub / aws_secret）。priority 3 压过全部 route_local 规则：block 的安全语义优先于命中频率序——
-    否则 PII 加权 p5 抢先命中，reject 模式（on_block=reject）对密钥永远 403 不了（2026-10-19 红队）'
-  when:
-    any:
-    - text matches_regex: AKIA[0-9A-Z]{16}
-    - text matches_regex: '-----BEGIN (RSA )?PRIVATE KEY-----'
-    - text matches_regex: sk-[0-9a-fA-F]{32}
-    - text contains_any:
-      - sk-ant-
-      - ghp_
-      - aws_secret
 - name: unparsed_binary_route_local
   priority: 13
   description: 'P0-3b fix: 扩展名伪装 / 未知或损坏二进制（magic 嗅探失败或富格式分支解析失败） -> fail-CLOSED route_local，取代旧的「把二进制
@@ -96,13 +96,13 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
-- name: tainted_file_ref
+- name: pii_weighted_route_local
   priority: 20
   action: route_local
-  description: 文件名污染（客户端无感的会话替代）：同一 key 下曾判机密的文件名被正文提及即走本地，TTL 同 session
+  description: PII 加权评分 >= 60 转内网 (身份证 70/银行卡 Luhn 60; 密钥类 90+)
   when:
     any:
-    - tainted_file.hit == true: true
+    - findings.weighted_pii_score >=: 60
   target:
     provider: vllm_local
     model: qwen2.5:7b

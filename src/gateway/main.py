@@ -61,6 +61,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from starlette.concurrency import run_in_threadpool
 
+from starlette.middleware.gzip import GZipMiddleware
+
 
 from .inspection import inspect_text
 
@@ -104,6 +106,8 @@ from .redaction import redact_audit_entry
 from .responses_filectx import extract_responses_filectx, responses_should_mark
 
 from .stat_scope import is_blocked, is_local_route, resolve_action, to_beijing
+
+from .rule_names import rule_match_text
 
 from .rate_limit import get_limiter, extract_client_key as _rl_key
 from .identity import (
@@ -152,6 +156,13 @@ def _pii_audit_summary(tf) -> dict | None:
 
 
 app = FastAPI(title="Secure Gateway — 大模型请求统一审查出口", version="0.3.0")
+
+
+# 响应 gzip：管理台首屏 561KB JS 原样传输，gzip 后约 190KB（内网也省）。
+# starlette 默认排除 text/event-stream（SSE 不压缩不缓冲 ⇒ 状态条推送不受影响），
+# 且流式响应整体不压缩；上游已带 content-encoding 的响应也不重复压。
+# compresslevel=6（默认 9 对 400KB 级 chunk CPU 偏高，收益差 1%）。
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
 # P2: middleware 抓 HTTP 响应码, set_current_status() 写到 ContextVar;
@@ -910,7 +921,18 @@ _L2_SCOPE_MAX_BLOCKS = 5      # = classify_chunks 的 chunks[:5] 硬上限
 # 现在**去掉上界**：PII>=60 的请求不会走到这里——priority 5 已判 route_local，
 # 门的第一个条件 `action == "allow"` 就是 False，对 PII 是零行为变化（死代码）。
 # 剩下的全是「L1 放行但分值偏高」= 关键词驱动，交给 L2 语义判定。
-_L2_GRAY_FLOOR = int((os.getenv("AI_GATEWAY_L2_GRAY_FLOOR", "20") or 20).strip() or 20)
+def _l2_gray_floor() -> int:
+    """灰区强制 L2 的 risk_score 下限（env 可调、**即时生效**：每次调用读 env，
+    管理台改完不用重启；2026-10-21 从模块常量改为函数）。
+
+    上限钉 20：再高则 inspection.KEYWORD_WEIGHTS 里 25/30 档关键词
+    （图纸/身份证/机密/绝密…）单命中就不再进灰区 ⇒ 审查被削弱，故不允许调高。
+    """
+    try:
+        v = int((os.getenv("AI_GATEWAY_L2_GRAY_FLOOR", "20") or 20).strip() or 20)
+    except (TypeError, ValueError):
+        return 20
+    return max(0, min(20, v))
 
 
 def _l2_gray_trigger(findings) -> bool:
@@ -921,7 +943,7 @@ def _l2_gray_trigger(findings) -> bool:
     """
     try:
         s = int((findings or {}).get("risk_score") or 0)
-        return s >= _L2_GRAY_FLOOR
+        return s >= _l2_gray_floor()
     except Exception:
         return False
 
@@ -1983,6 +2005,27 @@ async def favicon():
     p = os.path.join(os.path.dirname(__file__), "../../static/favicon.png")
     if os.path.exists(p):
         return FileResponse(p, media_type="image/png")
+    return Response(status_code=404)
+
+
+@app.get("/ca.crt")
+async def ca_cert():
+    """内网 CA 根证书下载：浏览器/客户端装入信任库后，网关证书不再"不安全"。"""
+    p = os.path.join(os.path.expanduser("~"), ".config", "gateway", "tls", "ca.crt")
+    if os.path.exists(p):
+        return FileResponse(p, media_type="application/x-x509-ca-cert",
+                            filename="gateway-internal-ca.crt")
+    return Response(status_code=404)
+
+
+@app.get("/ca.crl")
+async def ca_crl():
+    """内网 CA 的吊销列表（CRL）：证书 crlDistributionPoints 指向此路径，供
+    Windows/schannel 等做吊销检查（无 CDP 时报 CRYPT_E_NO_REVOCATION_CHECK）。
+    证书在 ~/.config/gateway/tls/（仓库外），空 CRL 由 deploy 流程生成。"""
+    p = os.path.join(os.path.expanduser("~"), ".config", "gateway", "tls", "ca.crl")
+    if os.path.exists(p):
+        return FileResponse(p, media_type="application/pkix-crl")
     return Response(status_code=404)
 
 
@@ -3247,6 +3290,7 @@ async def admin_login_submit(request: Request, next: Optional[str] = None):
         max_age=_ADMIN_SESSION_TTL_S,
         httponly=True,
         samesite="lax",
+        secure=True,  # 2026-10-21 起网关只讲 https（uvicorn --ssl-certfile），cookie 不走明文
         path="/",
     )
     return resp
@@ -3285,6 +3329,106 @@ def _enrich_audit_key_name(rows) -> None:
             pass
 
 
+def _audit_row_match_q(e, ql) -> bool:
+    """审计行全文搜索单行判定（列表接口与 CSV 导出共用一套口径）。"""
+    # “local/external”只是前端渲染标签（local 布尔），落库字段里没有这个串；
+    # 搜这几个词时按路由归属匹配，否则 external 永远搜不到（与表格 Tag 口径一致：缺 local 视为 external）。
+    q_route = None
+    if ql in ("external", "外部", "外发"):
+        q_route = False
+    elif ql in ("local", "本地"):
+        q_route = True
+    if q_route is not None:
+        v = e.get("local")
+        if v is None:
+            v = e.get("local_flag")          # MySQL 行用 local_flag（热窗行用 local）
+        _is_local = v is True or v in (1, "1", "true", "True")
+        if _is_local == q_route:
+            return True
+    for k in ("text_preview", "filename", "requested_model", "model", "provider",
+              "rule", "client_ip", "type", "token_masked", "key_name"):
+        v = e.get(k)
+        if v and ql in str(v).lower():
+            return True
+    # 规则名按中文显示名一起匹配：用户搜「L2 判密」要能命中 rule=l2_confidential
+    if ql in rule_match_text(e.get("rule") or "").lower():
+        return True
+    # l2 判定 JSON（含影子 shadow_*）：搜 shadow_degraded / CONFIDENTIAL 等可定位 L2 记录
+    try:
+        import json as _js
+        if ql in _js.dumps(e.get("l2") or {}, ensure_ascii=False).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _audit_shadow_mismatch(e) -> bool:
+    """主影判定不一致（影子验收筛选用；无影子/主判定降级的不算）。"""
+    l2 = e.get("l2")
+    if not isinstance(l2, dict):
+        return False
+    sl = l2.get("shadow_label")
+    return sl in ("CONFIDENTIAL", "NORMAL") and not l2.get("degraded") and sl != l2.get("label")
+
+
+def _audit_filter_rows(rows, *, ip="", token="", action="", provider="", rule="", type_="",
+                       q="", shadow="", since_dt=None, until_dt=None):
+    """审计行统一筛选（列表接口与 CSV 导出共用，避免两处口径漂移）。
+
+    ⚠️ 筛选项是**叠加**（AND）关系：时间窗必须作用在已按 action/rule 等筛过的集合上。
+    早前实现从 all_entries 重算时间窗，把 action 过滤整个冲掉 → 筛「本地路由」
+    却看到放行行（顶层 total 也与 mysql KPI 对不上）。
+    """
+    out = list(rows or [])
+    if ip:
+        ip = ip.strip()
+        if ip:
+            out = [e for e in out if ip in (e.get("client_ip") or "")]
+    if token:
+        token = token.strip()
+        if token:
+            _tl = token.lower()
+            out = [e for e in out if _tl in str(e.get("token_masked") or "").lower()
+                   or _tl in str(e.get("key_name") or "").lower()]
+    if action:
+        action = action.strip()
+        if action:
+            out = [e for e in out if e.get("action") == action]
+    if provider:
+        provider = provider.strip()
+        if provider:
+            out = [e for e in out if (e.get("provider") or "") == provider]
+    if rule:
+        rule = rule.strip()
+        if rule:
+            out = [e for e in out if (e.get("rule") or "") == rule]
+    if type_:
+        type_ = type_.strip()
+        if type_:
+            out = [e for e in out if (e.get("type") or "") == type_]
+    # 时间窗：解析不出时间的行在有窗口时丢弃（与旧口径一致）
+    if since_dt or until_dt:
+        tmp = []
+        for e in out:
+            t = _parse_window_ts(e.get("time") or e.get("ts") or "")
+            if not t:
+                continue
+            if since_dt and t < since_dt:
+                continue
+            if until_dt and t > until_dt:
+                continue
+            tmp.append(e)
+        out = tmp
+    if q:
+        ql = q.strip().lower()
+        if ql:
+            out = [e for e in out if _audit_row_match_q(e, ql)]
+    if (shadow or "").strip() == "mismatch":
+        out = [e for e in out if _audit_shadow_mismatch(e)]
+    return out
+
+
 @app.get("/admin/audit/entries", dependencies=[Depends(admin_page_auth)])
 
 async def audit_entries_api(request: Request, ip: Optional[str] = None, token: Optional[str] = None, action: Optional[str] = None, page: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None, provider: Optional[str] = None, rule: Optional[str] = None, q: Optional[str] = None, sort: Optional[str] = None, shadow: Optional[str] = None):
@@ -3309,113 +3453,14 @@ async def audit_entries_api(request: Request, ip: Optional[str] = None, token: O
     # 仪表盘筛选：始终基于 Redis 热缓存 tail（oldest-first），内存过滤后分页，保持与表格一致
     all_entries = store.tail(fetch_n)
     _enrich_audit_key_name(all_entries)
-    entries = all_entries
-    if ip:
-
-        ip = ip.strip()
-        if ip:
-
-            entries = [e for e in entries if ip in (e.get("client_ip") or "")]
-
-    if token:
-
-        token = token.strip()
-        if token:
-
-            _tl = token.lower()
-            entries = [e for e in entries if _tl in str(e.get("token_masked") or "").lower() or _tl in str(e.get("key_name") or "").lower()]
-
-    if action:
-
-        action = action.strip()
-        if action:
-
-            entries = [e for e in entries if e.get("action") == action]
-
-    if provider:
-
-        provider = provider.strip()
-        if provider:
-
-            entries = [e for e in entries if (e.get("provider") or "") == provider]
-
-    if rule:
-
-        rule = rule.strip()
-        if rule:
-
-            entries = [e for e in entries if (e.get("rule") or "") == rule]
-
     # 时间范围：since/until 支持 1h/24h/7d/30d 或 YYYY-MM-DD 或 ISO
     # 朴素日期串按用户口径（北京）解释，内部换算 UTC 与存储比较
     since_dt = _parse_window_ts(since, naive_as_utc=False)
     until_dt = _parse_window_ts(until, is_until=True, naive_as_utc=False)
-    if since_dt or until_dt:
-        tmp = []
-        for e in all_entries:
-            t = _parse_window_ts(e.get("time") or e.get("ts") or "")
-            if not t:
-
-                continue
-
-            if since_dt and t < since_dt:
-
-                continue
-
-            if until_dt and t > until_dt:
-
-                continue
-
-            tmp.append(e)
-
-        entries = tmp
-
-    if q:
-
-        q=q.strip()
-        if q:
-
-            ql=q.lower()
-            def _is_local(e):
-                v = e.get("local")
-                return v is True or v in (1, "1", "true", "True")
-            # “local/external”只是前端渲染标签（local 布尔），落库字段里没有这个串；
-            # 搜这几个词时按路由归属匹配，否则 external 永远搜不到（与表格 Tag 口径一致：缺 local 视为 external）。
-            q_route = None
-            if ql in ("external", "外部", "外发"):
-                q_route = False
-            elif ql in ("local", "本地"):
-                q_route = True
-            def _match(e):
-                if q_route is not None and _is_local(e) == q_route:
-                    return True
-                for k in ("text_preview","filename","requested_model","model","provider","rule","client_ip","type","token_masked","key_name"):
-
-                    v=e.get(k)
-                    if v and ql in str(v).lower():
-
-                        return True
-                # l2 判定 JSON（含影子 shadow_*）：搜 shadow_degraded / CONFIDENTIAL 等可定位 L2 记录
-                try:
-                    import json as _js
-                    if ql in _js.dumps(e.get("l2") or {}, ensure_ascii=False).lower():
-                        return True
-                except Exception:
-                    pass
-
-                return False
-
-            entries=[e for e in entries if _match(e)]
-
-    # 影子筛选：shadow=mismatch 只留主影 label 不一致的（影子验收专用；无影子/主判定降级的不算）
-    if (shadow or "").strip() == "mismatch":
-        def _mm(e):
-            l2 = e.get("l2")
-            if not isinstance(l2, dict):
-                return False
-            sl = l2.get("shadow_label")
-            return sl in ("CONFIDENTIAL", "NORMAL") and not l2.get("degraded") and sl != l2.get("label")
-        entries = [e for e in entries if _mm(e)]
+    # 统一筛选（与 CSV 导出同一套口径）：各条件叠加 AND
+    entries = _audit_filter_rows(all_entries, ip=ip, token=token, action=action,
+                                 provider=provider, rule=rule, q=q, shadow=shadow,
+                                 since_dt=since_dt, until_dt=until_dt)
 
     # 排序：默认严格 time_desc（最新在前），支持 time_asc / provider / rule / type
     def _t_key(x):
@@ -3503,6 +3548,7 @@ async def export_csv(
     ip: Optional[str] = None,          # client_ip filter
     token: Optional[str] = None,       # caller key (masked) filter
     q: Optional[str] = None,           # keyword filter
+    shadow: Optional[str] = None,      # mismatch = 只留主影判定不一致
     source: Optional[str] = "auto",    # auto | redis | mysql  (auto = mysql if since/until given)
     limit: int = 5000,
 
@@ -3517,6 +3563,8 @@ async def export_csv(
     - With since/until: queries MySQL for time-range + filters (90-day window).
 
     - Time shortcuts: "1h", "24h", "7d", "30d" relative to now.
+
+    筛选条件与列表接口同一套口径（_audit_filter_rows）：动作/规则/时间窗等叠加 AND。
 
     """
     import csv, io
@@ -3535,27 +3583,10 @@ async def export_csv(
     if since or until:
         since_dt = _parse_window_ts(since, naive_as_utc=False)
         until_dt = _parse_window_ts(until, default=datetime.utcnow(), is_until=True, naive_as_utc=False)
+        # action/rule/type 走 SQL；其余（ip/q/token/shadow）内存筛
         rows = store.query_mysql(since=since_dt, until=until_dt, action=action, rule=rule, type_=type, limit=limit)
-        if ip:
-
-            ip = ip.strip()
-            rows = [r for r in rows if ip in (r.get("client_ip") or "")]
-
         _enrich_audit_key_name(rows)
-        if q:
-
-            ql = q.strip().lower()
-            if ql:
-
-                rows = [r for r in rows if any(ql in str(r.get(k) or "").lower() for k in ("text_preview","filename","requested_model","model","provider","rule","client_ip","type","token_masked","key_name"))]
-
-        if token:
-
-            _tl = token.strip().lower()
-            if _tl:
-
-                rows = [r for r in rows if _tl in str(r.get("token_masked") or "").lower() or _tl in str(r.get("key_name") or "").lower()]
-
+        rows = _audit_filter_rows(rows, ip=ip, token=token, q=q, shadow=shadow)
         for r in rows:
 
             if "error" in r:
@@ -3587,6 +3618,9 @@ async def export_csv(
         # Redis 热缓存路径：显式按时间升序导出，保证确定性（MySQL 分支已 ORDER BY ts）
         rows_hot = sorted(store.all(), key=lambda x: str(x.get("time") or x.get("ts") or "").replace("T", " ")[:19])
         _enrich_audit_key_name(rows_hot)
+        # 筛选与列表接口同口径（早前热窗路径完全不过滤 → 导出 5000 行全量）
+        rows_hot = _audit_filter_rows(rows_hot, ip=ip, token=token, action=action,
+                                      rule=rule, type_=type, q=q, shadow=shadow)
         for e in rows_hot:
             if not e.get("key_name"):
                 e["key_name"] = e.get("token_masked") or ""
@@ -3722,11 +3756,29 @@ def _verify_admin_pw(pw: str) -> bool:
 app.include_router(_admin_api.router, dependencies=[Depends(admin_auth)])
 
 
+class _AdminStaticFiles(StaticFiles):
+    """管理台静态资源缓存头。
+
+    assets/ 下全是内容哈希文件名（index-XXX.js / Page-XXX.js）⇒ immutable 长缓存：
+    换构建即换 hash，浏览器不可能拿到旧 chunk（文件名变了就是新资源）。
+    其余（index.html 等入口）no-cache：入口必须每次重取，否则旧入口会引用
+    已被新构建删掉的旧 chunk → 404（同 /admin/app 路由注释）。
+    """
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if path.startswith("assets/")
+            else "no-cache"
+        )
+        return resp
+
+
 # SPA 静态资源（/static/admin/assets/*）；index.html 由 /admin/app 路由托管。
 # 目录存在才挂载，避免未构建环境下启动报错。
 _app_static_dir = os.path.join("static", "admin")
 if os.path.isdir(_app_static_dir):
-    app.mount("/static/admin", StaticFiles(directory=_app_static_dir), name="admin_static")
+    app.mount("/static/admin", _AdminStaticFiles(directory=_app_static_dir), name="admin_static")
 
 
 @app.get("/admin/app", response_class=HTMLResponse, dependencies=[Depends(admin_page_auth)])
@@ -3778,6 +3830,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
 
     # 审计归因：/v1/* 请求的调用方 key 落 ContextVar，log_entry 自动补 token_masked
     _ck = ""
+    _ident = None
     try:
         _ck = (request.headers.get("authorization", "") or "")
         if _ck.startswith("Bearer "):
@@ -3812,9 +3865,13 @@ async def _admin_ip_filter_mw(request: Request, call_next):
             "path": path,
         })
         try:
+            # 拉黑的 key 仍是登记身份：不带上 key_name/key_id 的话 KEY 统计里会多出
+            # 一个 "(unknown)" 桶（2026-10-20 实测：wb 被拉黑后的 4 次 403 全归到它）
             log_request_async(
                 _admin_api.get_admin_store(),
                 client_ip=_resolve_client_ip(request),
+                key_name=getattr(_ident, "name", "") or "",
+                key_id=getattr(_ident, "key_id", None) or 0,
                 action="block",
                 status_code=403,
                 blocked_reason="key_blacklist",
@@ -3955,6 +4012,11 @@ async def _admin_ip_filter_mw(request: Request, call_next):
             return StreamingResponse(_sse_relay(), status_code=response.status_code,
                                      headers=dict(response.headers), media_type=_ct)
         try:
+            if response.status_code == 401:
+                # 鉴权层拒掉的请求没有身份、也没有内容：不算受理流量，不落明细
+                # （否则 KEY 榜多一个 "(unknown)" 桶，还被记成 allow）。失败鉴权
+                # 只在 uvicorn access log 留痕，需要长期留存再单独写审计。
+                return response
             log_request_async(
                 _admin_api.get_admin_store(),
                 client_ip=_resolve_client_ip(request),

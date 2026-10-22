@@ -21,7 +21,7 @@ curl http://<网关IP>:8080/v1/chat/completions \
   -H "Authorization: Bearer <你的key>" \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "<别名，如 ext-flash>",
+    "model": "<别名，如 AB-flash>",
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
@@ -33,7 +33,7 @@ curl http://<网关IP>:8080/v1/models -H "Authorization: Bearer <你的key>"
 ```
 
 返回的 `id` 列表就是你能填进 `"model"` 的全部值，**以这个接口为准**，别信文档里写的旧名字。
-其中对外别名（如 `ext-flash`）会自动选最优供应商；内网模型可直连点名。
+其中对外别名（如 `AB-flash`）会自动选最优供应商；内网模型可直连点名。
 
 ---
 
@@ -60,7 +60,7 @@ curl http://<网关IP>:8080/v1/models -H "Authorization: Bearer <你的key>"
 | 用途 | 接口 | 说明 |
 |---|---|---|
 | 对话/生成 | `POST /v1/chat/completions` | OpenAI 协议，支持流式（`stream:true`） |
-| 向量 | `POST /v1/embeddings` | 只走内网 embedding 模型，从不送 L2 |
+| 向量 | `POST /v1/embeddings` | 与 chat 同一审查链（L1 + L2 灰区），机密内容自动转内网 embedding 模型 |
 | Anthropic 客户端 | `POST /v1/messages`（+ `count_tokens`） | 协议自动转换 |
 | Codex 类客户端 | `POST /v1/responses` | 附件走文件名/表头审查 |
 | 文件预检 | `POST /v1/files/check` | 先查文件能不能发，再决定调不调用 |

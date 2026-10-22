@@ -19,7 +19,7 @@
 - L2 触发（`main._review_text` 三条件与）：L1 allow **且** `risk_score ∈ [20,60)` 灰区
   **且**（机密会话 **或** 非白名单豁免）（2026-09-23 起取消字数触发，只看灰区）；
   白名单 key 95% 跳 L2（`AI_GATEWAY_WL_L2_SAMPLE=0.05`，5% 抽样）；
-  `/v1/embeddings` 永不 L2；灰区下限 env `AI_GATEWAY_L2_GRAY_FLOOR`（默认 20）。
+  `/v1/embeddings` 同样走 `_review_text`（与 chat 同源）；灰区下限 env `AI_GATEWAY_L2_GRAY_FLOOR`（默认 20）。
   命中 CONFIDENTIAL 转本地（`route_local`，`rule=l2:…`）。
   `POST /admin/api/route-inspect` 可干跑整条链（口径与线上门一致，返回 `trigger: gray`）
 - 热重载：`policy.load_policy()` 每次请求重载；`providers.load_routing()` 按 mtime 重载；

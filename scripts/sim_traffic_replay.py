@@ -1,6 +1,6 @@
 """模拟真实流量-回放：把生成集逐条经网关全链路打一遍（顺序，<=4 RPS，不触发限流）。
 
-模型固定 vllm_local/Qwen3.8-AB（内容不出境），max_tokens=8 只测链路不烧 KV。
+模型固定 vllm_local/qwen2.5:7b（内容不出境），max_tokens=8 只测链路不烧 KV。
 统计 e2e 延迟分位 + 状态码，并打印回放前后 /admin/metrics 关键行 diff。
 用法: .venv/bin/python scripts/sim_traffic_replay.py <traffic.jsonl> [--limit 0] [--gap 0.3]
 """
@@ -20,9 +20,9 @@ load_dotenv(os.path.join(ROOT, ".env"))
 sys.path.insert(0, ROOT)
 
 KEY = os.environ["AI_GATEWAY_DEV_API_KEY"]
-URL = "http://127.0.0.1:8080/v1/chat/completions"
-METRICS = "http://127.0.0.1:8080/admin/metrics"
-MODEL = "vllm_local/Qwen3.8-AB"
+URL = "https://127.0.0.1:8080/v1/chat/completions"
+METRICS = "https://127.0.0.1:8080/admin/metrics"
+MODEL = "vllm_local/qwen2.5:7b"
 
 
 def metrics_snapshot():

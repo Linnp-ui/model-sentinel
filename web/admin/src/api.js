@@ -9,7 +9,9 @@ export function usePoll(fn, ms = 30000) {
   const ref = useRef(fn);
   ref.current = fn;
   useEffect(() => {
-    const t = setInterval(() => ref.current(), ms);
+    // 后台标签页跳过（与总览/指标页自带轮询的 document.hidden 口径一致）：
+    // 切回前台第一个 tick 即补新数据，不产生后台空转请求
+    const t = setInterval(() => { if (!document.hidden) ref.current(); }, ms);
     return () => clearInterval(t);
   }, [ms]);
 }
@@ -60,8 +62,9 @@ export const copyText = async (t, okMsg = '已复制', failMsg = '复制失败')
   }
 };
 
+// since = 审计页时间窗参数（后端支持 Nh/Nd）：总览跳审计时带同一时间窗
 export const RANGES = [
-  { hours: 24, label: '最近 24 小时' },
-  { hours: 168, label: '最近 7 天' },
-  { hours: 720, label: '最近 30 天' },
+  { hours: 24, label: '最近 24 小时', since: '24h' },
+  { hours: 168, label: '最近 7 天', since: '7d' },
+  { hours: 720, label: '最近 30 天', since: '30d' },
 ];

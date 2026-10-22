@@ -1,18 +1,12 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
 import { SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
-import { api, errText, fetchJson, copyText, usePoll } from '../api.js';
+import { api, errText, fetchJson, copyText, usePoll, RANGES } from '../api.js';
 import { wideSticky } from '../utils.js';
+import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
-import { ruleZh, RULE_ZH } from '../ruleNames.jsx';
-
-// 动作+规则合并成一列：Tag 底色仍是动作口径，文字是具体规则
-const ACTION_INFO = {
-  block: ['阻断', 'red'],
-  route_local: ['本地路由', 'orange'],
-  allow: ['放行', 'green'],
-};
+import { ruleZh, RULE_FILTER_NAMES, ACTION_INFO, RuleZh, SystemBuiltinLegend } from '../ruleNames.jsx';
 
 // L2 展开行：主判定 + laya 影子（shadow_*）。无 L2 的行不可展开。
 // l2 可能是对象（新接口）或字符串（容错），统一归一化再渲染。
@@ -63,11 +57,10 @@ const AUDIT_ACTIONS = [
   { value: 'route_local', label: '本地路由' },
   { value: 'block', label: '拦截' },
 ];
+// 时间窗选项与总览页共用 RANGES（同一 since 值），避免两处窗口口径漂移
 const AUDIT_RANGES = [
   { value: '', label: '全部时间' },
-  { value: '24h', label: '最近 24 小时' },
-  { value: '7d', label: '最近 7 天' },
-  { value: '30d', label: '最近 30 天' },
+  ...RANGES.map((r) => ({ value: r.since, label: r.label })),
 ];
 
 export default function AuditPage() {
@@ -90,30 +83,46 @@ export default function AuditPage() {
   const [ruleNames, setRuleNames] = useState([]);
 
   // silent=true：30s 轮询用（不点 loading 不闪 Spin、后台失败不弹错）
+  // f 走 ref：load 身份只随 pageNo 变。若 f 进 deps，搜索框每个键入都换 load 身份
+  // → effect 重跑 → 半截关键词就发一次请求 + 每键闪一次 Spin（实测）。
+  // 下拉筛选（since/action/rule/shadow）是离散选择，仍在 effect 依赖里"选完即查"；
+  // 全文 q 只在「查询」按钮/回车（search()）时触发。
+  const fRef = useRef(f);
+  fRef.current = f;
   const load = useCallback(async (page = pageNo, silent = false) => {
     if (!silent) setLoading(true);
     try {
       const p = new URLSearchParams();
-      Object.entries(f).forEach(([k, v]) => { if (v) p.set(k, v); });
+      Object.entries(fRef.current).forEach(([k, v]) => { if (v) p.set(k, v); });
       if (page > 1) p.set('page', String(page));
       setData(await fetchJson('/admin/audit/entries?' + p.toString()));
     } catch (e) { if (!silent) message.error(errText(e)); }
     finally { if (!silent) setLoading(false); }
-  }, [f, pageNo]);
+  }, [pageNo]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); }, [load, f.since, f.action, f.rule, f.shadow]);
   usePoll(() => load(pageNo, true)); // 替代原刷新按钮
 
-  // 规则名清单拉取：失败时静默回退到内置中文映射（RULE_ZH），不影响筛选可用性
+  // 规则名清单拉取：失败时静默回退到内置映射（RULE_FILTER_NAMES），不影响筛选可用性
   useEffect(() => {
     api('/policies')
       .then((r) => setRuleNames((r.items || []).map((x) => x.name).filter(Boolean)))
       .catch(() => {});
   }, []);
 
+  // 规则名下拉 = policy 规则名（/policies，与规则管理页同源）+ 内部/历史规则名
+  // （L2 判密、系统内置判定等也会写进 audit_logs.rule，必须能筛得到）。
+  // 按显示名去重：policy 现行名优先，旧英文原值交给搜索框（中文名照样搜得到）。
   const ruleOptions = useMemo(() => {
-    const names = ruleNames.length ? ruleNames : Object.keys(RULE_ZH);
-    return names.map((v) => ({ value: v, label: RULE_ZH[v] ? RULE_ZH[v] + '（' + v + '）' : v }));
+    const seen = new Set();
+    const out = [];
+    for (const v of [...ruleNames, ...RULE_FILTER_NAMES]) {
+      const label = ruleZh(v);
+      if (seen.has(label)) continue;
+      seen.add(label);
+      out.push({ value: v, label });
+    }
+    return out;
   }, [ruleNames]);
 
   const search = () => { writeUrl(f); setPageNo(1); load(1); };
@@ -137,16 +146,16 @@ export default function AuditPage() {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
         return (
           <Tag color={color} title={`动作：${name}｜规则：${r.rule || '—'}`} style={{ marginInlineEnd: 0 }}>
-            {r.rule ? ruleZh(r.rule) : name}
+            {r.rule ? <RuleZh name={r.rule} /> : name}
           </Tag>
         );
       } },
     { title: '模型', dataIndex: 'model', width: '11%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
-    { title: '调用方名称', dataIndex: 'key_name', width: '11%', align: 'center',
+    { title: <>{'调用方名称'}<Tip term="caller" /></>, dataIndex: 'key_name', width: '11%', align: 'center',
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
-    { title: '客户端 IP', dataIndex: 'client_ip', width: '9%', align: 'center', render: (v) => v || '—' },
+    { title: <>{'客户端 IP'}<Tip term="client_ip" /></>, dataIndex: 'client_ip', width: '9%', align: 'center', render: (v) => v || '—' },
     { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
-    { title: '用户query', dataIndex: 'text_preview', width: '25%',
+    { title: <>{'用户query'}<Tip term="query" /></>, dataIndex: 'text_preview', width: '25%',
       render: (v) => (
         <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
@@ -167,6 +176,8 @@ export default function AuditPage() {
             onChange={(v) => { const next = { ...f, action: v }; setF(next); setPageNo(1); writeUrl(next); }} />
           <Select style={{ width: 190 }} value={f.rule || undefined} options={ruleOptions} allowClear showSearch
             optionFilterProp="label" placeholder="规则名"
+            /* 下拉项显示系统内置标记（label 仍是纯字符串，搜索按名字匹配不受影响） */
+            optionRender={(opt) => <RuleZh name={opt.value} />}
             onChange={(v) => { const next = { ...f, rule: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
           <Select style={{ width: 150 }} value={f.shadow}
             options={[{ value: '', label: '影子：全部' }, { value: 'mismatch', label: '主影不一致' }]}
@@ -180,15 +191,15 @@ export default function AuditPage() {
         <>
           <Card>
             <Space wrap style={{ marginLeft: 16, columnGap: 60, rowGap: 12 }}>
-              <Statistic data-testid="audit-stat-total" title="命中总数" value={data.kpi.total} />
-              <Statistic data-testid="audit-stat-allow" title="放行" value={data.kpi.c_allow} valueStyle={{ color: '#389e0d' }} />
-              <Statistic data-testid="audit-stat-route" title="本地路由" value={data.kpi.c_route} valueStyle={{ color: '#d46b08' }} />
-              <Statistic data-testid="audit-stat-block" title="阻断" value={data.kpi.c_block} valueStyle={{ color: '#cf1322' }} />
+              <Statistic data-testid="audit-stat-total" title={<>命中总数<Tip text="这段时间里被记录下来的请求条数（每个请求一条）。" /></>} value={data.kpi.total} />
+              <Statistic data-testid="audit-stat-allow" title={<>放行<Tip term="allow" /></>} value={data.kpi.c_allow} valueStyle={{ color: '#389e0d' }} />
+              <Statistic data-testid="audit-stat-route" title={<>本地路由<Tip term="route_local" /></>} value={data.kpi.c_route} valueStyle={{ color: '#d46b08' }} />
+              <Statistic data-testid="audit-stat-block" title={<>阻断<Tip term="block" /></>} value={data.kpi.c_block} valueStyle={{ color: '#cf1322' }} />
             </Space>
           </Card>
         </>
       )}
-      <Card title="审计日志">
+      <Card title={<>审计日志<Tip term="audit" /></>}>
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         sticky={wideSticky()}
         tableLayout="fixed"
@@ -202,6 +213,7 @@ export default function AuditPage() {
           onChange: (pg) => setPageNo(pg), showSizeChanger: false,
           showTotal: (t, rg) => `第 ${rg[0]}-${rg[1]} 条 / 共 ${t} 条`,
         }} />
+        <SystemBuiltinLegend />
       </Card>
     </Space>
   );

@@ -260,7 +260,7 @@ def test_models_list_includes_internal_model(tmp_path, monkeypatch):
     mp_path = tmp_path / "model_policy.yaml"
     mp_path.write_text(yaml.safe_dump({"model_policy": {
         "external_candidates": [],
-        "internal_models": [{"provider": "vllm_local", "model": "Qwen3.8-AB",
+        "internal_models": [{"provider": "vllm_local", "model": "qwen2.5:7b",
                              "note": "主力本地模型", "enabled": True}],
         "model_limits": [], "review_model": {"threshold": 0.7}}}, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
@@ -268,7 +268,7 @@ def test_models_list_includes_internal_model(tmp_path, monkeypatch):
     try:
         r = client.get("/v1/models", headers=H)
         assert r.status_code == 200
-        q = [m for m in r.json()["data"] if m["id"] == "Qwen3.8-AB"]
+        q = [m for m in r.json()["data"] if m["id"] == "qwen2.5:7b"]
         assert q and q[0]["gateway"]["local"] is True and q[0]["gateway"]["provider"] == "vllm_local", r.json()
     finally:
         _mp.invalidate_model_policy_cache()
@@ -279,11 +279,92 @@ def test_models_public_aligned_with_v1():
     b = [m["id"] for m in client.get("/admin/api/models/public").json()["data"]]
     assert a == b, (a, b)
 
+def test_alias_provider_must_resolve():
+    # 别名成员的 provider 解析不到就在保存口 422，不让它进库变运行期 503
+    # （2026-10-21 事故：库里存了 'Deepseek'/'Vllm_Local' 展示名，routing.yaml 键是小写）
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    r = client.put("/admin/api/aliases/rt-badprov",
+                   json={"members": [{"provider": "NoSuchProvider", "model": "m"}]})
+    assert r.status_code == 422, r.text
+    assert "NoSuchProvider" in r.text
+    # 大小写不同但能解析（routing.yaml 键小写、管理台可能填展示名）→ 放行且**归一成规范键**
+    r2 = client.put("/admin/api/aliases/rt-caseprov",
+                    json={"members": [{"provider": "Deepseek", "model": "m"}]})
+    assert r2.status_code == 200, r2.text
+    try:
+        g = [x for x in client.get("/admin/api/aliases").json()["groups"]
+             if x["name"] == "rt-caseprov"][0]
+        assert g["members"][0]["provider"] == "deepseek", g
+        names = [x["name"] for x in client.get("/admin/api/aliases").json()["groups"]]
+        assert "rt-badprov" not in names, names
+    finally:
+        for n in ("rt-caseprov", "rt-badprov"):
+            try:
+                store.delete_alias_group(n)
+            except ValueError:
+                pass
+
+
+def test_provider_rename_cascades_alias_and_policy(monkeypatch, tmp_path):
+    # 控制台改 provider 名：别名组成员 + policy 规则 target 必须跟着改，
+    # 否则别名 503 unknown provider / 规则静默指向已不存在的 provider（2026-10-21 修）
+    import shutil
+    import yaml as _y
+    from src.gateway import providers as _pv, model_policy as _mp, policy_admin as _pa
+    from src.gateway.admin_store import get_admin_store
+    from src.gateway.policy import DEFAULT_POLICY
+
+    rt = tmp_path / "routing.yaml"
+    shutil.copy(_pv.DEFAULT_ROUTING_FILE, rt)
+    mp = tmp_path / "model_policy.yaml"
+    shutil.copy(_mp.DEFAULT_MODEL_POLICY, mp)
+    pol = tmp_path / "policy.yaml"
+    doc = _y.safe_load(Path(DEFAULT_POLICY).read_text(encoding="utf-8"))
+    doc["policies"].append({
+        "name": "测试改名级联", "priority": 98, "action": "allow",
+        "when": {"any": [{"text contains_any": ["__rename_probe__"]}]},
+        "target": {"provider": "deepseek", "model": "deepseek-flash"},
+    })
+    pol.write_text(_y.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    monkeypatch.setattr(_pv, "_routing_path", lambda: rt)
+    monkeypatch.setattr(_mp, "_policy_path", lambda: mp)
+    monkeypatch.setattr(_pa, "_policy_path", lambda: pol)
+    _pv.invalidate_cache()
+    _mp.invalidate_model_policy_cache()
+
+    store = get_admin_store()
+    assert client.put("/admin/api/aliases/rt-rename",
+                      json={"members": [{"provider": "deepseek", "model": "deepseek-flash"}]}
+                      ).status_code == 200
+    try:
+        r = client.put("/admin/api/providers/deepseek",
+                       json={"base_url": "https://api.deepseek.com/v1", "api_key_env": "DEEPSEEK_API_KEY",
+                             "api_mode": "openai", "kind": "chat", "default_model": "deepseek-v4-flash",
+                             "timeout": 60, "local": False, "new_name": "ds-renamed"})
+        assert r.status_code == 200, r.text
+        # 别名成员跟着改名
+        g = [x for x in client.get("/admin/api/aliases").json()["groups"]
+             if x["name"] == "rt-rename"][0]
+        assert g["members"][0]["provider"] == "ds-renamed", g
+        # policy 规则 target 跟着改名
+        rules = {x["name"]: x for x in client.get("/admin/api/policies").json()["items"]}
+        assert rules["测试改名级联"]["target"]["provider"] == "ds-renamed", rules["测试改名级联"]
+        # routing.yaml 键改名
+        assert "ds-renamed" in (_y.safe_load(rt.read_text(encoding="utf-8"))["providers"])
+    finally:
+        for n in ("rt-rename",):
+            try:
+                store.delete_alias_group(n)
+            except ValueError:
+                pass
+
+
 def test_alias_group_rename():
     # 别名组改名：PUT new_name 整组重命名；撞名 422；旧名立即失效、/v1/models 换新名
     from src.gateway.admin_store import get_admin_store
     store = get_admin_store()
-    m = [{"provider": "p-x", "model": "m-x", "priority": 10, "enabled": True}]
+    m = [{"provider": "deepseek", "model": "m-x", "priority": 10, "enabled": True}]
     assert client.put("/admin/api/aliases/rt-old", json={"description": "d", "members": m}).status_code == 200
     try:
         d = client.put("/admin/api/aliases/rt-old",
@@ -311,7 +392,7 @@ def test_all_local_alias_skips_l1_l2():
     from src.gateway.admin_store import get_admin_store
     store = get_admin_store()
     assert client.put("/admin/api/aliases/rt-local",
-                      json={"members": [{"provider": "vllm_local", "model": "Qwen3.8-AB",
+                      json={"members": [{"provider": "vllm_local", "model": "qwen2.5:7b",
                                          "priority": 10, "enabled": True}]}).status_code == 200
     try:
         long_text = "这是一段进灰区的长文本（含工资一词得20分），用于验证全本地别名组跳过 L1/L2 审查的回归测试用例。"
@@ -609,7 +690,13 @@ def test_chat_audit_preview_strips_client_envelope():
         == "帮我看看 2026年3月工资表.xlsx"
 
 def test_file_docx_financial():
-    """docx 薪资表（含有效身份证→ pii 先命中，生产顺序 pii_weighted 在前；_sniff_ooxml 分流，PK 头不误判 xlsx）"""
+    """docx 人员名册（含有效身份证 → **内容解析** → PII 加权 ≥60 → pii_weighted_route_local）。
+
+    文件名刻意不带财务关键词（工资/薪资/salary…）：这样「financial_local_only」按文件名那条
+    分支命不中，只能靠**解析出的内容**命中 ⇒ 断言不受 policy 里各 route_local 规则的
+    先后顺序影响（2026-10-20 一次重排后「financial_local_only」p10 抢在「pii_weighted_route_local」p20 前，
+    钉死规则名会被重排打脸）；docx 走 _sniff_ooxml 分流（PK 头不误判 xlsx）。
+    """
     from docx import Document
     d = Document()
     t = d.add_table(rows=2, cols=3)
@@ -620,11 +707,13 @@ def test_file_docx_financial():
     buf = io.BytesIO()
     d.save(buf)
     buf.seek(0)
-    r = client.post("/v1/files/check", headers=H, files={"file": ("salary.docx", buf, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
+    r = client.post("/v1/files/check", headers=H, files={"file": ("人员名册.docx", buf, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
     assert r.status_code == 200
     gw = r.json()["gateway"]
     assert gw["action"] == "route_local"
     assert gw["policy_rule"] == "pii_weighted_route_local"
+    # 证明是**内容**命中（身份证解析出来并计了 PII 分），不是文件名/魔数命中
+    assert r.json()["text_findings"].get("weighted_pii_score", 0) >= 60, r.json()["text_findings"]
 
 def test_file_image_ocr_phone():
     """图片手机号经 OCR 读出 → pii_weighted_route_local（真 OCR：pytesseract + 系统 chi_sim；
@@ -685,14 +774,22 @@ def test_route_inspect_text_shape():
     assert d["final_action"] == "allow" and d["channel"] == "text" and d["files"] == []
 
 def test_route_inspect_check_xlsx():
-    """check 通道：xlsx 薪资表全量解析（含有效身份证→ pii 先命中，生产顺序 pii_weighted 在前）"""
+    """check 通道：xlsx 全量解析。
+
+    文件名中性（人员名册）⇒「financial_local_only」只能靠 **sheet 名/表头**命中 ⇒ 证明表格
+    真的被解析；身份证内容 → PII 加权 ≥60。规则名不钉死：两条内容类规则
+    （财务表 p10 / 隐私加权 p20）谁先命中取决于 policy 优先级顺序。
+    """
     buf, _ = _xlsx("工资表", ["姓名", "身份证", "工资"], [["张三", "110101199001011237", "30000"]])
     r = client.post("/admin/api/route-inspect", json={"model": "AB-flash", "channel": "check",
-        "files": [{"filename": "salary.xlsx", "file_data": _b64_data_url("application/octet-stream", buf.getvalue())}]})
+        "files": [{"filename": "人员名册.xlsx", "file_data": _b64_data_url("application/octet-stream", buf.getvalue())}]})
     assert r.status_code == 200
     d = r.json()
-    assert d["final_action"] == "route_local" and d["final_rule"] == "pii_weighted_route_local"
+    assert d["final_action"] == "route_local", d
+    assert d["final_rule"] in ("financial_local_only", "pii_weighted_route_local"), d["final_rule"]
     assert d["files"][0]["parsed_chars"] > 0
+    # 证明是**内容**命中（身份证解析出来并计了 PII 分），不是文件名命中
+    assert d["l1"]["findings"].get("weighted_pii_score", 0) >= 60, d["l1"]["findings"]
 
 def test_route_inspect_responses_pdf_name():
     """responses 通道：codex pdf 无 file_data 仅文件名 → drawing_local_only"""
@@ -851,12 +948,12 @@ def _bridge_resp_id(monkeypatch):
         yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
         yield b'data: [DONE]\n\n'
     monkeypatch.setattr(_rt, "route_chat_stream", _fake_stream)
-    body = {"model": "Qwen3.8-AB", "stream": True,
+    body = {"model": "qwen2.5:7b", "stream": True,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "你好"}]}]}
     decision = {"name": "default_local", "action": "route_local", "priority": 0,
                 "target": {"provider": "vllm_local"}}
     async def _run():
-        evs = [e async for e in _rt._responses_from_chat_stream(body, "Qwen3.8-AB", decision)]
+        evs = [e async for e in _rt._responses_from_chat_stream(body, "qwen2.5:7b", decision)]
         for e in reversed(evs):
             if b"response.completed" in e:
                 d = _json.loads(e.split(b"data:")[1].strip())

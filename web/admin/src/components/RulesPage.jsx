@@ -3,17 +3,64 @@ import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, mes
 import { RobotOutlined, DeleteOutlined } from '@ant-design/icons';
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
+import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
-import { ruleZh } from '../ruleNames.jsx';
+import { ACTION_INFO, RuleZh } from '../ruleNames.jsx';
 import { L2PromptsSection } from './ModelPolicyPage.jsx';
 // ---------------- 5.1/5.2/5.3 规则管理 ----------------
 // ---------------- L2 拦截配置（scope 两档 + 判密阈值；持久化 model_policy.yaml，热重载生效） ----------------
+// 判定档 = L2 小模型的「视野」：每一档各取一段文本、各自判一次密；
+// 任一档判 CONFIDENTIAL（且 confidence ≥ 阈值）⇒ 整条请求按 route_local 处理（转内网/拦截，内容不出境）。
 const L2_SCOPE_META = [
   { key: 'last_user', label: '最近用户消息', tip: '判定基线，不受预算裁剪' },
   { key: 'tool', label: '工具结果', tip: '最后一条 tool 结果' },
   { key: 'tail', label: '长文尾部', tip: '长粘贴 [chunk, 2×chunk) 段' },
 ];
+
+// 悬停说明：讲清「取哪段文本 + 例子 + 为什么开它」，口径与 main.py._select_l2_scopes 一致
+const SCOPE_TIPS = {
+  last_user: (
+    <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
+      <div><b>取什么</b>：本次请求里最后一条 role=user 的纯文本消息全文（带 tool_calls / tool_call_id 的消息跳过；多模态只取文本部分）。</div>
+      <div style={{ marginTop: 6 }}><b>为什么默认开</b>：它是判定基线 —— 用户真正问的那句话；且<b>不受预算裁剪</b>（tool/tail 档把 L2 文本预算用完，这一档照样审）。</div>
+      <div style={{ marginTop: 6 }}><b>例子</b></div>
+      <div>· 用户问「帮我看下这份薪酬表」→ 这一档审的就是这句。</div>
+      <div>· 客户端把环境样板塞在 user 正文里（&lt;system-reminder&gt;…）→ 审的是含样板的原文，样板会稀释判定但不会让这一档失效。</div>
+      <div>· 请求里只有工具消息、没有 user 文本 → 这一档为空 ⇒ 不发这次 L2 调用（少一档就少一次小模型判定）。</div>
+      <div style={{ marginTop: 6 }}><b>代价</b>：每档 = 一次小模型判定（~230ms）。</div>
+    </div>
+  ),
+  tool: (
+    <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
+      <div><b>取什么</b>：最后一条<b>工具结果</b>正文（chat：role=tool 的 content；anthropic：user 消息里的 tool_result 块；responses：function_call_output.output），截到 chunk 长度（默认 1200 字）。</div>
+      <div style={{ marginTop: 6 }}><b>为什么开它</b>：RAG 召回的内部文档、网页抓取结果都走这条路 —— 第三方内容进上下文的主通路。用户自己没提敏感词，工具结果里可能整段是内部资料。</div>
+      <div style={{ marginTop: 6 }}><b>例子</b></div>
+      <div>· 用户问「总结刚检索到的资料」，工具返回含「图号 A-12 / 施工图 / 混凝土标号 C30」的内部文档 → 这一档判密 ⇒ 整条请求转内网，不出境。</div>
+      <div>· 工具只返回「无结果」→ 这一档为空 ⇒ 不发这次调用。</div>
+      <div style={{ marginTop: 6 }}><b>注意</b>：只取<b>最后一条</b>工具结果，不是全部工具历史。</div>
+    </div>
+  ),
+  tail: (
+    <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
+      <div><b>取什么</b>：与「最近用户消息」<b>同一个源文本</b>（用户 query + 内联 OCR 文本）的第 2 段：[chunk, 2×chunk)（默认第 1200~2400 字）。</div>
+      <div style={{ marginTop: 6 }}><b>为什么开它</b>：长粘贴（整份合同、长表格）的前 1200 字常是抬头与目录，敏感字段在后半段；「最近用户消息」档只看前段，这一档补看后段。</div>
+      <div style={{ marginTop: 6 }}><b>例子</b></div>
+      <div>· 粘贴 3000 字合同：开头是「XX 建设项目施工图设计说明」，第 1300 字处才有「结构图号 A-12 / 单价 480 元 / 决算 320 万」→ 这一档能看到并判密。</div>
+      <div>· 源文本不足 2×chunk（如只贴了 500 字）→ 这一档为空 ⇒ 不发这次调用。</div>
+      <div style={{ marginTop: 6 }}><b>预算</b>：与「工具结果」档共享 L2 文本预算（默认 5000 字，先到先用）；「最近用户消息」不占预算。</div>
+    </div>
+  ),
+};
+
+const SCOPE_OVERVIEW = (
+  <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
+    <div><b>判定档</b> = L2 小模型的「视野」：每一档各取一段文本、各自判一次密。</div>
+    <div style={{ marginTop: 6 }}><b>后果</b>：任一档判 <b>CONFIDENTIAL</b> 且 confidence ≥ 判密阈值 ⇒ 整条请求按 route_local 处理（转内网 / 拦截，内容不出境）。</div>
+    <div style={{ marginTop: 6 }}><b>档数上限 5</b>：每档一次小模型判定（~230ms），档越多判定越慢；档内文本为空则跳过（不发那次调用）。</div>
+    <div style={{ marginTop: 6 }}>悬停每个勾选框看该档取哪段文本 + 例子。</div>
+  </div>
+);
 
 function L2RulesCard() {
   const [rm, setRm] = useState(null);
@@ -46,17 +93,19 @@ function L2RulesCard() {
     } catch (e) { message.error(errText(e)); }
     setSaving(false);
   };
-  if (!rm) return <Card title="L2 拦截配置" loading />;
+  if (!rm) return <Card title={<>L2 拦截配置<Tip term="l2" /></>} loading />;
   return (
-    <Card title="L2 拦截配置">
+    <Card title={<>L2 拦截配置<Tip term="l2" /></>}>
       <div style={{ marginBottom: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-          <Text strong>判定档（命中 CONFIDENTIAL → 本地路由拦截）</Text>
+          <Tooltip title={SCOPE_OVERVIEW}>
+            <Text strong style={{ cursor: 'help' }}>判定档（命中 CONFIDENTIAL → 本地路由拦截）</Text>
+          </Tooltip>
           <Button type="primary" loading={saving} data-testid="l2rules-save" onClick={save}>保存</Button>
         </div>
         <Space wrap>
           {L2_SCOPE_META.map((m) => (
-            <Tooltip key={m.key} title={m.tip}>
+            <Tooltip key={m.key} title={SCOPE_TIPS[m.key] || m.tip}>
               <Checkbox data-testid={`l2scope-scopes-${m.key}`}
                 checked={rm.scopes.has(m.key)} onChange={() => toggle('scopes', m.key)}>
                 {m.label} <Text type="secondary" code>{m.key}</Text>
@@ -66,11 +115,11 @@ function L2RulesCard() {
         </Space>
       </div>
       <Space align="center" wrap>
-        <Text>判密阈值：confidence ≥ {rm.threshold.toFixed(2)}</Text>
+        <Text>判密阈值：confidence ≥ {rm.threshold.toFixed(2)}</Text><Tip term="threshold" />
         <Slider style={{ width: 220 }} min={0} max={1} step={0.05}
           value={rm.threshold} onChange={(v) => setRm((c) => ({ ...c, threshold: v }))} />
       </Space>
-      <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid #f0f0f0' }}>
+      <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--gw-border)' }}>
         <L2PromptsSection />
       </div>
     </Card>
@@ -395,10 +444,14 @@ export default function RulesPage() {
   const cols = [
     /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。原 scroll.x=1070 定宽
        在窄屏撑出横向滚动；fixed 布局下 % 才是真·定比（auto 布局 % 只是建议值） */
-    { title: '优先级', dataIndex: 'priority', width: '10%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
-    { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, render: (v) => <Text code title={v}>{ruleZh(v)}</Text> },
-    { title: '动作', dataIndex: 'action', width: '12%',
-      render: (v) => <Tag color={v === 'block' ? 'red' : v === 'route_local' ? 'orange' : 'green'}>{v}</Tag> },
+    { title: <>{'优先级'}<Tip term="rule_priority" /></>, dataIndex: 'priority', width: '10%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
+    { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, align: 'center', className: 'cell-center',
+      render: (v) => <Text code title={v}><RuleZh name={v} /></Text> },
+    { title: <>{'动作'}<Tip term="action" /></>, dataIndex: 'action', width: '12%',
+      render: (v) => {
+        const [name, color] = ACTION_INFO[v] || [v || '—', undefined];
+        return <Tag color={color} title={v}>{name}</Tag>;
+      } },
     { title: '说明', dataIndex: 'description', width: '43%', ellipsis: true },
     // 操作列要装下 编辑+删除 两个默认尺寸按钮 + 24/24 cell padding，
     // 150 会撑出 wrapper 右缘（2026-10 实测）
@@ -417,7 +470,7 @@ export default function RulesPage() {
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
-      <Card title="L1 规则" extra={
+      <Card title={<>L1 规则<Tip term="l1" /></>} extra={
         <Space>
           <Button type="primary" onClick={() => openEdit(null)}>新增规则</Button>
         </Space>
@@ -432,7 +485,7 @@ export default function RulesPage() {
           }} />
       </Card>
 
-      <Card title="拦截模式 on_block" size="small" style={{ marginTop: 12 }}>
+      <Card title={<>拦截模式 on_block<Tip term="on_block" /></>} size="small" style={{ marginTop: 12 }}>
         <Space align="center" wrap>
           <Switch checked={onBlockMode === 'reject'} loading={onBlockLoading}
             onChange={toggleOnBlock}
@@ -480,10 +533,10 @@ export default function RulesPage() {
             <Form.Item name="name" label="规则名" rules={[{ required: true }]}>
               <Input id="rule-name" />
             </Form.Item>
-            <Form.Item name="priority" label="优先级（小者先）">
+            <Form.Item name="priority" label={<>{'优先级（小者先）'}<Tip term="rule_priority" /></>}>
               <InputNumber min={0} max={1000} />
             </Form.Item>
-            <Form.Item name="action" label="动作" rules={[{ required: true }]}>
+            <Form.Item name="action" label={<>{'动作'}<Tip term="action" /></>} rules={[{ required: true }]}>
               <Select style={{ width: 140 }} options={[
                 { value: 'allow', label: 'allow 放行' },
                 { value: 'route_local', label: 'route_local 转内网' },
@@ -530,7 +583,7 @@ export default function RulesPage() {
                   <div>
                     <div style={{ display: 'none' }}>{menu}</div>
                     <div style={{ maxHeight: 300, overflowY: 'auto' }}>
-                    <style>{'.sc-opt{padding:5px 12px;cursor:pointer;display:flex;align-items:center;gap:8px}.sc-opt:hover{background:#f5f5f5}'}</style>
+                    <style>{'.sc-opt{padding:5px 12px;cursor:pointer;display:flex;align-items:center;gap:8px}.sc-opt:hover{background:var(--gw-track)}'}</style>
                     {scopeOptions.map((o) => {
                       const on = aiScopes.includes(o.value);
                       return (
@@ -543,8 +596,8 @@ export default function RulesPage() {
                               document.getElementById('ai-scopes')?.focus();
                             }}>
                             <span style={{ width: 16, height: 16, flexShrink: 0, border: '1px solid',
-                              borderColor: on ? '#1677ff' : '#d9d9d9', borderRadius: 2,
-                              background: on ? '#1677ff' : '#fff', color: '#fff', fontSize: 12,
+                              borderColor: on ? '#1677ff' : 'var(--gw-border)', borderRadius: 2,
+                              background: on ? '#1677ff' : 'var(--gw-surface)', color: '#fff', fontSize: 12,
                               lineHeight: '16px', textAlign: 'center' }}>{on ? '✓' : ''}</span>
                             <span>{o.label}</span>
                           </div>

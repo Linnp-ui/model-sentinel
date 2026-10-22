@@ -24,7 +24,7 @@ load_dotenv(os.path.join(ROOT, ".env"))
 
 import pymysql  # noqa: E402
 
-STATS_URL = "http://127.0.0.1:8080/admin/api/l2-shadow-stats"
+STATS_URL = "https://127.0.0.1:8080/admin/api/l2-shadow-stats"
 DIVERGENCE_LIMIT = 40
 ROUND_FILE = os.path.join(ROOT, "var", "l2-round.json")
 

@@ -30,6 +30,30 @@ _last_purge_ts: float = 0.0
 _PURGE_INTERVAL_S = 6 * 3600
 
 # 3.3 建议阈值：运行时读 env（便于调参与测试），默认值见 _thresholds()
+#
+# 默认值唯一真相（2026-10-21 整理）：_thresholds() 的 env 兜底与各规则取值共用
+# 下面这一份常量，避免"20/1000 两处各写一遍"改一处漏一处。
+DEF_VIOLATION = 20          # 规则1 异常处置次数（窗口型）
+DEF_VOLUME = 1000           # 规则2 IP 调用量（窗口型）
+DEF_ERROR_RATE = 0.10       # 规则3 模型错误率
+DEF_ERROR_MIN_CALLS = 30    # 规则3 错误率告警的最小调用数
+DEF_KT_BLACK_CALLS = 20     # 规则0 拉黑建议调用数
+DEF_KT_BLACK_VIOLATIONS = 5  # 规则0 拉黑建议异常处置次数
+DEF_KT_VIOLATION_RATE = 0.30  # 规则0 拉黑建议异常处置率
+DEF_KT_WHITE_CALLS = 100    # 规则0 加白建议调用数
+DEF_KT_REVOKE = 2           # 规则0 撤销白名单的异常处置次数
+DEF_KT_WINDOW_HOURS = 720.0  # 规则0/4/5/6 的长窗口（30 天）
+DEF_REORDER_MIN_HITS = 10   # 规则4 优先级重排的最小触发次数
+DEF_LIMIT_MIN_CALLS = 1000  # 规则7 加限流建议的最小调用数（AND 条件一）
+DEF_LIMIT_MIN_PEAK = 20     # 规则7 加限流建议的峰值分钟下限（AND 条件二）
+DEF_MAX_PER_RULE = 3        # 每条规则最多报几条建议
+DEF_MAX_TOTAL = 20          # 整卡建议条数上限
+DEF_RULE_WINDOW_HOURS = 0.0  # 规则4/5/6 独立窗口（0 = 跟随 KEY 分级窗口）
+DEF_LATENCY_P95_MS = 0      # 规则8 延迟 P95 阈值（0 = 关闭该规则）
+DEF_DEGRADE_RATE = 0.0      # 规则9 本地路由占比阈值（0 = 关闭该规则）
+DEF_TOKEN_GROWTH = 0.0      # 规则10 token 用量突增倍数（0 = 关闭该规则）
+
+
 def _env_num(new: str, old: str, default, cast):
     """新 env 名优先，旧名兜底；取值非法时**留痕**并回落默认。
 
@@ -57,62 +81,139 @@ def _env_raw(new: str, old: str) -> str:
     return (raw or "").strip()
 
 
-def _window_thresholds(new: str, old: str, default: int) -> dict:
-    """按窗口阈值：'24:20,168:100,720:500'（hours:value 逗号分隔）；纯数字 = 全窗口同值。
+# 历史分档值只报一次（_thresholds() 每次请求都读 env，不加限制会刷日志）
+_warned_base: set = set()
 
-    返回 {hours: value}；纯数字形态返回 {'*': value}。窗口越长累计异常越多，
-    单一阈值在 30 天窗下必然误报 ⇒ 规则 1/2 按建议卡所选窗口取各自阈值。
+
+def _base_threshold(new: str, old: str, default, cast=int):
+    """**单一基准值**（24 小时窗口口径）：纯数字 = 基准值。
+
+    历史分档形态 '24:20,168:100,720:500' 取 **24h 档**当基准（其余档由系统按窗口
+    长度自动算，见 _scaled）——旧配置不用手改，语义自动切换到新规则。
+    """
+    raw = _env_raw(new, old)
+    if not raw:
+        return default
+    if ":" in raw:
+        m = _window_thresholds(new, old, default, cast)
+        if "*" in m:
+            return m["*"]
+        for h in (24, 168, 720):
+            if h in m:
+                base = m[h]
+                break
+        else:
+            base = m[min(m, key=lambda k: abs(k - 24))]
+        if len(m) > 1 and new not in _warned_base:
+            # 静默丢档必须留痕：老分档值里非基准档的数字被换算规则接管了（每进程每键只报一次）
+            _warned_base.add(new)
+            _log.warning("阈值 %s 的历史分档值 %r 只取 24h 档当基准，其余档按窗口长度自动算",
+                         new, raw)
+        return base
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        _log.warning("建议阈值 %s 取值非法：%r ⇒ 回落默认 %r", new, raw, default)
+        return default
+
+
+def _scaled(base, hours: float) -> int:
+    """**次数类阈值**按窗口长度等比放大：value(W) = base × W/24（取整，最小 1）。
+
+    依据：同一"强度"下，窗口越长累计的次数越多（24h 的 20 次 ≈ 7d 的 140 次 ≈ 30d 的
+    600 次）；不放大则长窗口必然误报（代码原注释：单值在 30 天窗必误报）。
+
+    只用于"窗口越长累计越多"的次数类阈值；**速率/比率类不放大**（错误率、异常处置率、
+    峰值分钟/分钟、限流累计调用数——它们与窗口长度无关）。
+
+    **窗口短于 24h 不缩小**（仍用基准值）：短窗口样本太小，按比例缩会把"1 次事件就
+    建议拉黑"这种误报放进来（/admin/api/suggestions?hours=1 曾把拉黑阈值压到 1）。
+    """
+    try:
+        b = float(base)
+    except (TypeError, ValueError):
+        return 1
+    h = max(24.0, float(hours) or 24.0)
+    return max(1, int(round(b * h / 24.0)))
+
+
+def _window_thresholds(new: str, old: str, default, cast=int) -> dict:
+    """历史分档形态的读取：'24:20,168:100,720:500'（hours:value 逗号分隔）。
+
+    只给 _base_threshold 用（老配置的 24h 档当基准）；纯数字形态返回 {'*': value}。
+    现在**不再**按窗口取档——次数类阈值统一是「单一基准值 + 按窗口长度自动算」
+    （见 _scaled）；比率型（异常处置率）不走这里。
     """
     raw = _env_raw(new, old)
     if not raw:
         return {"*": default}
     if ":" not in raw:
         try:
-            return {"*": int(raw)}
-        except ValueError:
+            return {"*": cast(raw)}
+        except (TypeError, ValueError):
             _log.warning("建议阈值 %s 取值非法：%r ⇒ 回落默认 %r", new, raw, default)
             return {"*": default}
     out = {}
     for part in raw.split(","):
         try:
             h, v = part.strip().split(":", 1)
-            out[int(float(h))] = int(v)
+            out[int(float(h))] = cast(v)
         except (TypeError, ValueError):
             continue
     return out or {"*": default}
 
 
-def pick_window(m: dict, hours: float, default: int) -> int:
-    """按窗口取阈值：精确命中优先，未登记的窗口取最近窗口的值。"""
-    if "*" in m:
-        return m["*"]
-    h = int(hours)
-    if h in m:
-        return m[h]
-    return m[min(m, key=lambda k: abs(k - h))]
-
-
 def _thresholds() -> dict:
+    """全部建议阈值。
+
+    **两类阈值**：
+    - 次数类（*_base）：只配一个基准值（24 小时窗口口径），系统按窗口长度自动放大
+      （_scaled）。含异常处置拉黑、IP 用量、错误率最小调用数、KEY 分级四项、优先级重排。
+    - 速率/比率类（单值）：错误率、异常处置率、限流建议的累计调用数与峰值分钟
+      ——它们与窗口长度无关，不放大。
+
+    规则用哪个窗口就取哪个窗口下的有效值：规则 1/2/3 = 面板窗口；规则 0 = KEY 分级
+    窗口（kt_window_hours）；规则 4 = 规则窗口（rule_window_hours，0 时同 KEY 分级窗口）。
+    """
     return {
-        # 规则1 拉黑：异常处置次数（原 AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD）；按窗口
-        "violation_map": _window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
-                                            "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20),
-        # 规则2 用量观察：同样按窗口
-        "volume_map": _window_thresholds("AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD", "", 1000),
-        "error_rate": float(os.getenv("AI_GATEWAY_SUGGEST_ERROR_RATE", "0.10")),
-        # 2026-09-16 修复②：原为硬编码 20（其余阈值都可配，唯独它不能）
-        "error_min_calls": int(os.getenv("AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS", "20")),
-        "kt_black_calls": int(os.getenv("AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK", "20")),
-        "kt_black_min_violations": _env_num("AI_GATEWAY_KEYTIER_MIN_VIOLATIONS",
-                                            "AI_GATEWAY_KEYTIER_MIN_BLOCKS", 5, int),
-        "kt_violation_rate": _env_num("AI_GATEWAY_KEYTIER_VIOLATION_RATE",
-                                      "AI_GATEWAY_KEYTIER_BLOCK_RATE", 0.30, float),
-        "kt_white_calls": int(os.getenv("AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE", "100")),
-        "kt_revoke_violations": _env_num("AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS",
-                                         "AI_GATEWAY_KEYTIER_REVOKE_BLOCKS", 2, int),
-        "kt_window_hours": float(os.getenv("AI_GATEWAY_KEYTIER_WINDOW_HOURS", "720")),
-        "reorder_min_hits": int(os.getenv("AI_GATEWAY_SUGGEST_REORDER_MIN_HITS", "10")),
-        "limit_min_calls": int(os.getenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", "1000")),
+        # 规则1 拉黑：异常处置次数（原 AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD）
+        "violation_base": _base_threshold("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
+                                           "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", DEF_VIOLATION),
+        # 规则2 用量观察
+        "volume_base": _base_threshold("AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD", "", DEF_VOLUME),
+        # 错误率是比率（不放大）；错误率的最小调用数是次数（按面板窗口放大）
+        "error_rate": float(os.getenv("AI_GATEWAY_SUGGEST_ERROR_RATE", str(DEF_ERROR_RATE))),
+        "error_min_calls_base": _base_threshold("AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS", "",
+                                                 DEF_ERROR_MIN_CALLS),
+        # 规则0 KEY 分级（长窗口口径；次数类按 KEY 分级窗口放大，异常处置率是比率不放大）
+        "kt_black_calls_base": _base_threshold("AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK", "",
+                                                DEF_KT_BLACK_CALLS),
+        "kt_black_min_violations_base": _base_threshold("AI_GATEWAY_KEYTIER_MIN_VIOLATIONS",
+                                                        "AI_GATEWAY_KEYTIER_MIN_BLOCKS",
+                                                        DEF_KT_BLACK_VIOLATIONS),
+        "kt_violation_rate": float(os.getenv("AI_GATEWAY_KEYTIER_VIOLATION_RATE",
+                                             str(DEF_KT_VIOLATION_RATE))),
+        "kt_white_calls_base": _base_threshold("AI_GATEWAY_KEYTIER_MIN_CALLS_WHITE", "",
+                                                DEF_KT_WHITE_CALLS),
+        "kt_revoke_violations_base": _base_threshold("AI_GATEWAY_KEYTIER_REVOKE_VIOLATIONS",
+                                                     "AI_GATEWAY_KEYTIER_REVOKE_BLOCKS",
+                                                     DEF_KT_REVOKE),
+        "kt_window_hours": float(os.getenv("AI_GATEWAY_KEYTIER_WINDOW_HOURS", str(DEF_KT_WINDOW_HOURS))),
+        "reorder_min_hits_base": _base_threshold("AI_GATEWAY_SUGGEST_REORDER_MIN_HITS", "",
+                                                  DEF_REORDER_MIN_HITS),
+        # 规则7 的两个 AND 条件：累计调用数（0 = 该条件不参与判断）、峰值分钟调用数
+        # ——两者都是"忙不忙/突发不突发"，与窗口长度无关 ⇒ 不放大
+        "limit_min_calls": int(os.getenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", str(DEF_LIMIT_MIN_CALLS))),
+        "limit_min_peak": int(os.getenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK", str(DEF_LIMIT_MIN_PEAK))),
+        # 建议条数上限：每规则 N 条 + 整卡 N 条（防止 KEY 多时刷屏）
+        "max_per_rule": int(os.getenv("AI_GATEWAY_SUGGEST_MAX_PER_RULE", str(DEF_MAX_PER_RULE))),
+        "max_total": int(os.getenv("AI_GATEWAY_SUGGEST_MAX_TOTAL", str(DEF_MAX_TOTAL))),
+        # 规则4/5/6（优先级重排/沉默清理/白名单回收）的独立窗口；0 = 跟随 KEY 分级窗口
+        "rule_window_hours": float(os.getenv("AI_GATEWAY_SUGGEST_RULE_WINDOW_HOURS", str(DEF_RULE_WINDOW_HOURS))),
+        # 运行态维度规则（8/9/10）的阈值；0 = 关闭对应规则
+        "latency_p95_ms": int(os.getenv("AI_GATEWAY_SUGGEST_LATENCY_P95_MS", str(DEF_LATENCY_P95_MS))),
+        "degrade_rate": float(os.getenv("AI_GATEWAY_SUGGEST_DEGRADE_RATE", str(DEF_DEGRADE_RATE))),
+        "token_growth": float(os.getenv("AI_GATEWAY_SUGGEST_TOKEN_GROWTH", str(DEF_TOKEN_GROWTH))),
         # 规则5 新规则豁免期（天）：上线不久的规则零触发不报警，等保底期过仍哑火再报
         "silent_grace_days": int(os.getenv("AI_GATEWAY_SUGGEST_SILENT_GRACE_DAYS", "14")),
     }
@@ -322,6 +423,16 @@ def _rule_failed(rule: str) -> None:
         pass
 
 
+def _rule_window_hours(th: dict) -> float:
+    """规则 4/5/6 的窗口：独立配置优先，0 = 跟随 KEY 分级窗口（kt_window_hours）。
+
+    之前三条规则硬绑 KEY 分级窗口 ⇒ 想让"沉默规则清理"看 90 天就必须连带改 KEY 分级
+    的 30 天窗口（两个语义不同的慢变量被绑在一起）。
+    """
+    rw = float(th.get("rule_window_hours") or 0.0)
+    return rw if rw > 0 else float(th["kt_window_hours"])
+
+
 def suggestion_meta(window_hours: float = 24.0) -> dict:
     """建议口径的元信息（供 UI 明示双窗口与触发口径，避免标题误导）。
 
@@ -339,17 +450,33 @@ def suggestion_meta(window_hours: float = 24.0) -> dict:
         "key_tier_window_hours": kt_h,
         "has_dual_window": abs(kt_h - w_h) > 1e-6,
         "thresholds": {
-            "violation": pick_window(th["violation_map"], window_hours, 20),
-            "volume": pick_window(th["volume_map"], window_hours, 1000),
+            # 次数类：回传**基准值**（24h 口径）+ 当前窗口自动算出的有效值
+            "violation_base": th["violation_base"],
+            "violation": _scaled(th["violation_base"], window_hours),
+            "volume_base": th["volume_base"],
+            "volume": _scaled(th["volume_base"], window_hours),
             "error_rate": th["error_rate"],
-            "error_min_calls": th["error_min_calls"],
-            "kt_black_calls": th["kt_black_calls"],
-            "reorder_min_hits": th["reorder_min_hits"],
+            "error_min_calls_base": th["error_min_calls_base"],
+            "error_min_calls": _scaled(th["error_min_calls_base"], window_hours),
+            "kt_black_calls_base": th["kt_black_calls_base"],
+            "kt_black_calls": _scaled(th["kt_black_calls_base"], kt_h),
+            "reorder_min_hits_base": th["reorder_min_hits_base"],
+            "reorder_min_hits": _scaled(th["reorder_min_hits_base"], _rule_window_hours(th)),
             "limit_min_calls": th["limit_min_calls"],
-            "kt_black_min_violations": th["kt_black_min_violations"],
+            "limit_min_peak": th["limit_min_peak"],
+            "kt_black_min_violations_base": th["kt_black_min_violations_base"],
+            "kt_black_min_violations": _scaled(th["kt_black_min_violations_base"], kt_h),
             "kt_violation_rate": th["kt_violation_rate"],
-            "kt_white_calls": th["kt_white_calls"],
-            "kt_revoke_violations": th["kt_revoke_violations"],
+            "kt_white_calls_base": th["kt_white_calls_base"],
+            "kt_white_calls": _scaled(th["kt_white_calls_base"], kt_h),
+            "kt_revoke_violations_base": th["kt_revoke_violations_base"],
+            "kt_revoke_violations": _scaled(th["kt_revoke_violations_base"], kt_h),
+            "max_per_rule": th["max_per_rule"],
+            "max_total": th["max_total"],
+            "rule_window_hours": _rule_window_hours(th),
+            "latency_p95_ms": th["latency_p95_ms"],
+            "degrade_rate": th["degrade_rate"],
+            "token_growth": th["token_growth"],
         },
     }
 
@@ -358,8 +485,8 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
     """3.3 规则引擎：基于统计触发建议。返回建议列表（可带一键应用动作）。"""
     since, until = _window(window_hours)
     th = _thresholds()
-    viol_th = pick_window(th["violation_map"], window_hours, 20)
-    vol_th = pick_window(th["volume_map"], window_hours, 1000)
+    viol_th = _scaled(th["violation_base"], window_hours)
+    vol_th = _scaled(th["volume_base"], window_hours)
     out = []
     from .policy import load_policy
     try:
@@ -392,6 +519,13 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         cur_rules = store.list_key_rules()
         white_kv2rule = {r["key_value"]: r["id"] for r in cur_rules if r.get("kind") == "white"}
         win_d = int(th["kt_window_hours"] / 24)
+        # 次数类阈值按 KEY 分级窗口自动放大（基准值是 24h 口径）；异常处置率是比率不放大
+        kt_h = float(th["kt_window_hours"])
+        kt_black_calls = _scaled(th["kt_black_calls_base"], kt_h)
+        kt_black_viol = _scaled(th["kt_black_min_violations_base"], kt_h)
+        kt_viol_rate = th["kt_violation_rate"]
+        kt_white_calls = _scaled(th["kt_white_calls_base"], kt_h)
+        kt_revoke = _scaled(th["kt_revoke_violations_base"], kt_h)
         for g in tiers:
             kn, calls = g["key_name"], g["calls"]
             blocks = g.get("blocks", 0)
@@ -403,8 +537,8 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                 continue
             rate = viol / calls if calls else 0.0
             mix = f"拦截 {blocks} + 本地路由 {loc_n}"
-            if (calls >= th["kt_black_calls"] and viol >= th["kt_black_min_violations"]
-                    and rate >= th["kt_violation_rate"]):
+            if (calls >= kt_black_calls and viol >= kt_black_viol
+                    and rate >= kt_viol_rate):
                 rate_black_names.add(kn)
                 out.append({
                     "id": f"ktblack:{kn}", "type": "key_rate_black", "severity": "high",
@@ -415,7 +549,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                     "apply": {"kind": "black", "key_name": kn},
                 })
             elif kp in white_kv2rule:
-                if viol >= th["kt_revoke_violations"]:
+                if viol >= kt_revoke:
                     out.append({
                         "id": f"ktrevoke:{kn}", "type": "key_white_revoke", "severity": "warn",
                         "key_name": kn,
@@ -424,7 +558,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                                     f"建议撤销白名单"),
                         "apply": {"kind": "unwhite", "rule_id": white_kv2rule[kp]},
                     })
-            elif calls >= th["kt_white_calls"] and viol == 0:
+            elif calls >= kt_white_calls and viol == 0:
                 out.append({
                     "id": f"ktwhite:{kn}", "type": "key_whitelist", "severity": "info",
                     "key_name": kn,
@@ -480,7 +614,8 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
     try:
         by_model = store.stats_group(since, until, "model")
         for g in by_model:
-            if g["calls"] >= th["error_min_calls"] and g["errors"] / g["calls"] >= th["error_rate"]:
+            if (g["calls"] >= _scaled(th["error_min_calls_base"], window_hours)
+                    and g["errors"] / g["calls"] >= th["error_rate"]):
                 out.append({
                     "id": f"errorrate:{g['label']}",
                     "type": "model_error_rate",
@@ -499,20 +634,22 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
     # 规则把低频 block 规则（拦截密钥）挤到身后，reject 模式 403 失效（2026-10-19 预演实证）。
     # 一键应用一次排到底；未触发规则不动，门槛 reorder_min_hits 防抖动。
     # apply 的 order 必须是单组名单（apply 对传入名单的槽位并集 permute，混组即跨组污染）。
-    # 窗口：固定长窗口（同规则 0/5/6，默认 30 天）—— 优先级是慢变量，不跟面板小时窗。
+    # 窗口：独立慢变量（rule_window_hours，0 = 跟随 KEY 分级窗口，默认 30 天）——
+    # 优先级是慢变量，不跟面板小时窗。
     try:
-        k4_since, k4_until = _window(th["kt_window_hours"])
+        k4_since, k4_until = _window(_rule_window_hours(th))
         hits = {}
         for g in store.stats_group(k4_since, k4_until, "blocked_reason"):
             lbl = (g.get("label") or "")
             if lbl.startswith("l1:"):
                 hits[lbl[3:]] = g.get("calls", 0)
         groups: dict = {}
+        reorder_min = _scaled(th["reorder_min_hits_base"], _rule_window_hours(th))
         for p in load_policy():
             if p.name == "默认放行":
                 continue
             c = hits.get(p.name, 0)
-            if c >= th["reorder_min_hits"]:
+            if c >= reorder_min:
                 groups.setdefault(p.action, []).append((p.name, c, p.priority))
         for action, cands in groups.items():
             if len(cands) < 2:
@@ -526,7 +663,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                 moved = [n for n in want if new_p[n] != prio[n]]
                 moves = "; ".join(f"{n} {hits[n]}次 {prio[n]}→{new_p[n]}"
                                   for n in moved)
-                win_d = int(th["kt_window_hours"] / 24)
+                win_d = int(_rule_window_hours(th) / 24)
                 out.append({
                     "id": f"reorder:{action}",
                     "type": "rule_priority",
@@ -539,12 +676,13 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
     except Exception:
         _rule_failed("rule_priority")
 
-    # 规则 5：沉默规则清理 —— 长窗口（同规则 0）零触发的非保底规则建议删除。
+    # 规则 5：沉默规则清理 —— 长窗口（独立 rule_window_hours，默认同规则 0）零触发的
+    # 非保底规则建议删除。
     # 安全兜底类低频规则也可能上榜，info 级仅提示、删不删用户定（policy.yaml 已入库可回滚）。
     # 上线保底：policy.yaml 无创建时间，用 first-seen 落盘 + 留存内 ever-fired 区分
     # “新规则”（从未触发过且刚露面 → 保底期内不上榜）与“老规则最近哑火”（照常上榜）。
     try:
-        k_since, k_until = _window(th["kt_window_hours"])
+        k_since, k_until = _window(_rule_window_hours(th))
         seen = set()
         for g in store.stats_group(k_since, k_until, "blocked_reason"):
             lbl = (g.get("label") or "")
@@ -569,7 +707,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         if touched:
             _save_rule_first_seen(first_seen)
         grace = int(th.get("silent_grace_days", 14))
-        win_d = int(th["kt_window_hours"] / 24)
+        win_d = int(_rule_window_hours(th) / 24)
         for p in load_policy():
             if p.name in ("默认放行",) or p.name in seen:
                 continue
@@ -587,13 +725,13 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
     except Exception:
         _rule_failed("silent_rule")
 
-    # 规则 6：白名单闲置回收 —— 长窗口零调用的白名单 KEY 建议撤销（缩小豁免面）。
+    # 规则 6：白名单闲置回收 —— 长窗口（独立 rule_window_hours）零调用的白名单 KEY 建议撤销。
     # 建白不久的跳过（created_at 在窗口内，还没攒够数据）。
     try:
-        k_since, k_until = _window(th["kt_window_hours"])
+        k_since, k_until = _window(_rule_window_hours(th))
         active = {g["key_name"] for g in store.stats_key_tier(k_since, k_until)}
         plain2name = {k["key_plain"]: k["name"] for k in store.list_api_keys_raw()}
-        win_d = int(th["kt_window_hours"] / 24)
+        win_d = int(_rule_window_hours(th) / 24)
         for r in store.list_key_rules(kind="white"):
             kn = plain2name.get(r.get("key_value", ""), "")
             if not kn or kn in active:
@@ -614,10 +752,14 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         _rule_failed("key_white_idle")
 
     # 规则 7：一键加限流 —— 窗口内调用量 Top 的 (provider, model) 若未配限流，
-    # 建议按当前速率 2 倍加全局 RPM（只报 Top1；别名按主候选折算最终模型才配得上）。
+    # 建议按当前速率加全局 RPM（最多报 max_per_rule 个模型；别名按主候选折算最终模型才配得上）。
+    # 速率口径：真实流量是**分钟级突发**（空闲时 0、突发时几十次/分钟），窗口摊平的平均值
+    # 既不能代表"当前速率"（旧算式 ×60 应为 ÷60，把平均放大 3600 倍），也不适合当限流依据
+    # ——按平均值给限流会在突发时误伤。故：展示给平均+峰值，限流建议按**峰值分钟 × 倍数**。
     try:
+        rows = store._log_rows(since, until)
         pairs: dict = {}
-        for r in store._log_rows(since, until):
+        for r in rows:
             prov = (r.get("provider") or "").strip()
             m = (r.get("model") or "").strip()
             if prov and m:
@@ -630,31 +772,175 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                 aliases = {}
             from .model_policy import model_rpm
             span_h = float(window_hours) or 24.0
-            for (prov, m), calls in sorted(pairs.items(), key=lambda kv: -kv[1]):
-                fm = m
+            n_models = max(1, int(th["max_per_rule"]))
+            picked = 0
+            for (rprov, rmodel), calls in sorted(pairs.items(), key=lambda kv: -kv[1]):
+                if picked >= n_models:
+                    break
+                prov, m, fm = rprov, rmodel, rmodel
                 cand0 = (aliases.get(m.lower()) or {}).get("candidates") or []
                 if cand0:
                     prov = cand0[0].get("provider") or prov
                     fm = cand0[0].get("model") or m
-                if calls >= th["limit_min_calls"] and not model_rpm(prov, fm):
-                    rpm = max(10, round(calls / span_h * 120))
-                    target = f"{prov}/{fm}"
-                    h = int(window_hours)
-                    rate = calls / span_h * 60
-                    out.append({
-                        "id": f"addlimit:{target}",
-                        "type": "model_rate_limit",
-                        "severity": "info",
-                        "metric": f"{calls} 次 / 最近 {h}h（约 {rate:.1f}/分钟）",
-                        "message": (f"模型 {target} 最近 {h} 小时调用 {calls} 次"
-                                    f"（约 {rate:.1f}/分钟）且未配限流，"
-                                    f"建议加全局限流 {rpm}/分钟（当前速率 2 倍余量）"),
-                        "apply": {"kind": "add_limit", "limit_model": target, "limit_rpm": rpm},
-                    })
-                    break
+                if model_rpm(prov, fm):
+                    continue
+                # 限流建议的两个条件与窗口长度无关 ⇒ 不放大（峰值是速率，累计是"忙不忙"）
+                lim_min_calls = th["limit_min_calls"]
+                lim_min_peak = th["limit_min_peak"]
+                if lim_min_calls and calls < lim_min_calls:
+                    continue
+                # 峰值分钟速率：窗口内按分钟桶计数的最大值（限流要盖得住突发）
+                per_min: dict = {}
+                for r in rows:
+                    if (r.get("provider") or "").strip() != rprov:
+                        continue
+                    if (r.get("model") or "").strip() != rmodel:
+                        continue
+                    minute = (r.get("ts") or "")[:16]
+                    per_min[minute] = per_min.get(minute, 0) + 1
+                peak = max(per_min.values()) if per_min else 0
+                # AND 条件二：峰值流量也要够高（平铺流量不值得配限流；0 = 不限该条件）
+                if lim_min_peak and peak < lim_min_peak:
+                    continue
+                rpm = max(10, round(peak * 2))
+                target = f"{prov}/{fm}"
+                h = int(window_hours)
+                rate = calls / span_h / 60  # 窗口摊平的平均每分钟调用数
+                out.append({
+                    "id": f"addlimit:{target}",
+                    "type": "model_rate_limit",
+                    "severity": "info",
+                    "metric": f"{calls} 次 / 最近 {h}h（平均 {rate:.2f}/分钟，峰值 {peak}/分钟）",
+                    "message": (f"模型 {target} 最近 {h} 小时调用 {calls} 次"
+                                f"（平均 {rate:.2f}/分钟，峰值 {peak}/分钟）且未配限流，"
+                                f"建议加全局限流 {rpm}/分钟（峰值 2 倍余量）"),
+                    "apply": {"kind": "add_limit", "limit_model": target, "limit_rpm": rpm},
+                })
+                picked += 1
     except Exception:
         _rule_failed("add_limit")
 
+    # 规则 8/9/10/11：运行态维度（延迟 / 降级率 / token 突增 / provider 熔断）。
+    # 与规则 0~7 不同：那些是"谁该被管"，这些是"系统现在健康吗"——
+    # 一律不给一键动作（动作在各自页面：统计页/Provider 页/审计页）。
+    try:
+        srows = store._log_rows(since, until)
+    except Exception:
+        srows = []
+    h = int(window_hours)
+
+    # 规则 8：端到端延迟 P95 超阈（阈值 0 = 关闭）
+    lat_th = int(th["latency_p95_ms"])
+    if lat_th > 0 and srows:
+        durs = sorted(int(r.get("duration_ms") or 0) for r in srows
+                      if int(r.get("duration_ms") or 0) > 0)
+        if durs:
+            p95 = durs[min(len(durs) - 1, int(round(0.95 * (len(durs) - 1))))]
+            if p95 > lat_th:
+                out.append({
+                    "id": "latency:p95",
+                    "type": "latency_high",
+                    "severity": "warn",
+                    "metric": f"P95 {p95}ms（阈值 {lat_th}ms）/ {len(durs)} 次",
+                    "message": (f"最近 {h} 小时端到端延迟 P95 {p95}ms 超过阈值 {lat_th}ms，"
+                                f"建议排查上游模型与网关自身开销（统计页看分位）"),
+                    "apply": None,
+                })
+
+    # 规则 9：本地路由（机密内容降级）占比超阈（阈值 0 = 关闭）
+    deg_th = float(th["degrade_rate"])
+    if deg_th > 0 and srows:
+        routed = sum(1 for r in srows if (r.get("action") or "") == "route_local")
+        passed = sum(1 for r in srows if (r.get("action") or "") in ("allow", "route_local"))
+        if passed:
+            deg = routed / passed
+            if deg >= deg_th:
+                out.append({
+                    "id": "degrade:rate",
+                    "type": "degrade_rate",
+                    "severity": "info",
+                    "metric": f"本地路由占比 {deg:.0%}（阈值 {deg_th:.0%}）/ {passed} 次",
+                    "message": (f"最近 {h} 小时 {passed} 次放行类调用里 {routed} 次走了本地路由"
+                                f"（{deg:.0%} ≥ {deg_th:.0%}）：机密内容占比偏高，"
+                                f"建议确认是否业务常态、是否 L2/L1 判得过严"),
+                    "apply": None,
+                })
+
+    # 规则 10：token 用量相对上一等长窗口突增（倍数阈值，0 = 关闭）
+    g_th = float(th["token_growth"])
+    if g_th > 0 and srows:
+        tok_of = lambda rs: sum(int(r.get("prompt_tokens") or 0) + int(r.get("completion_tokens") or 0)
+                                for r in rs)
+        cur_tok = tok_of(srows)
+        try:
+            p_since, p_until = _window_range(window_hours, 2 * (float(window_hours) or 24.0))
+            prev_tok = tok_of(store._log_rows(p_since, p_until))
+        except Exception:
+            prev_tok = 0
+        if cur_tok > 0 and prev_tok > 0:
+            growth = cur_tok / prev_tok
+            if growth >= g_th:
+                out.append({
+                    "id": "token:growth",
+                    "type": "token_spike",
+                    "severity": "info",
+                    "metric": f"token {cur_tok}（上一等长窗口 {prev_tok} 的 {growth:.1f} 倍）",
+                    "message": (f"最近 {h} 小时 token 用量 {cur_tok}，是上一等长窗口（{prev_tok}）"
+                                f"的 {growth:.1f} 倍（阈值 {g_th:g} 倍），"
+                                f"建议核对是否有批量任务/客户端异常循环"),
+                    "apply": None,
+                })
+
+    # 规则 11：provider 熔断中（运行态事件，无阈值——熔断本身就是异常）
+    try:
+        from .circuit_breaker import get_breaker
+        for name, st in sorted((get_breaker().snapshot() or {}).items()):
+            if (st or {}).get("state") in ("open", "half_open"):
+                out.append({
+                    "id": f"breaker:{name}",
+                    "type": "provider_breaker",
+                    "severity": "high",
+                    "metric": f"{name} 熔断 {st.get('state')}（窗口内失败 {st.get('failure_count_window')} 次）",
+                    "message": (f"provider {name} 当前熔断状态 {st.get('state')}，"
+                                f"建议排查上游可用性（Provider 页可看健康与熔断）"),
+                    "apply": None,
+                })
+    except Exception:
+        _rule_failed("provider_breaker")
+
+    # 条数上限：每规则 max_per_rule 条 + 整卡 max_total 条（severity 高优先保留）
+    out = _cap_suggestions(out, th)
+    return out
+
+
+def _window_range(start_h: float, end_h: float) -> tuple:
+    """(now-end_h, now-start_h] 的 UTC 边界 —— 用于"上一等长窗口"对比。"""
+    until = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - start_h * 3600))
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - end_h * 3600))
+    return since, until
+
+
+def _cap_suggestions(out: list, th: dict) -> list:
+    """按阈值截断建议条数：每规则 N 条 + 整卡 N 条（severity 高优先保留）。
+
+    没有上限时，KEY/模型一多建议卡能刷到几十条（一键应用按钮也一起刷屏）。
+    """
+    per = int(th.get("max_per_rule") or 0)
+    total = int(th.get("max_total") or 0)
+    if per > 0:
+        cnt: dict = {}
+        kept = []
+        for s in out:
+            t = s.get("type")
+            cnt[t] = cnt.get(t, 0) + 1
+            if cnt[t] <= per:
+                kept.append(s)
+        out = kept
+    if total > 0 and len(out) > total:
+        rank = {"high": 0, "warn": 1, "info": 2}
+        keep = set(sorted(range(len(out)),
+                          key=lambda i: (rank.get(out[i].get("severity"), 3), i))[:total])
+        out = [s for i, s in enumerate(out) if i in keep]
     return out
 
 

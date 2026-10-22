@@ -2,8 +2,9 @@
 
 - /v1/models 只暴露别名组；客户端 model=别名 时按组内候选链路由。
 - 候选链来自 Admin Console 配置（admin_store.alias_group/alias_member，5s TTL 缓存）。
-- 请求内失败立即切下一候选；熔断（per provider::model，复用 CircuitBreaker）打开的候选跳过，
-  即"非偶然性错误"记忆；全部候选不可用则抛最后一个错误（上游 4xx 透明透传原则）。
+- 请求内失败立即切下一候选；熔断（键 = provider::model，复用 CircuitBreaker，与点名请求
+  共用同一份状态）打开的候选跳过，即"非偶然性错误"记忆；全部候选不可用则抛最后一个错误
+  （上游 4xx 透明透传原则）。
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from .admin_store import get_admin_store
-from .circuit_breaker import get_breaker
+from .circuit_breaker import get_breaker, key_for
 
 # 请求级别名上下文（同 task 内可读；FastAPI 每请求独立 task，互不泄漏）
 _alias_ctx: "ContextVar[Optional[dict]]" = ContextVar("alias_ctx", default=None)
@@ -63,13 +64,13 @@ def alias_candidates(group: Dict[str, Any], skip: int = 0) -> List[Dict[str, Any
 
 
 def _cb_key(provider: str, model: str) -> str:
-    return f"{provider}::{model}"
+    return key_for(provider, model)
 
 
-def record_alias_result(provider: str, model: str, ok: bool, local: bool = False) -> None:
-    breaker = get_breaker()
-    if ok:
-        breaker.record_success(_cb_key(provider, model))
-        ctx_set_current(provider, model, local)
-    else:
-        breaker.record_failure(_cb_key(provider, model))
+def record_alias_ok(provider: str, model: str, local: bool = False) -> None:
+    """别名候选成功：记录「最终生效的候选」（供审计/meta 展示）。
+
+    熔断记账统一在 routing 的上游尝试处（键 = provider::model），这里不再重复记账
+    ——同一次失败记两遍会让阈值提前一倍触发。
+    """
+    ctx_set_current(provider, model, local)

@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col, Tooltip } from 'antd';
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
+import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
 import ExternalCandidateModal, { ExternalCandidateFormItems } from './ExternalCandidateBits.jsx';
@@ -83,7 +84,7 @@ function AliasGroupsCard() {
   };
 
   return (
-    <Card title="对外模型别名组"
+    <Card title={<>对外模型别名组<Tip term="alias_group" /></>}
           size="small" style={{ marginBottom: 16 }}
            extra={<Button type="primary"
                      onClick={() => { addForm.resetFields(); setEditing({ isNew: true, name: '', description: '', members: [] }); }}>新建别名组</Button>}>
@@ -293,11 +294,11 @@ function ExternalCandidatesCard() {
   };
 
   return (
-    <Card title="外部候选"
+    <Card title={<>外部候选<Tip term="candidate" /></>}
       extra={<Button type="primary"
         onClick={() => setModal({ mode: 'new' })}>新增候选</Button>}>
       <Space align="center" wrap style={{ display: 'flex', marginBottom: 12 }}>
-        <Text style={{ marginLeft: 10 }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text>
+        <Text style={{ marginLeft: 10 }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text><Tip term="failback" />
         <Switch size="small" aria-label="外网候选自动切换" loading={fbSaving}
           checked={!['0', 'false', 'no', 'off'].includes(String(envFlag?.AI_GATEWAY_MODEL_FALLBACK ?? 'true').toLowerCase())}
           onChange={setFallback} />
@@ -313,7 +314,7 @@ function ExternalCandidatesCard() {
           { title: '价格入(¥/1M)', dataIndex: 'price_per_1m_in', width: '13%' },
           { title: '价格出(¥/1M)', dataIndex: 'price_per_1m_out', width: '13%' },
           { title: '上下文', dataIndex: 'context_length', width: '11%' },
-          { title: '推荐等级', width: '10%', render: (_, r) => {
+          { title: <>{'推荐等级'}<Tip text="按单价和实际花费排出来的推荐顺序（越便宜越靠前），只是参考，不会自动改路由。" /></>, width: '10%', render: (_, r) => {
             const lv = recommendOf(r);
             return (
               <Tooltip title={spendTip(r)}>
@@ -440,6 +441,7 @@ function L2RuntimeSection() {
         AI_GATEWAY_L2_SHADOW: !!cfg.AI_GATEWAY_L2_SHADOW,
         AI_GATEWAY_L2_SHADOW_URL: cfg.AI_GATEWAY_L2_SHADOW_URL || '',
         AI_GATEWAY_WL_L2_SAMPLE: cfg.AI_GATEWAY_WL_L2_SAMPLE,
+        AI_GATEWAY_L2_GRAY_FLOOR: cfg.AI_GATEWAY_L2_GRAY_FLOOR,
       }) });
       message.success('已保存并生效（重启后仍生效）'); load();
     } catch (e) { message.error(errText(e)); }
@@ -471,17 +473,17 @@ function L2RuntimeSection() {
       </Space>
       <Space direction="vertical" size={10} style={{ width: '100%', marginLeft: 8, marginTop: 12 }}>
         {isLaya && cfgRow('端点：',
-          <Select size="small" showSearch style={{ width: 320 }} value={cfg.SMALL_MODEL_URL || ''}
+          <Select size="small" showSearch style={{ width: '100%', maxWidth: 320 }} value={cfg.SMALL_MODEL_URL || ''}
             placeholder="从内部模型中选择"
             options={urlOptionsWith(cfg.SMALL_MODEL_URL || '')}
             onChange={(v) => set('SMALL_MODEL_URL', v)}
             filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />)}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 16px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '10px 16px' }}>
           {cfgRow('超时(s)：',
-            <Slider style={{ width: 280 }} min={0.5} max={60} step={0.5}
+            <Slider style={{ width: '100%', maxWidth: 280, minWidth: 120 }} min={0.5} max={60} step={0.5}
               value={cfg.SMALL_MODEL_TIMEOUT} onChange={(v) => set('SMALL_MODEL_TIMEOUT', v)} />)}
-          {cfgRow('白名单抽样：',
-            <Slider style={{ width: 280 }} min={0} max={1} step={0.05}
+          {cfgRow(<>白名单抽样：<Tip term="whitelist" /></>,
+            <Slider style={{ width: '100%', maxWidth: 280, minWidth: 120 }} min={0} max={1} step={0.05}
               value={cfg.AI_GATEWAY_WL_L2_SAMPLE} onChange={(v) => set('AI_GATEWAY_WL_L2_SAMPLE', v)} />)}
           {cfgRow('模型：',
             <Select size="small" showSearch style={{ width: 280 }} value={cfg.SMALL_MODEL_NAME || ''}
@@ -493,15 +495,19 @@ function L2RuntimeSection() {
           {cfgRow('max_tokens：',
             <InputNumber size="small" min={8} max={512} value={cfg.SMALL_MODEL_MAX_TOKENS}
               onChange={(v) => set('SMALL_MODEL_MAX_TOKENS', v)} />)}
+          {cfgRow(<>灰区下限：<Tip term="gray" /></>,
+            <InputNumber size="small" min={0} max={20} value={cfg.AI_GATEWAY_L2_GRAY_FLOOR}
+              title="risk_score ≥ 该值即强制送 L2 复核（改完即时生效）。上限 20：再高则 25/30 档关键词单命中不再进灰区"
+              onChange={(v) => set('AI_GATEWAY_L2_GRAY_FLOOR', v)} />)}
         </div>
       </Space>
       <Space align="center" wrap style={{ marginTop: 12 }}>
-        <Text title="qwen 权威、laya 并行打标（shadow_* 进审计），backend=laya 时不生效">影子双跑：</Text>
+        <Text title="qwen 权威、laya 并行打标（shadow_* 进审计），backend=laya 时不生效">影子双跑：</Text><Tip term="shadow" />
         <Switch size="small" aria-label="影子双跑" checked={!!cfg.AI_GATEWAY_L2_SHADOW}
           disabled={(cfg.AI_GATEWAY_L2_BACKEND || 'qwen') === 'laya'}
           onChange={(v) => set('AI_GATEWAY_L2_SHADOW', v)} />
         <Text>影子端点：</Text>
-        <Select size="small" showSearch style={{ width: 280 }} value={cfg.AI_GATEWAY_L2_SHADOW_URL || ''}
+        <Select size="small" showSearch style={{ width: '100%', maxWidth: 280 }} value={cfg.AI_GATEWAY_L2_SHADOW_URL || ''}
           placeholder="从内部模型中选择"
           options={urlOptionsWith(cfg.AI_GATEWAY_L2_SHADOW_URL || '')}
           onChange={(v) => set('AI_GATEWAY_L2_SHADOW_URL', v)}
@@ -588,13 +594,13 @@ export function L2PromptsSection() {
           <Text>system prompt（角色/判定口径）</Text>
           <Input.TextArea rows={10} value={draft.system} onChange={(e) => setDraft({ ...draft, system: e.target.value })} />
           <Space>
-            <Button onClick={() => reset('system')}>还原默认</Button>
+            <Button danger onClick={() => reset('system')}>还原默认</Button>
             <Text type="secondary">字数：{draft.system.length}/8000</Text>
           </Space>
           <Text>user prompt 模板（占位符：{placeholders.join(' / ')}）</Text>
           <Input.TextArea rows={6} value={draft.template} onChange={(e) => setDraft({ ...draft, template: e.target.value })} />
           <Space>
-            <Button onClick={() => reset('template')}>还原默认</Button>
+            <Button danger onClick={() => reset('template')}>还原默认</Button>
             <Text type="secondary">字数：{draft.template.length}/2000</Text>
           </Space>
         </Space>
@@ -662,7 +668,7 @@ function InternalModelsCard() {
   };
 
   return (
-    <Card title="内部模型"
+    <Card title={<>内部模型<Tip term="internal_model" /></>}
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增内部模型</Button>}>
       <Table data-testid="mp-internal-table" rowKey={(r) => `${r.provider}/${r.model}`} size="small" sticky={wideSticky()} pagination={false}
         tableLayout="fixed"
@@ -671,11 +677,11 @@ function InternalModelsCard() {
         columns={[
           /* 列宽全 % + tableLayout=fixed；操作列是按钮组，同样给 % 定比。
              Provider 列已删（2026-10-14）：内部模型都是同一个本机 provider，列里全是重复值；字段仍留（弹窗可编辑、路由要用） */
-          { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true },
-          { title: '服务地址', dataIndex: 'url', width: '30%', ellipsis: true,
+          { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true, align: 'center', className: 'cell-center' },
+          { title: '服务地址', dataIndex: 'url', width: '30%', ellipsis: true, align: 'center', className: 'cell-center',
             render: (v) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : <Text type="secondary">—</Text>) },
-          { title: '备注', dataIndex: 'note', width: '13%', ellipsis: true },
-          { title: '健康', width: '26%', ellipsis: true, className: 'cell-center', render: (_, r, i) => (
+          { title: '备注', dataIndex: 'note', width: '13%', ellipsis: true, align: 'center', className: 'cell-center' },
+          { title: '健康', width: '26%', ellipsis: true, align: 'center', className: 'cell-center', render: (_, r, i) => (
             <Space size={4}>
               {!r._health ? <Text type="secondary">—</Text>
               : r._health.ok
@@ -683,7 +689,7 @@ function InternalModelsCard() {
                 : <Text type="danger" title={r._health.error}>{r._health.error || '异常'}</Text>}
               <Button type="link" size="small" loading={checking === i} onClick={() => checkRow(r, i)}>检查</Button>
             </Space>) },
-          { title: '操作', width: '11%', render: (_, r, i) => (
+          { title: '操作', width: '11%', align: 'center', className: 'cell-center', render: (_, r, i) => (
             <Space>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.provider}/${r.model}？`} onConfirm={() => {
@@ -841,7 +847,7 @@ export default function ModelPolicyPage() {
       <ExternalCandidatesCard />
       <InternalModelsCard />
       <ModelLimitsCard />
-      <Card title="审查模型">
+      <Card title={<>审查模型<Tip term="l2" /></>}>
         <L2RuntimeSection />
       </Card>
     </Space>

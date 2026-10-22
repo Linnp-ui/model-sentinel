@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Button, Input, Space, message, Alert, Card } from 'antd';
 import { api, errText } from '../api.js';
 import RouteInspectCard from './DiagnosePage.jsx';
+import { Tip } from '../terms.jsx';
 
 // 干跑工具页（改 L1/L2 规则后在这里验，不落审计、不限流、不真实出境）。
 // 与规则管理的区别：这里是"验证"，那边是"配置"。
@@ -21,7 +22,7 @@ export default function ReviewPage() {
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
-      <Card title="L2 规则测试">
+      <Card title={<>L2 规则测试<Tip term="l2" /></>}>
         <Space direction="vertical" style={{ width: '100%' }}>
           <Input.TextArea rows={4} value={l2Input} onChange={(e) => setL2Input(e.target.value)}
             placeholder="粘贴待识别内容，查看 L2 审查判定（label / confidence / reason）…" />

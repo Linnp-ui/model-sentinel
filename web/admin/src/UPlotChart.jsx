@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
+import { useTheme } from './theme.jsx';
 
 // uPlot wrapper for metrics timeseries (fixed 24h window, wheel/drag zoom).
 // series: [{ name, color, points: [{ t (unix s), v }] }]
@@ -27,11 +28,13 @@ export const msAxis = (v) => {
 // x 轴时间刻度：本仓所有 x 值都是 unix 秒（环 t / stats_chart / 事件时间线），
 // 按北京时间渲染（2026-10-12 起系统展示口径统一北京）；格式化器只建一次（Intl 构造 ms 级）
 let _bjAxisFmt = null;
-export const bjAxis = (v) => {
+const bjAxis = (v) => {
   if (typeof v !== 'number' || v <= 0) return '';
-  _bjAxisFmt = _bjAxisFmt || new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai',
+  // zh-CN：月/日序；sv-SE 只给 month+day 会排成日/月（22/10 14:30）。
+  // 输出用 '-' 分隔，与全仓日期口径一致（热力图 slice(5)、后端 YYYY-MM-DD）
+  _bjAxisFmt = _bjAxisFmt || new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai',
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
-  return _bjAxisFmt.format(v * 1000);
+  return _bjAxisFmt.format(v * 1000).replace('/', '-');
 };
 
 // uPlot y 轴标签区默认固定 50px（yAxisOpts.size=50），标签右对齐、距轴线
@@ -76,7 +79,12 @@ function sizeDotPaths(u, si, i0, i1) {
   return { stroke: fill, fill, clip, band: null, gaps: null, flags: 3 };
 }
 
+// uPlot 轴/网格颜色：默认轴文字是纯黑、网格是 rgba(0,0,0,0.07)——深色底上
+// 不可读。深浅两套，跟随 theme.jsx 的当前主题（theme 变 ⇒ 图表重建重绘）。
 export default function UPlotChart({ series, height = 180, yVal = null, scales = null, legend = null }) {
+  const { isDark } = useTheme();
+  const AXIS_COLOR = isDark ? '#a6a6a6' : '#000000';
+  const GRID_COLOR = isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.07)';
   const host = useRef(null);
   const plot = useRef(null);
   const lastX1 = useRef(0);
@@ -114,6 +122,24 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
   const ready = !!data && data[0].length >= 2; // 1 point = degenerate time scale
   const emptyKey = ready ? 'full' : 'empty';
 
+  // y 范围兜底：可见窗口内**没有 y 数据点**时，uPlot 默认范围函数返回 [null, null]
+  // ⇒ y 轴整条消失（刻度/标签全没，只剩 x 轴）。触发场景：延迟分位是稀疏桶（只有有
+  // 流量的桶才有点），滚轮放大到无流量档、或切到全空窗口。兜底 = 全量数据的 y 范围。
+  const yFallback = useMemo(() => {
+    let lo = Infinity, hi = -Infinity;
+    (data || []).slice(1).forEach((col) => col.forEach((v) => {
+      if (v == null) return;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }));
+    if (lo === Infinity) return [0, 1];
+    if (lo === hi) return [lo, lo + 1];
+    return [lo, hi];
+  }, [data]);
+  // 兜底范围随数据刷新（ref 而非闭包：主 effect 不随 data 重跑，闭包会拿到旧范围）
+  const yFallbackRef = useRef(yFallback);
+  yFallbackRef.current = yFallback;
+
   useEffect(() => {
     const el = host.current;
     if (!el || !ready) return undefined;
@@ -133,7 +159,10 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
           // 散点模式（逐条明细：一次判定一个点，不连线）；
           // 带 n 时点大小 ∝ sqrt(n)（分位散点：小样本桶的点要看得出"只有 1 个请求"）
           ? (() => {
-            const o = { label: s.name, stroke: s.color, fill: s.color, width: 0, points: { show: true }, paths: () => null, value: fmtVal };
+            // points.fill 必须显式给色：uPlot 点默认填充是 "#fff"（points.fill 为空时
+            // fillStyle 取白），深色模式下圈内部留白点
+            const o = { label: s.name, stroke: s.color, fill: s.color, width: 0,
+              points: { show: true, fill: s.color, stroke: s.color }, paths: () => null, value: fmtVal };
             if (s.n) {
               o.points.size = (u, si, i) => {
                 const n = (nRef.current[si - 1] || [])[i] || 0;
@@ -169,16 +198,19 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
           })),
       ],
       axes: [
+        // 轴文字色/网格色随深浅模式（uPlot 默认纯黑轴字 + 7% 黑网格，深底上看不见）
+        { stroke: AXIS_COLOR, grid: { stroke: GRID_COLOR }, ticks: { stroke: GRID_COLOR },
         // x=unix 秒（>1e9）时按北京时间打刻度，非时间轴（数值轴）原样。
         // uPlot 刻度间距只保证 >= space（默认 50px），而 "MM-DD HH:mm" 12px 约 64px 宽，
         // 窗口/宽度组合出间距 < 标签宽时（如 1h 窗）标签重叠 → 按实际间距抽稀标签
         // （刻度/网格不动），保留最右（最新时刻）向左隔 N 取一
-        { values: (u, vals, ai, space) => vals.map((v, i) => {
+        values: (u, vals, ai, space) => vals.map((v, i) => {
           if (typeof v !== 'number' || v <= 1e9) return v;
           const n = space > 0 ? Math.max(1, Math.ceil(66 / space)) : 1;
           return i % n === (vals.length - 1) % n ? bjAxis(v) : '';
         }) },
-        { size: yAxisSize, ...(yVal ? { values: (u, vals) => vals.map((v) => yVal(v)) } : {}) },
+        { size: yAxisSize, stroke: AXIS_COLOR, grid: { stroke: GRID_COLOR }, ticks: { stroke: GRID_COLOR },
+          ...(yVal ? { values: (u, vals) => vals.map((v) => yVal(v)) } : {}) },
       ],
       // 堆叠：band [upper, lower] 让 upper 系列的填充从 lower 值铺到 upper 值（而非从 0）
       ...(stacked ? { bands: series.slice(1).map((_, j) => ({ series: [j + 2, j + 1] })) } : {}),
@@ -186,6 +218,15 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
       ...(scales ? { scales } : {}),
     };
     const u = new uPlot(opts, data, el);
+    // 接管 y 范围函数：默认算出 null（可见窗口无点）时用全量范围兜底，y 轴不再整条消失。
+    // 只在调用方没自定义 y.range 时接管（自定义优先）。
+    if (!opts.scales?.y?.range && u.scales.y) {
+      const defRange = u.scales.y.range;
+      u.scales.y.range = (uu, dmin, dmax) => {
+        const r = defRange(uu, dmin, dmax);
+        return r && r[0] != null && r[1] != null ? r : yFallbackRef.current;
+      };
+    }
     plot.current = u;
     u.root._uplot = u;
     lastX1.current = data[0][data[0].length - 1];
@@ -231,7 +272,7 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
       plot.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [namesKey, height, !!yVal, emptyKey, stacked]);
+  }, [namesKey, height, !!yVal, emptyKey, stacked, isDark]);
 
   useEffect(() => {
     const u = plot.current;
@@ -267,7 +308,7 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
   if (!ready) {
     return (
       <div style={{ height, display: 'flex', alignItems: 'center',
-        justifyContent: 'center', color: '#bbb', fontSize: 12, background: '#fafafa' }}
+        justifyContent: 'center', color: 'var(--gw-muted)', fontSize: 12, background: 'var(--gw-empty)' }}
         data-testid="metrics-chart">
         暂无数据
       </div>

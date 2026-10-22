@@ -9,11 +9,14 @@ export default defineConfig({
   build: {
     outDir: '../../static/admin',
     emptyOutDir: true,
-    // vendor 单独分包：react/antd 不随业务代码变 hash，跨版本浏览器缓存命中
+    // vendor 只留 react/react-dom（稳定小包）：antd 若整包进 manualChunks，首屏会下载
+    // 「全站所有页面用到的 antd 并集」（Table/Form/Modal 等别的页组件也被拖进首屏，
+    // 实测 1088KB）。antd 交给 Rollup 按页面自然拆分：首屏只带 shell 用的组件，
+    // 页面各自/共享 chunk 随页懒载；library 代码内容不变 hash 不变，缓存收益不丢
     rollupOptions: {
       output: {
         manualChunks: {
-          vendor: ['react', 'react-dom', 'antd', '@ant-design/icons'],
+          vendor: ['react', 'react-dom'],
         },
       },
     },

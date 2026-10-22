@@ -4,6 +4,7 @@ import UPlotChart, { msAxis, qpsAxis } from '../UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './DailyHeatmap.jsx';
 import { fetchJson as api } from '../api.js';
 import { avg } from '../utils.js';
+import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
 const pct = (v) => v == null ? '-' : (v * 100).toFixed(1) + '%';
@@ -132,14 +133,14 @@ export default function MetricsSection({ hours = 24 }) {
   const cur = (bigWin && chartTab === 'l2') ? null : (chartDefs[CHART_TABS.includes(chartTab) ? chartTab : 'qps']);
 
   return (
-    <Card title="运行指标" style={{ marginTop: 12 }}
+    <Card title={<>运行指标<Tip text="网关自己的实时状况：每秒多少请求、错了多少、快不快、审查小模型跑了多少。" /></>} style={{ marginTop: 12 }}
        extra={<Space>
          <Segmented size="small" value={chartTab} onChange={setChartTab}
           options={[
-            { label: 'QPS', value: 'qps' },
-            { label: '错误率', value: 'err' },
-            { label: '网关延迟分位', value: 'lat' },
-            ...(bigWin ? [] : [{ label: 'L2', value: 'l2' }]),
+            { label: <span>QPS<Tip term="qps" /></span>, value: 'qps' },
+            { label: <span>错误率<Tip text="5xx = 网关或上游自己出错；403 = 被拒绝；429 = 请求太密集被限流。" /></span>, value: 'err' },
+            { label: <span>网关延迟分位<Tip term="p95" /></span>, value: 'lat' },
+            ...(bigWin ? [] : [{ label: <span>L2<Tip term="l2" /></span>, value: 'l2' }]),
           ]} />
       </Space>}>
       {!cur ? (

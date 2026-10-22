@@ -136,7 +136,7 @@ provider key 为 write-only 配置，只写不回显，ops 日志只记长度。
 ```bash
 sudo systemctl restart gateway.service && sleep 2 \
   && systemctl show gateway.service -p MainPID \
-  && curl -sf http://127.0.0.1:8080/health
+  && curl -sf https://127.0.0.1:8080/health
 ```
 
 MainPID 必须变，否则等于没重启。生产推代码完整流程见 `agents/deploy.md`

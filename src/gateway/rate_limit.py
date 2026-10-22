@@ -16,7 +16,11 @@ Env:
   AI_GATEWAY_RATE_LIMIT_RPM      = per-minute cap for chat/messages/embed (default 120)
   AI_GATEWAY_RATE_LIMIT_RPS      = per-second burst cap (default 10)
   AI_GATEWAY_RATE_LIMIT_FILES_RPM = per-minute cap for files (default 60)
-  REDIS_URL                      = optional; if set, use Redis for cross-process state
+
+  RPM 与 RPS 是**两个独立桶**（2026-10-21 修：此前 rpm>0 时 rps 分支不可达，
+  RPS 配置是死配置）。两个都配时必须都过：RPS 管突发，RPM 管总量。
+
+实现说明：限流状态是**进程内内存**（单进程部署有效；多 worker 需各自计数）。
 """
 from __future__ import annotations
 
@@ -103,21 +107,26 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._buckets: dict[tuple[str, str], _Bucket] = {}
 
-    def _scope_limits(self, scope: str, rpm_override: Optional[int] = None) -> Tuple[float, float, str]:
-        """Return (capacity, refill_per_sec, reason_label) for a given scope."""
-        if scope == "files":
-            return float(self.files_rpm), self.files_rpm / 60.0, "files_rpm"
-        if rpm_override and int(rpm_override) > 0:
-            v = float(int(rpm_override))
-            return v, v / 60.0, "rpm"
-        if self.rpm > 0:
-            return float(self.rpm), self.rpm / 60.0, "rpm"
-        if self.rps > 0:
-            return float(self.rps), float(self.rps), "rps"
-        return 0.0, 0.0, ""
+    def _scope_limits(self, scope: str, rpm_override: Optional[int] = None):
+        """Return (rpm_cap, rpm_refill, rpm_reason, rps_cap, rps_refill) for a scope.
 
-    def _get_bucket(self, key: str, scope: str, capacity: float) -> _Bucket:
-        bk = (scope, key)
+        2026-10-21 修：此前只返回一个桶（rpm>0 时 rps 分支不可达）⇒
+        ``AI_GATEWAY_RATE_LIMIT_RPS`` 是死配置（实测 20 并发全 200、无 429）。
+        现在 rpm 与 rps 各一个桶，**两个限制都配时必须都过**。
+        """
+        if scope == "files":
+            return float(self.files_rpm), self.files_rpm / 60.0, "files_rpm", 0.0, 0.0
+        rpm_cap = 0.0
+        if rpm_override and int(rpm_override) > 0:
+            rpm_cap = float(int(rpm_override))
+        elif self.rpm > 0:
+            rpm_cap = float(self.rpm)
+        rps_cap = float(self.rps) if self.rps > 0 else 0.0
+        return (rpm_cap, rpm_cap / 60.0 if rpm_cap else 0.0, "rpm",
+                rps_cap, rps_cap)
+
+    def _get_bucket(self, key: str, scope: str, capacity: float, kind: str = "rpm") -> _Bucket:
+        bk = (scope, key, kind)
         with self._lock:
             b = self._buckets.get(bk)
             if b is None:
@@ -137,19 +146,26 @@ class RateLimiter:
     def check(self, key: str, scope: str = "default", rpm_override: Optional[int] = None) -> Tuple[bool, int, str]:
         if not self.enabled:
             return True, 0, ""
-        capacity, refill, reason = self._scope_limits(scope, rpm_override)
-        if capacity <= 0 or refill <= 0:
+        rpm_cap, rpm_refill, rpm_reason, rps_cap, rps_refill = self._scope_limits(scope, rpm_override)
+        if rpm_cap <= 0 and rps_cap <= 0:
             return True, 0, ""
-        b = self._get_bucket(key, scope, capacity)
-        ok, retry = b.take(capacity, refill)
-        if not ok:
-            self._inc_metric(scope, key)
-        return ok, retry, ("" if ok else reason)
+        # RPS 桶先判（突发保护），再判 RPM 桶：两个限制都配时**都要过**才放行
+        if rps_cap > 0:
+            ok, retry = self._get_bucket(key, scope, rps_cap, "rps").take(rps_cap, rps_refill)
+            if not ok:
+                self._inc_metric(scope, key)
+                return False, retry, "rps"
+        if rpm_cap > 0:
+            ok, retry = self._get_bucket(key, scope, rpm_cap, "rpm").take(rpm_cap, rpm_refill)
+            if not ok:
+                self._inc_metric(scope, key)
+                return False, retry, rpm_reason
+        return True, 0, ""
 
     def check_model(self, full_model: str, rpm: int) -> Tuple[bool, int]:
         """模型级全局限流（全客户端共享一个桶）。rpm<=0 = 不限。
 
-        full_model 形如 "vllm_local/Qwen3.8-AB"，作桶键。
+        full_model 形如 "vllm_local/qwen2.5:7b"，作桶键。
         同一请求内 resolve() 会被预检/实际转发调用多次 —— ContextVar 去重，
         每请求每模型只扣一次（fallback 换候选 = 不同 full_model，各自计）。
         """

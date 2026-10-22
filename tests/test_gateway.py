@@ -82,10 +82,10 @@ def test_rule_priority_suggestion_and_reorder(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"policies": [
         {"name": "rl_slow", "priority": 10, "action": "route_local",
          "when": {"any": [{"text contains_any": ["rs"]}]},
-         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
         {"name": "rl_fast", "priority": 20, "action": "route_local",
          "when": {"any": [{"text contains_any": ["rf"]}]},
-         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
         {"name": "b_slow", "priority": 30, "action": "block",
          "when": {"any": [{"text contains_any": ["bs"]}]},
          },
@@ -93,6 +93,8 @@ def test_rule_priority_suggestion_and_reorder(tmp_path, monkeypatch):
          "when": {"any": [{"text contains_any": ["bf"]}]}},
     ]}, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(p))
+    # 规则窗口钉 24h ⇒ 优先级重排阈值 = 基准值（不放大），下面的次数才够得着
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_RULE_WINDOW_HOURS", "24")
     _pol.invalidate_policy_cache()
     store = get_admin_store()
     try:
@@ -134,7 +136,7 @@ def test_silent_rule_suggests_removal(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"policies": [
         {"name": "rule_busy", "priority": 10, "action": "route_local",
          "when": {"any": [{"text contains_any": ["busy"]}]},
-         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
         {"name": "rule_ghost", "priority": 20, "action": "block",
           "when": {"any": [{"text contains_any": ["ghost"]}]}},
      ]}, allow_unicode=True), encoding="utf-8")
@@ -174,7 +176,7 @@ def test_silent_rule_new_rule_grace(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"policies": [
         {"name": "rule_newbie", "priority": 10, "action": "route_local",
          "when": {"any": [{"text contains_any": ["newbie"]}]},
-         "target": {"provider": "vllm_local", "model": "Qwen3.8-AB"}},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
         {"name": "rule_oldquiet", "priority": 20, "action": "block",
          "when": {"any": [{"text contains_any": ["oldquiet"]}]}},
     ]}, allow_unicode=True), encoding="utf-8")
@@ -289,19 +291,20 @@ def test_upstream_5xx_trips_breaker_then_failfast(monkeypatch):
                               lambda i, u: httpx.Response(500, text="upstream boom",
                                                           request=httpx.Request("POST", u)))
     b = _cb.get_breaker()
-    b.reset(prov.name)
+    key = _cb.key_for(prov.name, "m")
+    b.reset(key)
 
     async def _call():
-        return await _rt._post(prov, url, {"model": "m"}, "K")
+        return await _rt._post(prov, url, {"model": "m"}, "K", "m")
 
     tripped0 = _prom_value(get_metrics().render(), "gateway_circuit_tripped_total")
     short0 = _prom_value(get_metrics().render(), "gateway_circuit_short_circuit_total")
     try:
         assert asyncio.run(_call()).status_code == 500
-        assert b.state(prov.name) == "closed", "1 次失败（阈值 2）不应跳闸"
+        assert b.state(key) == "closed", "1 次失败（阈值 2）不应跳闸"
         assert asyncio.run(_call()).status_code == 500
-        assert b.state(prov.name) == "open", "连续 5xx 达阈值应跳闸"
-        assert b.snapshot()[prov.name]["failure_count_window"] == 2
+        assert b.state(key) == "open", "连续 5xx 达阈值应跳闸"
+        assert b.snapshot()[key]["failure_count_window"] == 2
         assert _prom_value(get_metrics().render(), "gateway_circuit_tripped_total") == tripped0 + 1
         n = len(calls)
         with pytest.raises(_rt.RoutingError) as ei:
@@ -311,7 +314,7 @@ def test_upstream_5xx_trips_breaker_then_failfast(monkeypatch):
         assert _prom_value(get_metrics().render(),
                            "gateway_circuit_short_circuit_total") == short0 + 1
     finally:
-        b.reset(prov.name)
+        b.reset(key)
 
 
 def test_stream_upstream_5xx_trips_breaker(monkeypatch):
@@ -330,7 +333,8 @@ def test_stream_upstream_5xx_trips_breaker(monkeypatch):
                               lambda i, u: httpx.Response(500, text="upstream boom",
                                                           request=httpx.Request("POST", u)))
     b = _cb.get_breaker()
-    b.reset(prov.name)
+    key = _cb.key_for(prov.name, "m")
+    b.reset(key)
 
     async def _once():
         async for _ in _rt._chat_stream_once({"model": "m", "messages": []},
@@ -340,14 +344,14 @@ def test_stream_upstream_5xx_trips_breaker(monkeypatch):
     try:
         with pytest.raises(_rt.RoutingError) as ei:
             asyncio.run(_once())
-        assert ei.value.status_code == 500 and b.state(prov.name) == "open"
+        assert ei.value.status_code == 500 and b.state(key) == "open"
         n = len(calls)
         with pytest.raises(_rt.RoutingError) as ei2:
             asyncio.run(_once())
         assert ei2.value.status_code == 503 and "circuit open" in str(ei2.value)
         assert len(calls) == n, "跳闸后流式请求也必须 fail-fast"
     finally:
-        b.reset(prov.name)
+        b.reset(key)
 
 
 def test_upstream_network_error_trips_but_4xx_does_not(monkeypatch):
@@ -364,27 +368,40 @@ def test_upstream_network_error_trips_but_4xx_does_not(monkeypatch):
     prov = Provider(name="pytest-cb-net", base_url="http://cbnet.invalid", api_key_value="K")
     url = "http://cbnet.invalid/v1/embeddings"
     b = _cb.get_breaker()
-    b.reset(prov.name)
+    key = _cb.key_for(prov.name, "m")
+    b.reset(key)
     try:
         _cb_stub_upstream(monkeypatch, _rt,
                           lambda i, u: httpx.ConnectError("connection refused"))
         with pytest.raises(_rt.RoutingError) as ei:
-            asyncio.run(_rt._post(prov, url, {"model": "m"}, "K"))
+            asyncio.run(_rt._post(prov, url, {"model": "m"}, "K", "m"))
         assert ei.value.status_code == 502 and "unreachable" in str(ei.value)
-        assert b.state(prov.name) == "open", "连不上上游应与 5xx 同等计失败"
+        assert b.state(key) == "open", "连不上上游应与 5xx 同等计失败"
 
-        b.reset(prov.name)
+        b.reset(key)
         _cb_stub_upstream(monkeypatch, _rt,
                           lambda i, u: httpx.Response(400, text="bad request",
                                                       request=httpx.Request("POST", u)))
-        assert asyncio.run(_rt._post(prov, url, {"model": "m"}, "K")).status_code == 400
-        assert b.state(prov.name) == "closed" and b.allow(prov.name), "4xx 不该跳闸"
+        assert asyncio.run(_rt._post(prov, url, {"model": "m"}, "K", "m")).status_code == 400
+        assert b.state(key) == "closed" and b.allow(key), "4xx 不该跳闸"
     finally:
-        b.reset(prov.name)
+        b.reset(key)
+
+
+def test_routing_provider_lookup_case_insensitive():
+    # provider 名大小写不敏感：routing.yaml 键是小写（deepseek/vllm_local），
+    # 别名组成员常是展示名（Deepseek/Vllm_Local）——查不到就是运行期 503 unknown provider
+    from src.gateway.providers import Provider, RoutingConfig
+
+    p = Provider(name="deepseek", base_url="http://d.invalid", api_key_value="K")
+    cfg = RoutingConfig(providers={"deepseek": p})
+    assert cfg.get("Deepseek") is p and cfg.get("DEEPSEEK") is p
+    assert cfg.get("nope") is None and cfg.get(None) is None
 
 
 def test_alias_candidates_skip_open_candidate(monkeypatch):
     # 别名组按 provider::model 记熔断：跳闸成员被跳过（切下一候选）；全组跳闸 → 无候选（上层 503）
+    # 记账在 routing 的上游尝试处（_post），这里直接喂熔断器模拟"该候选已跳闸"
     from src.gateway import alias_router as _ar, circuit_breaker as _cb
 
     monkeypatch.setenv("AI_GATEWAY_CB_FAILURE_THRESHOLD", "2")
@@ -398,15 +415,49 @@ def test_alias_candidates_skip_open_candidate(monkeypatch):
     try:
         assert [c["idx"] for c in _ar.alias_candidates(group)] == [0, 1]
         for _ in range(2):
-            _ar.record_alias_result("pytest-alias-a", "ma", False)
+            b.record_failure(_ar._cb_key("pytest-alias-a", "ma"))
         assert [c["provider"] for c in _ar.alias_candidates(group)] == ["pytest-alias-b"]
         assert _ar.alias_candidates(group, skip=2) == [], "候选用尽 → 无候选（上层给 503）"
         for _ in range(2):
-            _ar.record_alias_result("pytest-alias-b", "mb", False)
+            b.record_failure(_ar._cb_key("pytest-alias-b", "mb"))
         assert _ar.alias_candidates(group) == [], "整组熔断 → 无候选，不静默转本地"
     finally:
         for p, m in keys:
             b.reset(_ar._cb_key(p, m))
+
+
+def test_breaker_key_shared_by_alias_and_direct(monkeypatch):
+    # 熔断键 = provider::model：点名请求失败跳闸后，**别名组同一候选**必须一起被跳过
+    # （两套键 = 上游挂了别名组照打，熔断形同虚设）
+    import asyncio
+    import httpx
+    import pytest
+    from src.gateway import alias_router as _ar, circuit_breaker as _cb
+    from src.gateway import routing as _rt
+    from src.gateway.providers import Provider
+
+    monkeypatch.setenv("AI_GATEWAY_CB_FAILURE_THRESHOLD", "1")
+    monkeypatch.setenv("AI_GATEWAY_CB_RECOVERY_SECONDS", "600")
+    monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: False)
+    prov = Provider(name="pytest-cb-shared", base_url="http://cbshared.invalid",
+                    api_key_value="K")
+    url = "http://cbshared.invalid/v1/chat/completions"
+    _cb_stub_upstream(monkeypatch, _rt,
+                      lambda i, u: httpx.Response(500, text="boom",
+                                                  request=httpx.Request("POST", u)))
+    b = _cb.get_breaker()
+    key = _cb.key_for(prov.name, "m1")
+    b.reset(key)
+    group = {"name": "AB", "candidates": [{"provider": prov.name, "model": "m1"}]}
+    try:
+        asyncio.run(_rt._post(prov, url, {"model": "m1"}, "K", "m1"))
+        assert b.state(key) == "open", "点名请求 5xx 应跳闸"
+        assert _ar.alias_candidates(group) == [], "别名组必须看到同一份熔断状态"
+        with pytest.raises(_rt.RoutingError) as ei:
+            asyncio.run(_rt._post(prov, url, {"model": "m1"}, "K", "m1"))
+        assert ei.value.status_code == 503 and "circuit open" in str(ei.value)
+    finally:
+        b.reset(key)
 
 
 def test_alias_candidates_get_own_provider_key(monkeypatch):
@@ -440,11 +491,11 @@ def test_alias_candidates_get_own_provider_key(monkeypatch):
     monkeypatch.setattr(_ar, "alias_candidates",
                         lambda g, skip=0: [{"provider": "provA", "model": "mA", "idx": 0},
                                            {"provider": "provB", "model": "mB", "idx": 1}][skip:])
-    monkeypatch.setattr(_ar, "record_alias_result", lambda *a, **k: None)
+    monkeypatch.setattr(_ar, "record_alias_ok", lambda *a, **k: None)
 
     seen = []
 
-    async def _fake_post(prov, url, body, ukey=""):
+    async def _fake_post(prov, url, body, ukey="", model=""):
         seen.append((prov.name, ukey))
         raise _rt.RoutingError(f"{prov.name} boom", 502)
 
@@ -470,6 +521,87 @@ def test_alias_candidates_get_own_provider_key(monkeypatch):
         return list(seen)
 
     assert asyncio.run(_msg_once()) == [("provA", "KEY-A"), ("provB", "KEY-B")]
+
+def test_keys_import_accepts_named_and_bare_key():
+    # 批量导入（手写 key）：每行一条，"名称,key" 与只写 key 都收（名称按行号自动生成）；
+    # 注释行忽略、key < 8 位无效、"sk-x,sk-y"（第 1 段疑似 key）无效、重复 key 记 duplicate
+    text = "\n".join([
+        "# 注释行",
+        "批量甲,sk_pytest_import_a_0001",
+        "sk_pytest_import_b_0002",
+        "批量丙,short",
+        "sk-x,sk-y",
+    ])
+    r = client.post("/admin/api/keys/import", json={"text": text})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["added"] == 2, d
+    by_line = {x["line"]: x for x in d["results"]}
+    assert by_line[2]["status"] == "ok" and by_line[2]["message"] == "批量甲"
+    assert by_line[3]["status"] == "ok" and by_line[3]["message"] == "导入-03", by_line[3]
+    assert by_line[4]["status"] == "invalid" and "8 位" in by_line[4]["message"]
+    assert by_line[5]["status"] == "invalid" and "名称,key" in by_line[5]["message"]
+    # 响应只回掩码，不回明文
+    assert all("sk_pytest_import" not in x["key_masked"] for x in d["results"])
+    # 再导一次同一个 key → duplicate（不重复登记）
+    r2 = client.post("/admin/api/keys/import", json={"text": "sk_pytest_import_b_0002"})
+    assert r2.json()["added"] == 0 and r2.json()["results"][0]["status"] == "duplicate"
+
+def test_bare_internal_model_name_routes_local():
+    # 2026-10-21 巡检修：裸内网模型名（model_policy.internal_models 里登记的，如
+    # qwen2.5:7b）此前落 default_external ⇒ 客户端以为走内网、实际内容出境。
+    # 现在钉回它登记的内网 provider；/v1/models 暴露的名字与实际路由必须一致。
+    r = client.post("/v1/chat/completions", headers=H,
+                    json={"model": "qwen2.5:7b", "messages": [{"role": "user", "content": "你好"}]})
+    assert r.status_code == 200, r.text
+    g = r.json()["gateway"]
+    assert g["provider"] == "vllm_local", g
+    assert g["local"] is True, g
+    assert g["model"] == "qwen2.5:7b", g
+    # 斜杠写法仍然走同一个内网 provider（老客户端不受影响）
+    r2 = client.post("/v1/chat/completions", headers=H,
+                     json={"model": "vllm_local/qwen2.5:7b", "messages": [{"role": "user", "content": "你好"}]})
+    assert r2.json()["gateway"]["provider"] == "vllm_local"
+    # 未登记的裸名仍按原样交给上游（不 404：线上有客户端用历史模型名请求）
+    r3 = client.post("/v1/chat/completions", headers=H,
+                     json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "你好"}]})
+    assert r3.status_code == 200
+    assert r3.json()["gateway"]["provider"] == "deepseek", r3.json()["gateway"]
+    # 网关知道但不是对话模型的内部名（laya 的 /classify 决策模型）⇒ 404，
+    # 不能把它当普通模型名转给外网上游（= 把内容发给一个不是它的上游）
+    r4 = client.post("/v1/chat/completions", headers=H,
+                     json={"model": "laya-multilingual", "messages": [{"role": "user", "content": "你好"}]})
+    assert r4.status_code == 404, r4.text
+    assert r4.json()["detail"]["type"] == "model_not_chat", r4.text
+
+
+def test_public_models_excludes_non_chat_internal():
+    # /v1/models 只暴露「能对话的内网模型」：laya 是 /classify 决策模型（非 chat），
+    # model_policy 注释即写「不暴露」；暴露出去客户端会拿它当对话模型调 → 落外网。
+    r = client.get("/v1/models", headers=H)
+    assert r.status_code == 200
+    ids = [m["id"] for m in r.json()["data"]]
+    assert "qwen2.5:7b" in ids, ids
+    assert "laya-multilingual" not in ids, ids
+
+
+def test_rate_limit_rps_enforced_alongside_rpm(monkeypatch):
+    # 2026-10-21 修：此前 rpm>0 时 rps 分支不可达 ⇒ AI_GATEWAY_RATE_LIMIT_RPS 是死配置
+    # （实测 20 并发全 200、无 429）。现在两个桶都要过。
+    from src.gateway.rate_limit import get_limiter
+    monkeypatch.setenv("AI_GATEWAY_RATE_LIMIT_ENABLED", "true")
+    monkeypatch.setenv("AI_GATEWAY_RATE_LIMIT_RPM", "60")
+    monkeypatch.setenv("AI_GATEWAY_RATE_LIMIT_RPS", "2")
+    get_limiter().reset()
+    try:
+        assert get_limiter().check("k1", scope="chat")[0] is True
+        assert get_limiter().check("k1", scope="chat")[0] is True
+        ok, retry, reason = get_limiter().check("k1", scope="chat")
+        assert ok is False and reason == "rps", (ok, retry, reason)
+        assert retry >= 1
+    finally:
+        get_limiter().reset()
+
 
 def test_cand_key_gates_per_candidate():
     # 候选可转发性必须按**该候选自己**的 provider 判：用当前 prov 的 key 去筛
@@ -546,6 +678,82 @@ def test_idle_whitelist_suggests_revoke():
             pass
         store.delete_api_key(kid)
 
+def test_blacklist_block_keeps_key_identity():
+    # 拉黑的 key 仍是登记身份：403 明细要写 key_name/key_id，别在 KEY 统计里落成 "(unknown)"
+    import time as _time
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    plain = "sk_black_%d" % int(_time.time() * 1000)
+    name = "pytest-blacklist"
+    kid = store.create_api_key(plain, name, "", "pytest blacklist attribution")["id"]
+    rid = store.add_key_rule(kind="black", key_value=plain, note="pytest")["id"]
+    try:
+        r = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {plain}"},
+                        json={"model": "vllm_local/qwen2.5:7b",
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 403, r.text[:200]
+        groups = {g["label"]: g for g in store.stats_group("2000-01-01 00:00:00", "2099-01-01 00:00:00", "key_name")}
+        assert groups[name]["blocked"] >= 1, groups
+    finally:
+        store.remove_key_rule(rid)
+        store.delete_api_key(kid)
+        with store._mem_lock:  # 清掉本用例写入的明细行（共享 memory store）
+            store._logs[:] = [x for x in store._logs if x.get("key_name") != name]
+
+
+def test_unregistered_key_401_not_logged_as_traffic():
+    # 鉴权层 401 没有身份/内容，不进 request_log（否则 KEY 榜出现 (unknown) 且算 allow）
+    import time as _time
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    r = client.post("/v1/chat/completions", headers={"Authorization": "Bearer sk_unregistered_probe"},
+                    json={"model": "vllm_local/qwen2.5:7b",
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 401, r.text[:200]
+    _time.sleep(0.2)  # 明细是 fire-and-forget（executor 线程），留一拍再看
+    with store._mem_lock:
+        assert not [x for x in store._logs if x.get("status_code") == 401]
+
+
+def test_provider_group_excludes_unrouted():
+    # 空 provider = 没到上游（拦截/未路由）：整行不进 provider 调用分布
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    since, until = "2000-01-01 00:00:00", "2099-01-01 00:00:00"
+    before = {g["label"]: g["calls"] for g in store.stats_group(since, until, "provider")}
+    store.insert_request_log({"provider": "", "action": "block", "status_code": 403,
+                              "key_name": "pytest-prov", "blocked_reason": "key_blacklist"})
+    store.insert_request_log({"provider": "vllm_local", "action": "route_local", "status_code": 200,
+                              "key_name": "pytest-prov"})
+    try:
+        after = {g["label"]: g["calls"] for g in store.stats_group(since, until, "provider")}
+        assert "" not in after and "未到上游" not in after and "(unknown)" not in after, after
+        assert after.get("vllm_local", 0) == before.get("vllm_local", 0) + 1, (before, after)
+        summ = {g["label"]: g["calls"] for g in store.stats_summary(since, until, top=20)["group_provider"]}
+        assert summ.get("vllm_local", 0) == before.get("vllm_local", 0) + 1, summ
+    finally:
+        with store._mem_lock:
+            store._logs[:] = [x for x in store._logs if x.get("key_name") != "pytest-prov"]
+
+
+def test_audit_search_matches_chinese_rule_name():
+    # 界面显示中文、库里存英文标识：搜「L2 判密」要能命中 rule=l2_confidential
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    entry = {"time": "2026-10-20 00:00:00", "ts": "2026-10-20 00:00:00", "type": "chat",
+             "action": "route_local", "rule": "l2_confidential", "text_preview": "搜索用样本",
+             "client_ip": "127.0.0.1", "provider": "vllm_local", "model": "vllm_local/qwen2.5:7b"}
+    store.append(entry)
+    try:
+        for q in ("判密", "L2 判密", "l2_confidential", "系统内置"):
+            d = client.get("/admin/audit/entries", params={"q": q}).json()
+            items = d.get("entries") or d.get("items") or []
+            assert any(e.get("text_preview") == "搜索用样本" for e in items), (q, d)
+    finally:
+        with store._mem_lock:
+            store._mem[:] = [e for e in store._mem if e.get("text_preview") != "搜索用样本"]
+
+
 def test_suggest_add_limit_and_apply(tmp_path, monkeypatch):
     # 规则7：调用量 Top 的 (provider,model) 未配限流则建议一键加限流；应用后建议消失
     import yaml
@@ -567,9 +775,11 @@ def test_suggest_add_limit_and_apply(tmp_path, monkeypatch):
                                       "client_ip": "9.9.9.9"})
         items = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
         lim = [s for s in items if (s.get("apply") or {}).get("kind") == "add_limit"]
-        assert len(lim) == 1, items
-        ap = lim[0]["apply"]
-        assert ap["limit_model"] == "hot-prov/hot-model" and ap["limit_rpm"] > 0
+        # 规则7 最多报 max_per_rule 个模型 ⇒ 按模型名定位，别假设只有一条
+        hit = [s for s in lim if s["apply"]["limit_model"] == "hot-prov/hot-model"]
+        assert hit, items
+        ap = hit[0]["apply"]
+        assert ap["limit_rpm"] > 0
         r = client.post("/admin/api/suggestions/apply", json={"kind": "add_limit", **ap})
         assert r.status_code == 200, r.text
         assert _mp.model_rpm("hot-prov", "hot-model") == ap["limit_rpm"]
@@ -579,24 +789,210 @@ def test_suggest_add_limit_and_apply(tmp_path, monkeypatch):
     finally:
         _mp.invalidate_model_policy_cache()
 
-def test_window_thresholds_parse_and_pick(monkeypatch):
-    # 规则1/2 按窗口取阈值：'24:20,168:100,720:500'；纯数字=全窗口同值；未登记窗口取最近
+
+def test_suggest_add_limit_rate_is_peak_based(tmp_path, monkeypatch):
+    # 规则7 速率口径：平均 = 窗口摊平（÷60，旧算式 ×60 把平均放大 3600 倍）；
+    # 限流建议按**峰值分钟 ×2**（突发流量才是限流依据）
+    import time
+
+    import yaml
+    from src.gateway import model_policy as _mp
+    from src.gateway.admin_store import get_admin_store
+    mp_path = tmp_path / "model_policy.yaml"
+    mp_path.write_text(yaml.safe_dump({"model_policy": {
+        "external_candidates": [], "internal_models": [], "model_limits": [],
+        "review_model": {"threshold": 0.7}}}, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", "5")
+    _mp.invalidate_model_policy_cache()
+    store = get_admin_store()
+    try:
+        # 120 次：两个分钟各 60 次（窗口 1h）→ 峰值分钟 60、平均 120/60=2.00/分钟
+        for off, n in ((90, 60), (150, 60)):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - off))
+            for i in range(n):
+                store.insert_request_log({"key_name": "pytest-peak", "action": "allow",
+                                          "model": "peak-model", "provider": "peak-prov",
+                                          "client_ip": "8.8.8.8", "ts": ts})
+        items = client.get("/admin/api/suggestions", params={"hours": 1}).json()["items"]
+        lim = [s for s in items if (s.get("apply") or {}).get("kind") == "add_limit"]
+        # 规则7 现在最多报 max_per_rule 个模型 ⇒ 按模型名定位，别假设只有一条
+        hit = [s for s in lim if s["apply"]["limit_model"] == "peak-prov/peak-model"]
+        assert hit, items
+        s = hit[0]
+        assert s["apply"]["limit_rpm"] == 120, s          # 峰值 60 × 2（默认倍数）
+        assert "峰值 60/分钟" in s["message"], s
+        assert "平均 2.00/分钟" in s["message"], s
+        assert "7200" not in s["message"], s              # 旧算式（×60）的放大值不该再出现
+        # AND 条件二：峰值下限更高 → 不再建议（累计够但没有分钟级突发）
+        monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK", "1000")
+        items2 = client.get("/admin/api/suggestions", params={"hours": 1}).json()["items"]
+        assert not [s for s in items2 if (s.get("apply") or {}).get("kind") == "add_limit"
+                    and s["apply"]["limit_model"] == "peak-prov/peak-model"], items2
+        # 0 = 关闭该条件 → 恢复建议
+        monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK", "0")
+        items3 = client.get("/admin/api/suggestions", params={"hours": 1}).json()["items"]
+        assert [s for s in items3 if (s.get("apply") or {}).get("kind") == "add_limit"], items3
+        # 累计调用数条件也能单独关闭（0 = 该条件不参与判断，与峰值条件语义一致）
+        monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", "1000")
+        items4 = client.get("/admin/api/suggestions", params={"hours": 1}).json()["items"]
+        assert not [s for s in items4 if (s.get("apply") or {}).get("kind") == "add_limit"
+                    and s["apply"]["limit_model"] == "peak-prov/peak-model"], items4
+        monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", "0")
+        items5 = client.get("/admin/api/suggestions", params={"hours": 1}).json()["items"]
+        assert [s for s in items5 if (s.get("apply") or {}).get("kind") == "add_limit"
+                and s["apply"]["limit_model"] == "peak-prov/peak-model"], items5
+    finally:
+        _mp.invalidate_model_policy_cache()
+
+
+def test_suggest_caps_per_rule_and_total(monkeypatch):
+    # 条数上限：每规则 N 条 + 整卡 N 条（severity 高的先留）
+    # 次数类阈值会按窗口放大 ⇒ 用量观察基准压到 1，保证 7 天窗（×7=7）也够得着
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD", "1")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_MAX_PER_RULE", "1")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_MAX_TOTAL", "1")
+    items = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
+    assert len(items) == 1, items
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_MAX_TOTAL", "2")
+    items2 = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
+    assert 1 <= len(items2) <= 2, items2
+    types = [s.get("type") for s in items2]
+    assert len(types) == len(set(types)), items2      # 每规则最多 1 条
+
+
+def test_suggest_run_state_rules(monkeypatch):
+    # 运行态维度规则：延迟 P95 / 本地路由占比 / token 突增（各自 0 = 关闭）
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    rows = ([{"action": "route_local", "duration_ms": 5000, "prompt_tokens": 10,
+              "completion_tokens": 10, "provider": "p", "model": "m", "ts": "2026-01-01 00:00:00"}] * 3
+            + [{"action": "allow", "duration_ms": 10, "prompt_tokens": 1,
+                "completion_tokens": 1, "provider": "p", "model": "m", "ts": "2026-01-01 00:00:00"}])
+    monkeypatch.setattr(store, "_log_rows", lambda since="", until="": rows)
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_LATENCY_P95_MS", "1000")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_DEGRADE_RATE", "0.7")
+    items = client.get("/admin/api/suggestions", params={"hours": 24}).json()["items"]
+    by_type = {s.get("type"): s for s in items}
+    assert "latency_high" in by_type, items
+    assert "P95 5000ms" in by_type["latency_high"]["metric"], by_type["latency_high"]
+    assert "degrade_rate" in by_type, items
+    assert "75%" in by_type["degrade_rate"]["metric"], by_type["degrade_rate"]
+    # 阈值置 0 = 关闭对应规则
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_LATENCY_P95_MS", "0")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_DEGRADE_RATE", "0")
+    items2 = client.get("/admin/api/suggestions", params={"hours": 24}).json()["items"]
+    assert not [s for s in items2 if s.get("type") in ("latency_high", "degrade_rate")], items2
+
+
+def test_suggest_token_growth(monkeypatch):
+    # 规则10：token 用量相对上一等长窗口突增
+    import time as _t
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    now = _t.time()
+    cur_since = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime(now - 3600))
+    cur = [{"action": "allow", "duration_ms": 10, "prompt_tokens": 1000,
+            "completion_tokens": 1000, "provider": "p", "model": "m", "ts": cur_since}]
+    prev = [{"action": "allow", "duration_ms": 10, "prompt_tokens": 10,
+             "completion_tokens": 10, "provider": "p", "model": "m", "ts": "2026-01-01 00:00:00"}]
+
+    def fake_rows(since="", until=""):
+        return cur if (since or "") >= cur_since else prev
+
+    monkeypatch.setattr(store, "_log_rows", fake_rows)
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_TOKEN_GROWTH", "3")
+    items = client.get("/admin/api/suggestions", params={"hours": 1}).json()["items"]
+    sp = [s for s in items if s.get("type") == "token_spike"]
+    assert sp, items
+    assert "100.0 倍" in sp[0]["metric"], sp[0]
+
+
+def test_suggest_threshold_scales_with_window(monkeypatch):
+    # 次数类阈值：只配一个 24h 基准值，各窗口按长度等比放大；比率/速率类不放大
+    from src.gateway import stats_service as _st
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "20")
+    th = _st._thresholds()
+    assert th["violation_base"] == 20
+    assert _st._scaled(th["violation_base"], 24) == 20
+    assert _st._scaled(th["violation_base"], 168) == 140
+    assert _st._scaled(th["violation_base"], 720) == 600
+    # meta 回传的是**当前窗口**的有效值（UI 提示用）
+    assert _st.suggestion_meta(24)["thresholds"]["violation"] == 20
+    assert _st.suggestion_meta(168)["thresholds"]["violation"] == 140
+    assert _st.suggestion_meta(720)["thresholds"]["violation"] == 600
+    # 比率类（异常处置率）与限流建议的两个条件不随窗口放大
+    monkeypatch.setenv("AI_GATEWAY_KEYTIER_VIOLATION_RATE", "0.3")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_CALLS", "1000")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_LIMIT_MIN_PEAK", "20")
+    th2 = _st._thresholds()
+    assert th2["kt_violation_rate"] == 0.3
+    assert th2["limit_min_calls"] == 1000
+    assert th2["limit_min_peak"] == 20
+    # 历史分档形态按 24h 档当基准（老配置不用手改）
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "24:20,168:100,720:500")
+    assert _st._thresholds()["violation_base"] == 20
+
+
+def test_l2_gray_floor_hot_reload(monkeypatch):
+    # 灰区下限改成每次读 env（即时生效），且上限钉 20（再高则 25/30 档关键词单命中不进灰区）
+    from src.gateway import main as _main
+    monkeypatch.setenv("AI_GATEWAY_L2_GRAY_FLOOR", "20")
+    assert _main._l2_gray_floor() == 20
+    assert _main._l2_gray_trigger({"risk_score": 20}) is True
+    assert _main._l2_gray_trigger({"risk_score": 19}) is False
+    monkeypatch.setenv("AI_GATEWAY_L2_GRAY_FLOOR", "30")
+    assert _main._l2_gray_floor() == 20          # 超过 20 一律回落 20
+    monkeypatch.setenv("AI_GATEWAY_L2_GRAY_FLOOR", "0")
+    assert _main._l2_gray_floor() == 0
+    assert _main._l2_gray_trigger({"risk_score": 0}) is True
+
+
+def test_legacy_window_map_reads_24h_base(monkeypatch):
+    # 历史分档形态 '24:20,168:100,720:500' 只用于读**24h 档当基准**（其余档按窗口长度自动算）
     from src.gateway import stats_service as ss
     monkeypatch.setenv("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "24:20,168:100,720:500")
     m = ss._window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20)
     assert m == {24: 20, 168: 100, 720: 500}
-    assert ss.pick_window(m, 24, 0) == 20
-    assert ss.pick_window(m, 168, 0) == 100
-    assert ss.pick_window(m, 720, 0) == 500
-    assert ss.pick_window(m, 48, 0) == 20  # 未登记窗口取最近：|48-24|=24 < |48-168|=120
-    # 纯数字 = 全窗口同值
+    assert ss._base_threshold("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
+                              "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20) == 20
+    # 纯数字 = 基准值
     monkeypatch.setenv("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "33")
-    m2 = ss._window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20)
-    assert m2 == {"*": 33} and ss.pick_window(m2, 168, 0) == 33
+    assert ss._window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
+                                  "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20) == {"*": 33}
+    assert ss._base_threshold("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
+                              "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20) == 33
     # 非法 → 回落默认
     monkeypatch.setenv("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "abc")
-    m3 = ss._window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20)
-    assert m3 == {"*": 20}
+    assert ss._window_thresholds("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
+                                  "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20) == {"*": 20}
+    assert ss._base_threshold("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD",
+                              "AI_GATEWAY_SUGGEST_BLOCK_THRESHOLD", 20) == 20
+
+def test_suggest_effective_thresholds_per_rule_window(monkeypatch):
+    # 钉死各规则在自己窗口下的**有效阈值**（次数类 = 基准 × 窗口/24）：
+    # 基准值改动会同步移动这些数字，别让下一次改动悄悄挪走触发线
+    from src.gateway import stats_service as _st
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "20")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD", "1000")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_ERROR_MIN_CALLS", "30")
+    monkeypatch.setenv("AI_GATEWAY_KEYTIER_MIN_CALLS_BLACK", "30")
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_REORDER_MIN_HITS", "10")
+    monkeypatch.setenv("AI_GATEWAY_KEYTIER_WINDOW_HOURS", "720")
+    th = _st._thresholds()
+    # 规则 1/2/3：面板窗口
+    assert _st._scaled(th["violation_base"], 24) == 20
+    assert _st._scaled(th["violation_base"], 168) == 140
+    assert _st._scaled(th["violation_base"], 720) == 600
+    assert _st._scaled(th["volume_base"], 168) == 7000
+    assert _st._scaled(th["error_min_calls_base"], 168) == 210
+    # 规则 0：KEY 分级窗口（720h）
+    assert _st._scaled(th["kt_black_calls_base"], th["kt_window_hours"]) == 900
+    # 规则 4：规则窗口（0 = 跟随 KEY 分级窗口）
+    assert _st._scaled(th["reorder_min_hits_base"], _st._rule_window_hours(th)) == 300
+    # 窗口短于 24h 不缩小（沿用基准值，避免"1 次事件就建议拉黑"）
+    assert _st._scaled(20, 1) == 20
+    assert _st._scaled(20, 0) == 20
 
 def test_l2_gray_trigger_no_upper_bound_on_risk():
     # 回归（2026-09-30）：灰区上界曾是 `risk_score < 60`，但 risk_score 混了关键词分，
@@ -729,8 +1125,10 @@ def test_l1_keyword_in_decode_layer():
     assert _encoded_keyword_decision(fp) is None
 
 def test_l2_config_suggest_window_roundtrip(tmp_path, monkeypatch):
-    # /l2-config：两项阈值按窗口 {24/168/720} 存取；PUT 传 dict → env '24:20,168:100,720:500'
+    # /l2-config：次数类阈值只存**基准值**（24h 口径）；PUT 传 dict（历史分档形态）取 24h 档，
+    # 其余窗口由系统按窗口长度自动换算（stats_service._scaled）
     import os
+    from src.gateway import stats_service as _st
     monkeypatch.setenv("AI_GATEWAY_L2_OVERRIDES_PATH", str(tmp_path / "ov.yaml"))
     saved = {k: os.environ.get(k) for k in
              ("AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD", "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD")}
@@ -740,17 +1138,22 @@ def test_l2_config_suggest_window_roundtrip(tmp_path, monkeypatch):
             "AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD": {"24": 100, "168": 2000, "720": 9000},
         })
         assert r.status_code == 200, r.text
-        assert os.environ["AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD"] == "24:20,168:100,720:500"
-        assert os.environ["AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD"] == "24:100,168:2000,720:9000"
+        # 落 env 的是基准值（24h 档），不是分档表
+        assert os.environ["AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD"] == "20"
+        assert os.environ["AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD"] == "100"
         d = client.get("/admin/api/l2-config").json()
-        assert d["AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD"] == {"24": 20, "168": 100, "720": 500}
-        assert d["AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD"] == {"24": 100, "168": 2000, "720": 9000}
+        assert d["AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD"] == 20
+        assert d["AI_GATEWAY_SUGGEST_VOLUME_THRESHOLD"] == 100
+        # 各窗口的有效值 = 基准 × 窗口/24（自动换算）
+        assert _st._scaled(20, 24) == 20
+        assert _st._scaled(20, 168) == 140
+        assert _st._scaled(20, 720) == 600
         # 越界 422
         r2 = client.put("/admin/api/l2-config", json={"AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": {"24": 0}})
         assert r2.status_code == 422
-        # 纯数字仍兼容（全窗口同值）
+        # 纯数字仍兼容（= 基准值）
         r3 = client.put("/admin/api/l2-config", json={"AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD": 7})
-        assert r3.status_code == 200 and os.environ["AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD"] == "24:7,168:7,720:7"
+        assert r3.status_code == 200 and os.environ["AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD"] == "7"
     finally:
         for k, v in saved.items():
             if v is None:
@@ -927,6 +1330,70 @@ def test_audit_entries_show_key_name():
     assert d["entries"], "token=pytest 应按调用方名称命中"
     assert any(e.get("key_name") == "pytest" and e.get("token_masked") == mask_key(KEY) for e in d["entries"])
 
+def test_audit_entries_filter_and_time_window_are_and():
+    # 回归：动作筛选 + 时间窗必须叠加（早前时间窗分支从 all_entries 重算，
+    # 把 action/rule 过滤整个冲掉 → 筛「本地路由」却看到放行行）
+    import time
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    rows = [
+        {"time": now, "ts": now, "type": "chat", "action": "route_local",
+         "rule": "l2_confidential", "text_preview": "AND叠加样本-本地路由"},
+        {"time": now, "ts": now, "type": "chat", "action": "allow",
+         "rule": "default_allow", "text_preview": "AND叠加样本-放行"},
+    ]
+    for e in rows:
+        store.append(e)
+    try:
+        d = client.get("/admin/audit/entries",
+                       params={"action": "route_local", "since": "24h"}).json()
+        items = d.get("entries") or []
+        assert items, d
+        assert all(e.get("action") == "route_local" for e in items), \
+            [e.get("action") for e in items]
+        assert not any(e.get("text_preview") == "AND叠加样本-放行" for e in items), items
+        # 规则筛选 + 时间窗同理
+        d2 = client.get("/admin/audit/entries",
+                        params={"rule": "l2_confidential", "since": "24h"}).json()
+        items2 = d2.get("entries") or []
+        assert all(e.get("rule") == "l2_confidential" for e in items2), \
+            [e.get("rule") for e in items2]
+    finally:
+        with store._mem_lock:
+            store._mem[:] = [e for e in store._mem
+                             if e.get("text_preview") not in ("AND叠加样本-本地路由", "AND叠加样本-放行")]
+
+
+def test_audit_csv_hot_path_applies_filters():
+    # 回归：CSV 热窗路径（无 since/until）也要按动作/规则筛选，
+    # 早前完全不过滤 → 导出 5000 行全量（含放行行）
+    import time
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    rows = [
+        {"time": now, "ts": now, "type": "chat", "action": "route_local",
+         "rule": "l2_confidential", "text_preview": "CSV样本-本地路由"},
+        {"time": now, "ts": now, "type": "chat", "action": "allow",
+         "rule": "default_allow", "text_preview": "CSV样本-放行"},
+    ]
+    for e in rows:
+        store.append(e)
+    try:
+        r = client.get("/admin/csv", params={"action": "route_local"})
+        assert r.status_code == 200, r.status_code
+        lines = [ln for ln in r.text.splitlines()[1:] if ln.strip()]
+        assert lines, r.text[:500]
+        assert all(",allow," not in ln for ln in lines), lines[:3]
+        assert any("CSV样本-本地路由" in ln for ln in lines), lines[:3]
+        assert not any("CSV样本-放行" in ln for ln in lines), lines[:3]
+    finally:
+        with store._mem_lock:
+            store._mem[:] = [e for e in store._mem
+                             if e.get("text_preview") not in ("CSV样本-本地路由", "CSV样本-放行")]
+
+
 def test_audit_entries_kpi_from_mysql(monkeypatch):
     # 筛选可用 SQL 表达时，KPI 走审计库真值；顶层 total/pages 仍是热窗口径（分页不受影响）
     from src.gateway.audit_store import get_audit_store
@@ -1066,14 +1533,14 @@ def test_stats_summary_equivalent_to_individual_funcs():
 
 def test_real_model_label_normalizes_dirty_rows():
     # 2026-10-12 生产实测计费页 model 脏行：空 model → "vllm_local/"、客户端斜杠式
-    # model → "vllm_local/vllm_local/Qwen3.8-AB"（双前缀行在外网 provider 上还会让
+    # model → "vllm_local/vllm_local/qwen2.5:7b"（双前缀行在外网 provider 上还会让
     # _price_billing 按首个 / 拆名漏定价）。_real_model_label 是 key_model/billing/
     # billing_daily/summary 四个口径的唯一汇聚点，在读取侧归一、不动历史数据。
     from src.gateway.admin_store import _real_model_label
     assert _real_model_label({}, "vllm_local", "") == "vllm_local"
     assert _real_model_label({}, "deepseek", "   ") == "deepseek"
-    assert _real_model_label({}, "vllm_local", "vllm_local/Qwen3.8-AB") == "vllm_local/Qwen3.8-AB"
-    assert _real_model_label({}, "vllm_local", "Qwen3.8-AB") == "vllm_local/Qwen3.8-AB"
+    assert _real_model_label({}, "vllm_local", "vllm_local/qwen2.5:7b") == "vllm_local/qwen2.5:7b"
+    assert _real_model_label({}, "vllm_local", "qwen2.5:7b") == "vllm_local/qwen2.5:7b"
     assert _real_model_label({}, "vllm_local", "deepseek/deepseek-flash") == \
         "vllm_local/deepseek/deepseek-flash"  # 前缀不匹配 provider，不敢猜、原样保留
     assert _real_model_label({}, "", "") == "(unknown)"
@@ -1217,6 +1684,72 @@ def test_l2_divergences_label_roundtrip():
     assert bad.status_code == 422
 
 
+def test_l2_divergences_auto_label_guard(monkeypatch):
+    """模型自动标注：外网 provider 拒绝（审计文本不出境）；建议不落库（人工采纳才写）。"""
+    from src.gateway import l2_retrain
+    from src.gateway.admin_store import get_admin_store
+
+    r = client.post("/admin/api/l2-divergences/auto-label",
+                    json={"model": "deepseek", "req_ids": ["x"]})
+    assert r.status_code == 400
+
+    models = client.get("/admin/api/l2/auto-label/models").json()["models"]
+    assert any(m["value"] == "vllm_local" for m in models)
+    assert all(m["value"] != "deepseek" for m in models)  # 外网模型不进下拉
+
+    # 用假分歧行替掉审计源（不依赖生产库），模型调用也替掉
+    monkeypatch.setattr("src.gateway.admin_api._l2_divergence_rows",
+                        lambda *a, **k: [{"req_id": "pytest-auto-1", "ts": "t", "cell": "cn",
+                                          "main": "CONFIDENTIAL", "shadow": "NORMAL",
+                                          "shadow_prob": 0.1, "text_preview": "工资表",
+                                          "filename": ""}])
+    monkeypatch.setattr(l2_retrain, "auto_label",
+                        lambda items, provider, **k: [
+                            {"req_id": i["req_id"], "label": 1, "confidence": 0.9, "reason": "薪酬"}
+                            for i in items])
+    d = client.post("/admin/api/l2-divergences/auto-label",
+                    json={"model": "vllm_local", "req_ids": ["pytest-auto-1"]}).json()
+    assert d["total"] == 1 and d["items"][0]["label"] == 1
+    # 建议不落库：l2_labels 是训练真值，必须人工采纳才写
+    assert get_admin_store().get_l2_labels(["pytest-auto-1"]) == {}
+
+
+def test_auto_label_parses_model_output():
+    """模型三种真实输出形态都要能解析：标准 JSON / 畸形前缀（实测 '{"label":  "label": 0,…}'）/ JSON 后带散文。"""
+    import asyncio
+    from src.gateway import l2_retrain
+
+    class _Resp:
+        def __init__(self, content, finish="stop"):
+            self._c, self._f = content, finish
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"finish_reason": self._f, "message": {"content": self._c}}]}
+
+    class _Client:
+        def __init__(self, resp):
+            self.resp = resp
+
+        async def post(self, *a, **k):
+            return self.resp
+
+    def run(raw, finish="stop"):
+        return asyncio.run(l2_retrain._auto_label_one(
+            _Client(_Resp(raw, finish)), "http://x/v1/chat/completions", "m", {},
+            {"req_id": "r", "text": "t"}))
+
+    assert run('{"label": 1, "confidence": 0.95, "reason": "薪酬"}')["label"] == 1
+    d = run('{"label":  "label": 0, "confidence": 0.9, "reason": "普通"}')  # 畸形前缀：走正则兜底
+    assert (d["label"], d["confidence"]) == (0, 0.9)
+    d = run('说明：\n{"label": 0, "confidence": 0.8, "reason": "普通"}\n以上。')  # JSON 后带散文
+    assert (d["label"], d["confidence"]) == (0, 0.8)
+    d = run("", finish="length")                                             # 空串/截断：不猜，报 error
+    assert d["label"] is None and "无法解析" in d["error"]
+
+
 def test_policy_version_rollback(monkeypatch, tmp_path):
     # 独立 policy 文件，绝不碰生产 policy.yaml
     import yaml as _yaml
@@ -1282,6 +1815,28 @@ def test_rule_hits_shape():
     assert r.status_code == 200
     d = r.json()
     assert d["hours"] == 168 and d["total"] == 0 and d["items"] == []
+
+
+def test_rule_hits_excludes_l2_decisions(monkeypatch):
+    # 规则命中榜 = 审计页同一集合：L2 判决与系统内置判定都计入（界面由 ruleZh 标
+    # 「（系统内置）」），只排除「default_allow」
+    from src.gateway.audit_store import get_audit_store
+    rows = [
+        {"rule": "l2_confidential", "action": "route_local", "ts": "2026-10-20 01:00:00"},
+        {"rule": "l2_unavailable", "action": "route_local", "ts": "2026-10-20 02:00:00"},
+        {"rule": "encoded_keyword", "action": "route_local", "ts": "2026-10-20 02:10:00"},
+        {"rule": "review_text_overflow", "action": "route_local", "ts": "2026-10-20 02:20:00"},
+        {"rule": "first_chunk_fallback", "action": "route_local", "ts": "2026-10-20 02:30:00"},
+        {"rule": "default_allow", "action": "allow", "ts": "2026-10-20 03:00:00"},
+        {"rule": "financial_local_only", "action": "route_local", "ts": "2026-10-20 04:00:00"},
+    ]
+    monkeypatch.setattr(get_audit_store(), "query_mysql", lambda **kw: rows)
+    d = client.get("/admin/api/rule-hits", params={"hours": 168}).json()
+    assert d["total"] == 6, d
+    assert {it["rule"] for it in d["items"]} == {
+        "l2_confidential", "l2_unavailable", "encoded_keyword", "review_text_overflow",
+        "first_chunk_fallback", "financial_local_only"}
+
 
 
 def test_laya_apply_labeled_priority():
