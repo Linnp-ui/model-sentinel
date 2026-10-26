@@ -84,11 +84,14 @@ function AliasGroupsCard() {
     } catch (e) { message.error(errText(e)); }
   };
 
-  // 兜底模型 = 链首（第一个启用成员，路由按 priority 顺序打）。挑选即提到首位，
-  // 保存时 save() 按行号重算 priority，不需要新字段。
-  const setFallback = (i) => {
+  // 兜底模型 = 链首（第一个启用成员，路由按 priority 顺序打）。挑兜底把该成员提到首位
+  //（priority 顺序），但**不**重排编辑数组的显示顺序——显示按档位排序，避免切换时行跳动。
+  // 保存时 save() 按数组顺序重算 priority，无需新字段/接口。
+  const setFallback = (m) => {
+    const idx = editing.members.indexOf(m);
+    if (idx < 0) return;
     const ms = [...editing.members];
-    ms.unshift(ms.splice(i, 1)[0]);
+    ms.unshift(ms.splice(idx, 1)[0]);
     setEditing({ ...editing, members: ms });
   };
 
@@ -193,28 +196,39 @@ function AliasGroupsCard() {
               <Button htmlType="submit">添加候选</Button>
               <Button onClick={() => setExtModal("new")}>＋新增外部候选</Button>
             </Form>
-            <Table rowKey={(_, i) => 'm' + i} size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed"
-                   dataSource={editing.members}
+            <Table rowKey={(m, i) => 'm' + i} size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed"
+                   dataSource={editing.members
+                     .map((m, idx) => ({ m, idx }))
+                     .sort((a, b) => ((a.m.tier || 2) - (b.m.tier || 2)) || (a.idx - b.idx))
+                     .map((x) => x.m)}
                    columns={[
-                     { title: '', width: '6%', render: (_, m, i) => (
-                         i === editing.members.findIndex((x) => x.enabled !== 0 && x.enabled !== false)
-                           ? <Tag color="green">兜底</Tag>
-                           : (m.enabled ? <Button type="link" size="small" style={{ padding: 0 }} title="设为兜底模型（提到链首）"
-                                          onClick={() => setFallback(i)}>↑</Button> : null)
-                     )},
+                     { title: '', width: '6%', render: (_, m) => {
+                          const fallback = editing.members.find((x) => x.enabled !== 0 && x.enabled !== false);
+                          const isFallback = !!fallback && fallback.provider === m.provider && fallback.model === m.model;
+                          return isFallback
+                            ? <Tag color="green">兜底</Tag>
+                            : (m.enabled ? <Tag color="default" style={{ cursor: 'pointer' }}
+                                           title="设为兜底模型（提到链首）"
+                                           onClick={() => setFallback(m)}>兜底</Tag> : null);
+                      }},
                      { title: 'Provider', dataIndex: 'provider', width: '20%' },
                      { title: 'Model', dataIndex: 'model', width: '26%' },
-                     { title: <span title="1 轻：闲聊/单点问答　2 中：常规编码　3 重：架构/重构/难排查">档位 ⓘ</span>, dataIndex: 'tier', width: '18%', render: (v, _, i) => (
+                     { title: <span title="1 轻：闲聊/单点问答　2 中：常规编码　3 重：架构/重构/难排查">档位 ⓘ</span>, dataIndex: 'tier', width: '18%', render: (v, m) => (
                          <Select size="small" value={v || 2} options={TIER_OPTS} style={{ width: '100%' }}
                                  onChange={(t) => {
-                                   const ms = [...editing.members]; ms[i] = { ...ms[i], tier: t }; setEditing({ ...editing, members: ms });
+                                   const idx = editing.members.indexOf(m); if (idx < 0) return;
+                                   const ms = [...editing.members]; ms[idx] = { ...ms[idx], tier: t }; setEditing({ ...editing, members: ms });
                                  }} /> )},
-                     { title: '启用', dataIndex: 'enabled', width: '8%', render: (v, _, i) => (
+                     { title: '启用', dataIndex: 'enabled', width: '8%', render: (v, m) => (
                          <Switch size="small" aria-label="启用该候选" checked={v} onChange={(ck) => {
-                           const ms = [...editing.members]; ms[i] = { ...ms[i], enabled: ck }; setEditing({ ...editing, members: ms });
+                           const idx = editing.members.indexOf(m); if (idx < 0) return;
+                           const ms = [...editing.members]; ms[idx] = { ...ms[idx], enabled: ck }; setEditing({ ...editing, members: ms });
                          }} /> )},
-                     { title: '操作', width: '22%', render: (_, __, i) => (
-                         <Popconfirm title="删除该候选？" onConfirm={() => setEditing({ ...editing, members: editing.members.filter((_, k) => k !== i) })}>
+                     { title: '操作', width: '22%', render: (_, m) => (
+                         <Popconfirm title="删除该候选？" onConfirm={() => {
+                           const idx = editing.members.indexOf(m);
+                           setEditing({ ...editing, members: editing.members.filter((_, k) => k !== idx) });
+                         }}>
                            <Button type="link" danger>删除</Button>
                          </Popconfirm>
                      )},
