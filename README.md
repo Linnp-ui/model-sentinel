@@ -20,17 +20,20 @@
 
 ## 界面预览
 
-| 管理台 · 总览 | 审计日志（含脱敏） |
-|---|---|
-| ![overview](docs/screenshots/admin-overview.png) | ![audit](docs/screenshots/admin-audit.png) |
+> 截图来自本地 mock 实例（上游指向本地 mock 服务、数据为合成数据），仅用于展示界面；
+> 数字不代表真实流量。
 
-| 模型配置（别名/候选/限流） | API KEY 管理 |
-|---|---|
-| ![model-policy](docs/screenshots/admin-model-policy.png) | ![keys](docs/screenshots/admin-keys.png) |
+| 总览 | 审计日志（含脱敏） | 统计可视化 |
+|---|---|---|
+| ![overview](docs/screenshots/admin-overview.png) | ![audit](docs/screenshots/admin-audit.png) | ![stats](docs/screenshots/admin-stats.png) |
 
-| 统计可视化 | L2 影子（双跑看板/提示词/重训管道） |
-|---|---|
-| ![stats](docs/screenshots/admin-stats.png) | ![l2](docs/screenshots/admin-l2.png) |
+| 模型配置（对外别名/复杂度档位/候选/限流） | 规则管理（L1 CRUD + on_block + L2 档） | 规则测试与检查（L2 判定 + 全链路干跑） |
+|---|---|---|
+| ![model-policy](docs/screenshots/admin-model-policy.png) | ![rules](docs/screenshots/admin-rules.png) | ![review](docs/screenshots/admin-review.png) |
+
+| Provider 管理（注册表/健康检查/熔断器） | API KEY 管理 | L2 影子（双跑看板/提示词/重训管道） |
+|---|---|---|
+| ![provider](docs/screenshots/admin-provider.png) | ![keys](docs/screenshots/admin-keys.png) | ![l2](docs/screenshots/admin-l2.png) |
 
 ## 特性
 
