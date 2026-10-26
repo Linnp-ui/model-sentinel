@@ -10,7 +10,7 @@ src/gateway/policy.py
     避免 "yaml 字段名拼错 → 静默失效" 这种常见 bug。
   - Policy 对象支持 r["action"] / r["name"] 字典式访问, 保持与旧 dict 路径
     兼容, 现有 routing.py 与 test_gateway.py 不需要改。
-  - decide() 返回 Policy 实例; 兜底「默认放行」也是 Policy。
+  - decide() 返回 Policy 实例; 兜底「default_allow」也是 Policy。
   - 用户在 policy.yaml 写的字段名 / 优先级 / 运算符 typo 立刻抛 ValidationError。
 """
 from __future__ import annotations
@@ -75,6 +75,23 @@ class Policy(_DictLike):
     def _when_not_empty(cls, v: Any) -> Any:
         if v is None or v == "":
             return "always"
+        if isinstance(v, Mapping):
+            # 嵌套 any/all 壳静默永不命中：_match_when 只剥一层壳，嵌套壳掉进
+            # _eval_cond，key "any"/"all" 匹配不到任何算子 → 恒 False，而自由形式
+            # dict 的 when 校验不挡它 ⇒「保存成功、干跑不命中、线上零报错」。
+            # 单层组（{"any":[单条件...]}）合法；壳里再出现 any/all 即拒（fail-fast）。
+            for k in ("any", "all"):
+                if k not in v:
+                    continue
+                items = v[k]
+                if not isinstance(items, list):
+                    raise ValueError(f"'{k}' 的值必须是条件对象列表，得到: {items!r}")
+                for item in items:
+                    if not isinstance(item, Mapping):
+                        raise ValueError(f"'{k}' 的条件项必须是单条件对象，得到: {item!r}")
+                    if set(item) & {"any", "all"}:
+                        raise ValueError(
+                            f"when 里的 any/all 不支持嵌套（引擎求值不了，规则永不命中）；只用一层 any/all 组")
         return v
 
     @field_validator("priority")
@@ -95,8 +112,8 @@ class PolicyDoc(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _default_allow() -> Policy:
-    # 规则名与 policy.yaml 的「默认放行」一致：审计里显式规则与隐式兜底同名，聚合不分叉
-    return Policy(name="默认放行", priority=100, action="allow", description="implicit fallback")
+    # 规则名与 policy.yaml 的「default_allow」一致：审计里显式规则与隐式兜底同名，聚合不分叉
+    return Policy(name="default_allow", priority=100, action="allow", description="implicit fallback")
 
 
 _POLICY_CACHE: Dict[str, Any] = {"key": None, "policies": None}
@@ -234,7 +251,7 @@ def _match_when(when: Any, ctx: Mapping[str, Any]) -> bool:
 def decide(policy_list: List[Union[Policy, Mapping[str, Any]]], ctx: Mapping[str, Any]) -> Policy:
     """
     Walk policy_list in priority order, return first matching Policy.
-    Fallback: 「默认放行」(priority 100, action allow).
+    Fallback: 「default_allow」(priority 100, action allow).
 
     兼容: 也接受 Mapping (dict) 条目, 让测试用 plist = [{"when":...}, ...] 写直白
     仍能 work. 真实部署路径都走 load_policy() 返 Policy.

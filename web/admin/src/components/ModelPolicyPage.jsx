@@ -25,6 +25,15 @@ const savePolicySection = async (section, rows) => {
   })});
 };
 
+// 档位中文（复杂度路由）：1 轻 / 2 中 / 3 重。选项值用短标签：弹窗内列宽有限，
+// 长文案（"2 中（常规编码）"）会被 antd 截成 "2…"；说明挂在列头 tooltip。
+const TIER_ZH = { 1: '轻', 2: '中', 3: '重' };
+const TIER_OPTS = [
+  { value: 1, label: '1 轻' },
+  { value: 2, label: '2 中' },
+  { value: 3, label: '3 重' },
+];
+
 function AliasGroupsCard() {
   const [groups, setGroups] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -67,12 +76,20 @@ function AliasGroupsCard() {
       // URL 恒为原组名；改组名走 new_name（新建时两者相同，后端视为 no-op）
       await api(`/aliases/${encodeURIComponent(editing.origName || gname)}`, {
         method: 'PUT',
-        body: JSON.stringify({ description: editing.description, members, new_name: gname }),
+        body: JSON.stringify({ description: editing.description, members, new_name: gname, intent: true }),
       });
       message.success('已保存，路由即时生效（5s 内刷新）');
       setEditing(null);
       load();
     } catch (e) { message.error(errText(e)); }
+  };
+
+  // 兜底模型 = 链首（第一个启用成员，路由按 priority 顺序打）。挑选即提到首位，
+  // 保存时 save() 按行号重算 priority，不需要新字段。
+  const setFallback = (i) => {
+    const ms = [...editing.members];
+    ms.unshift(ms.splice(i, 1)[0]);
+    setEditing({ ...editing, members: ms });
   };
 
   const remove = async (gname) => {
@@ -85,7 +102,7 @@ function AliasGroupsCard() {
 
   return (
     <Card title={<>对外模型别名组<Tip term="alias_group" /></>}
-          size="small" style={{ marginBottom: 16 }}
+          size="small" style={{ marginBottom: 'var(--gw-sp-16)' }}
            extra={<Button type="primary"
                      onClick={() => { addForm.resetFields(); setEditing({ isNew: true, name: '', description: '', members: [] }); }}>新建别名组</Button>}>
       <Table
@@ -99,12 +116,14 @@ function AliasGroupsCard() {
         columns={[
           /* 列宽全 %  + tableLayout=fixed：表跟随容器宽度，列按比例分配；操作列装两个链接按钮，给足 14% */
           { title: '别名组', dataIndex: 'name', width: '12%', render: (v) => <Tag color="blue">{v}</Tag> },
-          { title: '候选链（顺序即优先级，第一个为默认）', width: '74%', render: (_, g) => (
+          { title: '候选链（复杂度路由按档位定链首；数字为档位）', width: '74%', render: (_, g) => (
               <Space direction="vertical" size={2}>
                 {(g.members || []).map((m, i) => (
                   <Typography.Text key={i} type={m.enabled ? undefined : 'secondary'}>
-                    {i === 0 && m.enabled ? <Tag color="green">默认</Tag> : null}
-                    {m.provider}/{m.model}{m.enabled ? '' : '（停用）'}
+                    {i === (g.members || []).findIndex((x) => x.enabled !== 0 && x.enabled !== false) ? <Tag color="green">兜底</Tag> : null}
+                    {m.provider}/{m.model}
+                    <Tag style={{ marginLeft: 'var(--gw-sp-6)' }}>{TIER_ZH[m.tier || 2]}</Tag>
+                    {m.enabled ? '' : '（停用）'}
                   </Typography.Text>
                 ))}
               </Space>
@@ -113,7 +132,7 @@ function AliasGroupsCard() {
               <Space size={4}>
                 <Button type="link" onClick={() => { addForm.resetFields(); setEditing({
                   name: g.name, origName: g.name, description: g.description || '',
-                  members: (g.members || []).map((m) => ({ provider: m.provider, model: m.model, priority: m.priority, enabled: !!m.enabled })),
+                  members: (g.members || []).map((m) => ({ provider: m.provider, model: m.model, priority: m.priority, tier: m.tier || 2, enabled: !!m.enabled })),
                 }); }}>编辑</Button>
                 <Popconfirm title={`删除别名组 ${g.name}？`}
                             description="整组及候选链一并删除，/v1/models 立即不再展示，且不可恢复。"
@@ -130,14 +149,21 @@ function AliasGroupsCard() {
              okText="保存" cancelText="取消">
         {editing && (
           <>
-            <Form layout="inline" style={{ marginBottom: 8 }}>
+            <Form layout="inline" style={{ marginBottom: 'var(--gw-sp-8)' }}>
               <Form.Item label="别名" required>
                 <Input value={editing.name} style={{ width: 220 }}
                        onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-                       placeholder="如 AB-flash" />
+                       placeholder="如 Auto-AB" />
+              </Form.Item>
+              <Form.Item label="复杂度路由">
+                {/* 定死常开（不再提供开关）：判复杂度选头是网关固定行为，这里只做说明 */}
+                <Typography.Text type="secondary"
+                                 style={{ display: 'inline-block', maxWidth: 600, fontSize: 'var(--gw-fs-12)', lineHeight: 1.7 }}>
+                  常开：每轮按任务复杂度（1轻/2中/3重）把够用最省的候选提到链首；判不出来或成员档位不足两种时按原顺序
+                </Typography.Text>
               </Form.Item>
             </Form>
-            <Form layout="inline" style={{ marginBottom: 8 }} form={addForm}
+            <Form layout="inline" style={{ marginBottom: 'var(--gw-sp-8)' }} form={addForm}
                   onFinish={(v) => {
                     const key = (v.cand || '').trim();
                     if (!key) return;
@@ -146,7 +172,7 @@ function AliasGroupsCard() {
                     if (editing.members.some((m) => m.provider === hit.provider && m.model === hit.model)) {
                       message.warning('该候选已在链中'); return;
                     }
-                    setEditing({ ...editing, members: [...editing.members, { provider: hit.provider, model: hit.model, priority: (editing.members.length + 1) * 10, enabled: true }] });
+                    setEditing({ ...editing, members: [...editing.members, { provider: hit.provider, model: hit.model, priority: (editing.members.length + 1) * 10, tier: 2, enabled: true }] });
                     addForm.resetFields();
                   }}>
               <Form.Item name="cand" rules={[{ required: true, message: '请从外部候选/内网模型中选择' }]}>
@@ -170,22 +196,27 @@ function AliasGroupsCard() {
             <Table rowKey={(_, i) => 'm' + i} size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed"
                    dataSource={editing.members}
                    columns={[
-                     { title: '#', width: '6%', render: (_, __, i) => (i === 0 ? <Tag color="green">默认</Tag> : i + 1) },
-                     { title: 'Provider', dataIndex: 'provider', width: '30%' },
-                     { title: 'Model', dataIndex: 'model', width: '32%' },
-                     { title: '启用', dataIndex: 'enabled', width: '10%', render: (v, _, i) => (
+                     { title: '', width: '6%', render: (_, m, i) => (
+                         i === editing.members.findIndex((x) => x.enabled !== 0 && x.enabled !== false)
+                           ? <Tag color="green">兜底</Tag>
+                           : (m.enabled ? <Button type="link" size="small" style={{ padding: 0 }} title="设为兜底模型（提到链首）"
+                                          onClick={() => setFallback(i)}>↑</Button> : null)
+                     )},
+                     { title: 'Provider', dataIndex: 'provider', width: '20%' },
+                     { title: 'Model', dataIndex: 'model', width: '26%' },
+                     { title: <span title="1 轻：闲聊/单点问答　2 中：常规编码　3 重：架构/重构/难排查">档位 ⓘ</span>, dataIndex: 'tier', width: '18%', render: (v, _, i) => (
+                         <Select size="small" value={v || 2} options={TIER_OPTS} style={{ width: '100%' }}
+                                 onChange={(t) => {
+                                   const ms = [...editing.members]; ms[i] = { ...ms[i], tier: t }; setEditing({ ...editing, members: ms });
+                                 }} /> )},
+                     { title: '启用', dataIndex: 'enabled', width: '8%', render: (v, _, i) => (
                          <Switch size="small" aria-label="启用该候选" checked={v} onChange={(ck) => {
                            const ms = [...editing.members]; ms[i] = { ...ms[i], enabled: ck }; setEditing({ ...editing, members: ms });
                          }} /> )},
                      { title: '操作', width: '22%', render: (_, __, i) => (
-                         <Space>
-                           <Button disabled={i === 0} onClick={() => {
-                             const ms = [...editing.members]; const t = ms[i - 1]; ms[i - 1] = ms[i]; ms[i] = t; setEditing({ ...editing, members: ms });
-                           }}>上移</Button>
-                           <Popconfirm title="删除该候选？" onConfirm={() => setEditing({ ...editing, members: editing.members.filter((_, k) => k !== i) })}>
-                             <Button type="link" danger>删除</Button>
-                           </Popconfirm>
-                         </Space>
+                         <Popconfirm title="删除该候选？" onConfirm={() => setEditing({ ...editing, members: editing.members.filter((_, k) => k !== i) })}>
+                           <Button type="link" danger>删除</Button>
+                         </Popconfirm>
                      )},
                     ]} />
             <ExternalCandidateModal
@@ -210,7 +241,7 @@ function AliasGroupsCard() {
                 await savePolicySection('external_candidates', (cur) => [...cur, entry]);
                 setExtCands((prev) => [...prev, entry]);
                 if (!editing.members.some((m) => m.provider === provider && m.model === model)) {
-                  setEditing({ ...editing, members: [...editing.members, { provider, model, priority: (editing.members.length + 1) * 10, enabled: true }] });
+                  setEditing({ ...editing, members: [...editing.members, { provider, model, priority: (editing.members.length + 1) * 10, tier: 2, enabled: true }] });
                 }
                 message.success('已加入外部候选并加入别名链');
               }}
@@ -297,8 +328,8 @@ function ExternalCandidatesCard() {
     <Card title={<>外部候选<Tip term="candidate" /></>}
       extra={<Button type="primary"
         onClick={() => setModal({ mode: 'new' })}>新增候选</Button>}>
-      <Space align="center" wrap style={{ display: 'flex', marginBottom: 12 }}>
-        <Text style={{ marginLeft: 10 }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text><Tip term="failback" />
+      <Space align="center" wrap style={{ display: 'flex', marginBottom: 'var(--gw-sp-12)' }}>
+        <Text style={{ marginLeft: 'var(--gw-sp-8)' }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text><Tip term="failback" />
         <Switch size="small" aria-label="外网候选自动切换" loading={fbSaving}
           checked={!['0', 'false', 'no', 'off'].includes(String(envFlag?.AI_GATEWAY_MODEL_FALLBACK ?? 'true').toLowerCase())}
           onChange={setFallback} />
@@ -423,7 +454,7 @@ function L2RuntimeSection() {
   })();
   const effUrl = derivedUrl || (cfg || {}).SMALL_MODEL_URL || '';
   const cfgRow = (label, control) => (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--gw-sp-8)' }}>
       <Text style={{ whiteSpace: 'nowrap' }}>{label}</Text>
       {control}
     </div>
@@ -465,20 +496,20 @@ function L2RuntimeSection() {
   return (
     <div data-testid="l2cfg-section">
       <Space align="center" wrap>
-        <Text strong style={{ fontSize: 14 }}>L2 运行配置</Text>
-        <Text type="secondary" style={{ fontSize: 12 }}>
+        <Text strong style={{ fontSize: 'var(--gw-fs-14)' }}>L2 运行配置</Text>
+        <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>
           {loadedAt ? `数据取自 ${loadedAt.toLocaleTimeString('zh-CN', { hour12: false })}（切回本页自动重取）` : ''}
           {dirty ? '（有未保存改动）' : ''}
         </Text>
       </Space>
-      <Space direction="vertical" size={10} style={{ width: '100%', marginLeft: 8, marginTop: 12 }}>
+      <Space direction="vertical" size={10} style={{ width: '100%', marginLeft: 'var(--gw-sp-8)', marginTop: 'var(--gw-sp-12)' }}>
         {isLaya && cfgRow('端点：',
           <Select size="small" showSearch style={{ width: '100%', maxWidth: 320 }} value={cfg.SMALL_MODEL_URL || ''}
             placeholder="从内部模型中选择"
             options={urlOptionsWith(cfg.SMALL_MODEL_URL || '')}
             onChange={(v) => set('SMALL_MODEL_URL', v)}
             filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />)}
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '10px 16px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 'var(--gw-sp-8) var(--gw-sp-16)' }}>
           {cfgRow('超时(s)：',
             <Slider style={{ width: '100%', maxWidth: 280, minWidth: 120 }} min={0.5} max={60} step={0.5}
               value={cfg.SMALL_MODEL_TIMEOUT} onChange={(v) => set('SMALL_MODEL_TIMEOUT', v)} />)}
@@ -501,7 +532,7 @@ function L2RuntimeSection() {
               onChange={(v) => set('AI_GATEWAY_L2_GRAY_FLOOR', v)} />)}
         </div>
       </Space>
-      <Space align="center" wrap style={{ marginTop: 12 }}>
+      <Space align="center" wrap style={{ marginTop: 'var(--gw-sp-12)' }}>
         <Text title="qwen 权威、laya 并行打标（shadow_* 进审计），backend=laya 时不生效">影子双跑：</Text><Tip term="shadow" />
         <Switch size="small" aria-label="影子双跑" checked={!!cfg.AI_GATEWAY_L2_SHADOW}
           disabled={(cfg.AI_GATEWAY_L2_BACKEND || 'qwen') === 'laya'}
@@ -516,7 +547,7 @@ function L2RuntimeSection() {
           ? <Text type="secondary">backend=laya 时「端点」即 /classify（qwen 的模型/max_tokens 不生效）</Text>
           : null}
       </Space>
-      <Space align="center" wrap style={{ marginTop: 12, marginLeft: 8 }}>
+      <Space align="center" wrap style={{ marginTop: 'var(--gw-sp-12)', marginLeft: 'var(--gw-sp-8)' }}>
         <Button type="primary" loading={saving} onClick={save}>保存生效</Button>
       </Space>
     </div>
@@ -576,15 +607,15 @@ export function L2PromptsSection() {
   const placeholders = data.placeholders || [];
   return (
     <div data-testid="l2prompts-section">
-      <Space align="center" style={{ marginBottom: 4 }}>
+      <Space align="center" style={{ marginBottom: 'var(--gw-sp-4)' }}>
         <Text strong>L2 提示词</Text>
         <Button type="link" onClick={() => setOpen(true)}>查看/编辑</Button>
-        <Text type="secondary" style={{ fontSize: 12 }}>{dirty ? '（有未保存改动）' : '30s 自动刷新（编辑中暂停）'}</Text>
+        <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{dirty ? '（有未保存改动）' : '30s 自动刷新（编辑中暂停）'}</Text>
       </Space>
       <WheelGate>
       <Row gutter={8}>
-        <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>SYSTEM</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.system_prompt.slice(0, 200)}{data.system_prompt.length > 200 ? '…' : ''}</Typography.Paragraph></Col>
-        <Col span={12}><Text strong style={{ display: 'block', marginBottom: 12 }}>USER 模板</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.user_prompt_template}</Typography.Paragraph></Col>
+        <Col span={12}><Text strong style={{ display: 'block', marginBottom: 'var(--gw-sp-12)' }}>SYSTEM</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.system_prompt.slice(0, 200)}{data.system_prompt.length > 200 ? '…' : ''}</Typography.Paragraph></Col>
+        <Col span={12}><Text strong style={{ display: 'block', marginBottom: 'var(--gw-sp-12)' }}>USER 模板</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.user_prompt_template}</Typography.Paragraph></Col>
       </Row>
       </WheelGate>
       <Modal title="编辑 L2 提示词" open={open} onCancel={() => setOpen(false)} destroyOnClose
@@ -679,7 +710,7 @@ function InternalModelsCard() {
              Provider 列已删（2026-10-14）：内部模型都是同一个本机 provider，列里全是重复值；字段仍留（弹窗可编辑、路由要用） */
           { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true, align: 'center', className: 'cell-center' },
           { title: '服务地址', dataIndex: 'url', width: '30%', ellipsis: true, align: 'center', className: 'cell-center',
-            render: (v) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : <Text type="secondary">—</Text>) },
+            render: (v) => (v ? <Text code style={{ fontSize: 'var(--gw-fs-12)' }}>{v}</Text> : <Text type="secondary">—</Text>) },
           { title: '备注', dataIndex: 'note', width: '13%', ellipsis: true, align: 'center', className: 'cell-center' },
           { title: '健康', width: '26%', ellipsis: true, align: 'center', className: 'cell-center', render: (_, r, i) => (
             <Space size={4}>
@@ -698,7 +729,7 @@ function InternalModelsCard() {
               }}><Button type="link" size="small" danger>删除</Button></Popconfirm>
             </Space>) },
         ]} />
-      <Space style={{ marginTop: 12 }} align="center">
+      <Space style={{ marginTop: 'var(--gw-sp-12)' }} align="center">
         <Text>分流模式：</Text>
         <Select size="small" style={{ width: 180 }} value={mode} onChange={setMode} disabled
           options={[
@@ -795,7 +826,7 @@ function ModelLimitsCard() {
               }}><Button type="link" size="small" danger>删除</Button></Popconfirm>
             </Space>) },
         ]} />
-      <Text type="secondary">按最终路由到的模型计（别名/前缀重写后不逃限）；全客户端共享一个桶，保护 vLLM 容量与外网额度。</Text>
+      <Text type="secondary">只对 resolve 出口的首个模型生效（别名组与 fallback 换候选不经过该卡口）；全客户端共享一个桶，保护 vLLM 容量与外网额度。</Text>
       <Modal title={modal?.mode === 'edit' ? `编辑限流 ${modal.row?.model || ''}` : '新增模型限流'}
         open={!!modal} destroyOnClose onCancel={() => setModal(null)}
         onOk={async () => {
@@ -847,7 +878,14 @@ export default function ModelPolicyPage() {
       <ExternalCandidatesCard />
       <InternalModelsCard />
       <ModelLimitsCard />
-      <Card title={<>审查模型<Tip term="l2" /></>}>
+      <Card title={<>审查模型<Tip term="l2" /></>}
+        extra={
+          // L2 配置劈两页（本页=端点/模型/超时/影子/灰区下限，规则管理页=判定档/判密阈值/提示词），互链别让用户猜
+          <Tooltip title="L2 判定档 / 判密阈值 / 提示词在「规则管理」页的 L2 拦截配置卡">
+            <Button type="link" size="small" style={{ padding: 0 }}
+              onClick={() => { window.location.hash = '/rules'; }}>L2 拦截配置 →</Button>
+          </Tooltip>
+        }>
         <L2RuntimeSection />
       </Card>
     </Space>

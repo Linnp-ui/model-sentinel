@@ -51,11 +51,11 @@ export default function RouteInspectCard() {
   const actTag = (a) => a === 'allow' ? <Tag color="green">allow</Tag>
     : a === 'route_local' ? <Tag color="orange">route_local</Tag> : <Tag color="red">{a}</Tag>;
   return (
-    <Card title={<Tooltip title="用和线上一样的流程走一遍：先过 L1 关键词关，再看要不要过 L2 语义关，最后告诉你这条内容会去哪（放行 / 拦截 / 转内网）。只做演练：不落审计、不限流、不真的发出去。"><span style={{ cursor: 'help' }}>路由检查器</span></Tooltip>}>
+    <Card title={<Tooltip title="用和线上一样的流程走一遍：先过 L1 关键词关，再看要不要过 L2 语义关，最后告诉你这条内容会去哪（放行 / 拦截 / 转内网）。只做演练：不落审计、不限流、不转发上游（但会真调 L2 与 OCR）；白名单抽样、会话粘性按最严口径（无会话、非白名单）模拟。"><span style={{ cursor: 'help' }}>路由检查器</span></Tooltip>}>
       <Space direction="vertical" style={{ width: '100%' }} size="small">
-        <Input.TextArea rows={5} placeholder="待审查文本（L1 命中即返回；L1 放行且风险分 ≥20 才触发 L2，灰区强制 L2）"
+        <Input.TextArea rows={5} placeholder="待审查文本（L1 命中即返回；L1 放行且风险分 ≥ 灰区下限（默认 20）才送 L2；文件通道有解析内容时直接送 L2）"
           value={text} onChange={(e) => setText(e.target.value)} />
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--gw-sp-8)', alignItems: 'center' }}>
           <Select style={{ width: 300 }} value={channel} onChange={setChannel} options={[
             { value: 'check', label: '文件通道：files/check 全量解析' },
             { value: 'chat', label: '文件通道：workbuddy image_url 内联图' },
@@ -96,7 +96,7 @@ export default function RouteInspectCard() {
                       && <div><Tag color="red">{res.routing.gateway_key.note}</Tag></div>}
                   </Space>
                 )}
-                <div><Text type="secondary" style={{ fontSize: 12 }}>
+                <div><Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>
                   {res.uncovered && res.uncovered.length
                     ? `本次干跑不生效的维度：${res.uncovered.join('、')}（当前策略真写了这些条件，此处恒不命中——不是规则写错）`
                     : '当前策略用到的条件维度，本次干跑全部生效'}

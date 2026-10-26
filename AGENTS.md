@@ -102,10 +102,14 @@ docker compose up -d gateway redis
 - 外发吃公司额度**仅限具名登记身份**（admin 登记的 key）：未登记身份连本地路由也进不去（`auth()` 直接 401，不再放行到 `validate_environment` 判 503）。
 - 生产 `AI_GATEWAY_UPSTREAM_KEY_MODE=gateway_only`；客户端自带 `X-Upstream-Api-Key` 直接 400。
 
-## L1/L2 门（`main._review_text`，三条件与）
+## L1/L2 门（`main._review_text`）
 
-L1 allow **且** `risk_score >= 20`（下限 env `AI_GATEWAY_L2_GRAY_FLOOR`，**无上界**）**且**
-（机密会话 **或** 非白名单豁免）→ L2（2026-09-23 起取消字数触发，只看风险分）；
+L1 allow **且**（`AI_GATEWAY_L2_ALWAYS=true` **或** `risk_score >= 20`（下限 env
+`AI_GATEWAY_L2_GRAY_FLOOR`，**无上界**））**且**（机密会话 **或** 非白名单豁免）→ L2。
+
+`AI_GATEWAY_L2_ALWAYS`（生产已常开）：risk=0 的语义泄密 L1 完全打不中（实测回放 120 条
+risk=0 放行文本，4 条被 L2 判密）⇒ 打开后所有 L1 放行请求都送 L2（+~230ms/请求，多块
+~400ms）；env 即时生效，删掉即回灰区口径；route-inspect 干跑同口径。
 白名单 key 95% 跳 L2（5% 抽样）；
 `/v1/embeddings` 同样走 `_review_text`（与 chat 同源：灰区 L2 / 文件名污染 / body 上限同口径）。
 **全本地别名组**（启用候选 provider 全内网，如 `local-model`，`main._all_local_alias`）
@@ -120,7 +124,7 @@ L1 allow **且** `risk_score >= 20`（下限 env `AI_GATEWAY_L2_GRAY_FLOOR`，**
   `text contains_any: [财务报表, 资产负债, 利润表]`，纯关键词、与风险分无关。
 - **B. 灰区 → L2 判密（主力路径）**：单个 20 档词 kw=20 恰在灰区下界，L2 触发判
   CONFIDENTIAL 即转本地。实测「工资表里的数据」kw=20、「机密」kw=30 都走这条路。
-- **C. `weighted_pii_score>=60`（priority 5）**：只算 PII 权重，**不含关键词分**。
+- **C. `weighted_pii_score>=60`（priority 20）**：只算 PII 权重，**不含关键词分**。
 
 **当前态**：灰区**无上限**（`main._l2_gray_trigger` 只留下限）⇒ 关键词堆到
 `risk_score>=60` 且 `weighted_pii_score=0` 也转内网、不再出境；回归
@@ -136,7 +140,15 @@ block 只由 `block_secrets`（priority 3，排在所有 route_local 之前）�
 `local_alias_bypass` 跳过 L1/L2（测不到 L2）；`qwen2.5:7b` 裸名落 `default_external`
 **出境**。
 L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` route_local
-（`AI_GATEWAY_L2_FAIL_MODE=open` 则放行）。
+（`AI_GATEWAY_L2_FAIL_MODE=open` 则放行）；L2 `history` 档可 A/B 影子
+（`AI_GATEWAY_L2_HISTORY_SHADOW`，不改判决）。
+
+**会话粘性**：机密判定（L1 内容规则 / L2 判密）⇒ 标会话机密 ⇒ 同会话后续请求走
+`session_route_local` 直接转本地（L1 短路，不再送 L2）。**纯文本命中也标**（2026-10-26
+起，此前「无文件参与不标」作废）；`l2_unavailable` / 超预算 / 分块兜底等**可用性兜底不标**
+（L2 抖一次不该锁会话）。codex 不发会话头，用对话指纹 `codex-<sha>` 兜住；TTL 随
+`AI_GATEWAY_SESSION_TTL`。**盲区**：不发会话头的客户端（约六成会话）粘性覆盖不到，
+其多轮靠 L2 `history` 档。
 
 延迟口径：P50/P95/P99 只算**网关自身** `gateway_internal_ms`
 （`request_log` 列，`duration = gi + upstream`；ring 每 10s tick 取近 5 分钟窗口）。
@@ -156,6 +168,23 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
 - 审计 `append()` 在事件循环里同步打 Redis（pipeline 2 命令，中位 0.28ms），但
   `socket_timeout=2` ⇒ Redis 卡住时单请求最多阻塞 2s。**观察项**，见到抖动再上 threadpool。
 
+## 别名组复杂度路由（`intent_router.py`）
+
+别名组可按「本轮任务有多难」选头，不再永远打第一个候选（2026-10-26 起**定死常开**，
+管理台不再有开关）：
+
+- 档位 1 轻 / 2 中 / 3 重，逐候选在「编辑」弹窗里设（新增候选默认 2）；启用成员只有
+  单档位的组选头无意义，不发判定调用。DB/API 的 `intent` 字段仅保留兼容，
+  `/v1/models` 的 `gateway.intent` 恒 true。
+- 判定模型 = L2 小模型（`SMALL_MODEL_*`，内网），不新增 provider、内容不出境；
+  外网模型永不参与判定（没有「选 classifier」这种旋钮）。
+- **一次用户发言只判一次**：判定输入是最后一条用户消息（不是整段审查文本），同一轮
+  几十个 tool 回合反复携带同一段文字 ⇒ 10min 缓存命中。
+- **会话级档位粘性**（`apply_sticky`，窗口内只升不降）：换模型会废掉上一模型的 vendor
+  prompt cache（下轮全量重付），带长上下文的简单追问也会掉到轻模型；窗口
+  `AI_GATEWAY_INTENT_STICKY_MIN` 分钟（默认 30，**0=关**，每次请求读 ⇒ 即时生效），
+  相对「上次使用」计时（每次使用刷新）。
+
 ## Architecture（一行一个文件 = 它的真角色）
 
 | 文件 | 关键职责 |
@@ -170,7 +199,8 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
 | `src/gateway/routing.py` | `resolve()` 三级覆盖 + chat/embeddings/stream 转发 + Anthropic/Responses 协议转换；**单例 `httpx.AsyncClient`**（新代码别再 `httpx.AsyncClient()` 每请求）；`upstream_key()` per-provider 取凭据（**候选循环一律 `_request_credential`（客户端那半，每请求一次）+ `_cand_key`（网关那半，每候选一次）**——在循环里调 `upstream_key()` 会把上一候选的 key 打到下一家，且重复计入 `upstream_key_passthrough_total`）|
 | `src/gateway/l2_retrain.py` | L2 影子一键优化管道：标注→数据集→GPU 微调→候选 8004 评测（battery+标注回归+历史分歧回归）→promote 写 `var/laya-l2.env`+重启 laya-l2；全局单 job，并发 409；**权威 backend 切换不走这里** |
 | `src/gateway/env_file.py` | env 文件读改写（systemd EnvironmentFile 格式）：provider key 配置两层生效（os.environ 即时 + .env 行级持久化）；密钥明文永不回显 |
-| `src/gateway/alias_router.py` | 别名组：`/v1/models` 暴露名 → (provider, model) 候选表（大小写不敏感，5s TTL 缓存，per-candidate 熔断）。`/v1/models` 单一真源 = `admin_api.build_public_models()`（别名组 + `internal_models` + 用户自注册，与 `/admin/api/models/public` 共用）；`internal_models` 只管暴露/展示/引用保护，**不参与路由**。改名走 `admin_store.update_alias_group(new_name=)`（组行+成员同事务搬移，撞名 422） |
+| `src/gateway/alias_router.py` | 别名组：`/v1/models` 暴露名 → (provider, model) 候选表（大小写不敏感，5s TTL 缓存，per-candidate 熔断）。`/v1/models` 单一真源 = `admin_api.build_public_models()`（别名组 + `internal_models` + 用户自注册，与 `/admin/api/models/public` 共用），末尾按 `AI_GATEWAY_PUBLIC_MODELS`（逗号分隔，空=不过滤）**只收窄可发现性、不改可路由性**，零匹配记 WARNING；`internal_models` 只管暴露/展示/引用保护，**不参与路由**。改名走 `admin_store.update_alias_group(new_name=)`（组行+成员同事务搬移，撞名 422） |
+| `src/gateway/intent_router.py` | 别名组复杂度路由：最后一条用户消息 → L2 小模型判 1/2/3 档 → 选该档候选；10min 缓存 + 会话级档位粘性（`apply_sticky`，只升不降）；定死常开 |
 | `src/gateway/inspection.py` | 文本层：Regex(身份证/手机/AKIA/私钥) + 熵 + Luhn(银行卡) + 关键词三档 + PII 加权评分（PII≥60 → route_local；risk≥20 灰区强制 L2，**无上界**）。pattern 跑 NFKC + 去分隔符 copy，**关键词跑原文**（英文词只写小写形态——子串匹配不 lower） |
 | `src/gateway/file_inspector.py` | 文件层：PDF/Excel/Word/**图片（含 heic/avif）** + pymupdf 兜底 + 扫描件 OCR（paddleocr→pytesseract chi_sim+eng，5页/150DPI/8000字）；图片走 `_ocr_pixmap`（PDF/图片共享） + 20MB size cap；**解析在 `run_in_threadpool`**（不要直接 `await`）；扩展名不可信，以 magic 嗅探为准 |
 | `src/gateway/small_model.py` | L2 `Qwen3-4B-Instruct-2507`；`CONFIDENTIAL_THRESHOLD=0.7`；LRU 500/TTL600；5 块并发；客户端必须复用；`latency_ms==0` 一律视为无真实调用（disabled / 缓存 / 空输入），不入直方图。**双后端** `AI_GATEWAY_L2_BACKEND=qwen\|laya`（laya = `laya-l2.service`:8003 `/classify`，noul 英文题规格）；影子双跑 `AI_GATEWAY_L2_SHADOW=true`（qwen 权威 + laya 并行打标，`shadow_*` 随审计 l2 JSON 自动落库，2s 短超时不拖主链） |
@@ -188,7 +218,7 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
 | `src/gateway/audit_store.py` | 审计双写：Redis 热缓存 `key=gateway:audit` `lpush+ltrim(0,4999)`（影子统计只读这里）+ MySQL 持久化（后台线程批量写，fail-open，90 天清理；`l2` 列存主判+影子 JSON，缺列启动自检自动 ALTER）。`tail()` 按 `(LLEN, 最新一条)` 版本签名缓存解析结果（≈10MB/进程），**返回的是共享 dict 的浅拷贝——调用方只可幂等补字段**（现只有 key_name 兜底） |
 | `src/gateway/admin_api.py` | 管理面：45+ `/admin/api/*`（Basic/`/admin/login` cookie，会话 TTL 见 `AI_GATEWAY_SESSION_TTL`）+ 运维三件套（`route-inspect` 干跑——文本外还支持 `channel=check/chat/responses` 文件干跑，codex∪workbuddy 并集、`providers/check` 健康、`circuit` 手动）+ provider 注册表 CRUD + provider key 配置（write-only，`env_file.py` 写 os.environ 即时生效 + 行级落盘）+ `stats/chart`（request_log 分桶，统计/总览折线图跟时间窗，桶内峰值 qps_max/lat_min-max）+ `l2-shadow-stats`（主影一致率/覆盖率，扫 Redis 热缓存）+ L2 影子看板（`l2-shadow-trend`/`l2-divergences`+标注/`export` JSONL，MySQL l2 列）+ `events` 降级事件流 + `rule-hits` 规则命中 + `policy/versions` 版本历史/回滚。**key 值永不回显**，ops-log 只记长度 |
 | `src/gateway/rate_limit.py` | 令牌桶限流（in-memory）；`extract_client_key` 按 token > X-Forwarded-For > IP（XFF 仅 `AI_GATEWAY_TRUST_XFF=true` 时采用，默认 socket IP 优先）；`check_model` 模型级全局 RPM（配置在 `model_policy.model_limits`，卡口在 `routing.resolve` 出口，ContextVar 按请求去重） |
-| `src/gateway/session_store.py` | 会话级机密标记：`X-Session-ID` 下 files/check 文件命中、chat/messages 内联图或提及数据文件名命中（route_local/block）后同会话强制 route_local（TTL 见 `AI_GATEWAY_SESSION_TTL`）；Redis + 内存兜底。另有**文件名污染**（客户端无感会话替代）：同 key 下曾判机密的文件名被正文提及即 `tainted_file_ref`（priority 12）走本地，按 key 隔离、后缀匹配 |
+| `src/gateway/session_store.py` | 会话级机密标记：`X-Session-ID` 下 files/check 文件命中、chat/messages 内联图或提及数据文件名命中（route_local/block）后同会话强制 route_local（TTL 见 `AI_GATEWAY_SESSION_TTL`）；Redis + 内存兜底。另有**文件名污染**（客户端无感会话替代）：同 key 下曾判机密的文件名被正文提及即 `tainted_file_ref`（priority 5）走本地，按 key 隔离、后缀匹配 |
 | `src/gateway/user_models.py` | `/v1/models/register` 自助注册；`AI_GATEWAY_EGRESS_DOMAINS` 白名单；Redis `gateway:user_models` |
 
 路由：`/v1/chat/completions`、`/v1/embeddings`、`/v1/messages`、`/v1/messages/count_tokens`、

@@ -46,7 +46,8 @@ model_policy:
     scopes:
     - last_user
     - tool
-    - tail
+    - history
+    - long_text
     chunk_chars: 1200
-    budget_chars: 5000
+    budget_chars: 6000
     note: ''

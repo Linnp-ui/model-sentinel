@@ -15,50 +15,57 @@ import { L2PromptsSection } from './ModelPolicyPage.jsx';
 const L2_SCOPE_META = [
   { key: 'last_user', label: '最近用户消息', tip: '判定基线，不受预算裁剪' },
   { key: 'tool', label: '工具结果', tip: '最后一条 tool 结果' },
-  { key: 'tail', label: '长文尾部', tip: '长粘贴 [chunk, 2×chunk) 段' },
+  { key: 'long_text', label: '长文抽样', tip: '整段长文均匀抽样，含结尾' },
 ];
 
 // 悬停说明：讲清「取哪段文本 + 例子 + 为什么开它」，口径与 main.py._select_l2_scopes 一致
 const SCOPE_TIPS = {
   last_user: (
-    <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
+    <div style={{ maxWidth: 380, fontSize: 'var(--gw-fs-12)', lineHeight: 1.8 }}>
       <div><b>取什么</b>：本次请求里最后一条 role=user 的纯文本消息全文（带 tool_calls / tool_call_id 的消息跳过；多模态只取文本部分）。</div>
-      <div style={{ marginTop: 6 }}><b>为什么默认开</b>：它是判定基线 —— 用户真正问的那句话；且<b>不受预算裁剪</b>（tool/tail 档把 L2 文本预算用完，这一档照样审）。</div>
-      <div style={{ marginTop: 6 }}><b>例子</b></div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>为什么默认开</b>：它是判定基线 —— 用户真正问的那句话；且<b>不受预算裁剪</b>（工具结果 / 长文抽样档把 L2 文本预算用完，这一档照样审）。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>例子</b></div>
       <div>· 用户问「帮我看下这份薪酬表」→ 这一档审的就是这句。</div>
-      <div>· 客户端把环境样板塞在 user 正文里（&lt;system-reminder&gt;…）→ 审的是含样板的原文，样板会稀释判定但不会让这一档失效。</div>
       <div>· 请求里只有工具消息、没有 user 文本 → 这一档为空 ⇒ 不发这次 L2 调用（少一档就少一次小模型判定）。</div>
-      <div style={{ marginTop: 6 }}><b>代价</b>：每档 = 一次小模型判定（~230ms）。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>代价</b>：每档 = 一次小模型判定（~230ms）。</div>
     </div>
   ),
   tool: (
-    <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
-      <div><b>取什么</b>：最后一条<b>工具结果</b>正文（chat：role=tool 的 content；anthropic：user 消息里的 tool_result 块；responses：function_call_output.output），截到 chunk 长度（默认 1200 字）。</div>
-      <div style={{ marginTop: 6 }}><b>为什么开它</b>：RAG 召回的内部文档、网页抓取结果都走这条路 —— 第三方内容进上下文的主通路。用户自己没提敏感词，工具结果里可能整段是内部资料。</div>
-      <div style={{ marginTop: 6 }}><b>例子</b></div>
+    <div style={{ maxWidth: 380, fontSize: 'var(--gw-fs-12)', lineHeight: 1.8 }}>
+      <div><b>取什么</b>：最后一条<b>工具结果</b>正文，截到 chunk 长度（默认 1200 字）。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>为什么开它</b>：RAG 召回的内部文档、网页抓取结果都走这条路 —— 第三方内容进上下文的主通路。用户自己没提敏感词，工具结果里可能整段是内部资料。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>例子</b></div>
       <div>· 用户问「总结刚检索到的资料」，工具返回含「图号 A-12 / 施工图 / 混凝土标号 C30」的内部文档 → 这一档判密 ⇒ 整条请求转内网，不出境。</div>
       <div>· 工具只返回「无结果」→ 这一档为空 ⇒ 不发这次调用。</div>
-      <div style={{ marginTop: 6 }}><b>注意</b>：只取<b>最后一条</b>工具结果，不是全部工具历史。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>注意</b>：只取<b>最后一条</b>工具结果，不是全部工具历史。</div>
     </div>
   ),
-  tail: (
-    <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
-      <div><b>取什么</b>：与「最近用户消息」<b>同一个源文本</b>（用户 query + 内联 OCR 文本）的第 2 段：[chunk, 2×chunk)（默认第 1200~2400 字）。</div>
-      <div style={{ marginTop: 6 }}><b>为什么开它</b>：长粘贴（整份合同、长表格）的前 1200 字常是抬头与目录，敏感字段在后半段；「最近用户消息」档只看前段，这一档补看后段。</div>
-      <div style={{ marginTop: 6 }}><b>例子</b></div>
-      <div>· 粘贴 3000 字合同：开头是「XX 建设项目施工图设计说明」，第 1300 字处才有「结构图号 A-12 / 单价 480 元 / 决算 320 万」→ 这一档能看到并判密。</div>
-      <div>· 源文本不足 2×chunk（如只贴了 500 字）→ 这一档为空 ⇒ 不发这次调用。</div>
-      <div style={{ marginTop: 6 }}><b>预算</b>：与「工具结果」档共享 L2 文本预算（默认 5000 字，先到先用）；「最近用户消息」不占预算。</div>
+  long_text: (
+    <div style={{ maxWidth: 380, fontSize: 'var(--gw-fs-12)', lineHeight: 1.8 }}>
+      <div><b>取什么</b>：与「最近用户消息」<b>同一个源文本</b>（用户 query + 内联 OCR 文本），按 chunk（默认 1200 字）切窗后均匀抽样，最多 4 段（含结尾）。与「最近用户消息」重叠的开头不重复判定；那个档没勾时整段都参与抽样。单块槽位被其它档占用时相应减少。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>为什么开它</b>：长粘贴（整份合同、长表格）的开头常是抬头与目录，敏感字段在更后面；只看开头会整段漏掉。抽样才能让 1 万字文档的中后段也有机会被审到。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>例子</b></div>
+      <div>· 粘贴 8000 字合同：开头是「XX 建设项目施工图设计说明」，第 7000 字处才有「结构图号 A-12 / 单价 480 元 / 决算 320 万」→ 抽样含结尾 ⇒ 能看到并判密。</div>
+      <div>· 文本太短、没有可补抽的长文段（且开头已由「最近用户消息」覆盖）→ 这一档为空 ⇒ 不发这次调用。</div>
+      <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>预算</b>：与「工具结果」档共享 L2 文本预算（默认 6000 字，先到先用）；「最近用户消息」不占预算。</div>
     </div>
   ),
 };
 
+// L2 配置劈两页：本页管判定档/判密阈值/提示词，模型配置页管端点/模型/超时/影子/灰区下限。互链别让用户猜
+const L2_CROSS_LINK = (
+  <Tooltip title="端点 / 模型 / 超时 / 影子 / 灰区下限在「模型配置」页的审查模型卡">
+    <Button type="link" size="small" style={{ padding: 0 }}
+      onClick={() => { window.location.hash = '/modelpolicy'; }}>审查模型 →</Button>
+  </Tooltip>
+);
+
 const SCOPE_OVERVIEW = (
-  <div style={{ maxWidth: 380, fontSize: 12, lineHeight: 1.8 }}>
+  <div style={{ maxWidth: 380, fontSize: 'var(--gw-fs-12)', lineHeight: 1.8 }}>
     <div><b>判定档</b> = L2 小模型的「视野」：每一档各取一段文本、各自判一次密。</div>
-    <div style={{ marginTop: 6 }}><b>后果</b>：任一档判 <b>CONFIDENTIAL</b> 且 confidence ≥ 判密阈值 ⇒ 整条请求按 route_local 处理（转内网 / 拦截，内容不出境）。</div>
-    <div style={{ marginTop: 6 }}><b>档数上限 5</b>：每档一次小模型判定（~230ms），档越多判定越慢；档内文本为空则跳过（不发那次调用）。</div>
-    <div style={{ marginTop: 6 }}>悬停每个勾选框看该档取哪段文本 + 例子。</div>
+    <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>后果</b>：任一档判 <b>CONFIDENTIAL</b> 且 confidence ≥ 判密阈值 ⇒ 整条请求按 route_local 处理（转内网 / 拦截，内容不出境）。</div>
+    <div style={{ marginTop: 'var(--gw-sp-6)' }}><b>块数上限 5</b>：各块并发判一次（单块 ~230ms，3 块 ~320ms、5 块 ~390ms）；块内文本为空则跳过（不发那次调用）。</div>
+    <div style={{ marginTop: 'var(--gw-sp-6)' }}>悬停每个勾选框看该档取哪段文本 + 例子。</div>
   </div>
 );
 
@@ -93,11 +100,11 @@ function L2RulesCard() {
     } catch (e) { message.error(errText(e)); }
     setSaving(false);
   };
-  if (!rm) return <Card title={<>L2 拦截配置<Tip term="l2" /></>} loading />;
+  if (!rm) return <Card title={<>L2 拦截配置<Tip term="l2" /></>} loading extra={L2_CROSS_LINK} />;
   return (
-    <Card title={<>L2 拦截配置<Tip term="l2" /></>}>
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+    <Card title={<>L2 拦截配置<Tip term="l2" /></>} extra={L2_CROSS_LINK}>
+      <div style={{ marginBottom: 'var(--gw-sp-12)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--gw-sp-16)' }}>
           <Tooltip title={SCOPE_OVERVIEW}>
             <Text strong style={{ cursor: 'help' }}>判定档（命中 CONFIDENTIAL → 本地路由拦截）</Text>
           </Tooltip>
@@ -119,7 +126,7 @@ function L2RulesCard() {
         <Slider style={{ width: 220 }} min={0} max={1} step={0.05}
           value={rm.threshold} onChange={(v) => setRm((c) => ({ ...c, threshold: v }))} />
       </Space>
-      <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--gw-border)' }}>
+      <div style={{ marginTop: 'var(--gw-sp-16)', paddingTop: 'var(--gw-sp-12)', borderTop: '1px solid var(--gw-border)' }}>
         <L2PromptsSection />
       </div>
     </Card>
@@ -164,6 +171,10 @@ export default function RulesPage() {
   // 条件组构造器：多行（字段+匹配方式+匹配项）+ any/all 组合；单行时等价老单条件
   const [rows, setRows] = useState([]);
   const [combiner, setCombiner] = useState('any');
+  // when_json 被手改后构造器暂停自动同步（whenDirtyRef 的内部镜像，UI 用）
+  const [whenDirty, setWhenDirty] = useState(false);
+  // 老规则的 when 逆解析不出（手写形状/无构造器等价物）：构造器空白有两义（无条件 vs 解析不出），显式提示
+  const [unparsed, setUnparsed] = useState(false);
   // AI 生成的覆盖范围限定（允许生成的 content_type 集合）；空=不限
   const [aiScopes, setAiScopes] = useState([]);
   // 覆盖范围选项 = choices 里的 distinct content_type（唯一真源仍是后端 MATCH_CHOICES）；
@@ -231,6 +242,8 @@ export default function RulesPage() {
   const progRef = useRef(false);
   const whenDirtyRef = useRef(false);
   const whenSyncTimer = useRef(null);
+  // 编辑弹窗有未保存改动（表单或构造器动过手）：关闭前弹确认，destroyOnClose 静默丢草稿不可接受
+  const editDirtyRef = useRef(false);
   const syncGroupFromBuilder = useCallback(async (rws, cmb) => {
     if (!modalOpen) return;
     // 还有行没填匹配项就不同步——否则空值必然 422（contains/in 要求至少一个值）弹误报，
@@ -257,25 +270,33 @@ export default function RulesPage() {
   }, [syncGroupFromBuilder]);
   const onFormValuesChange = (changed) => {
     if (progRef.current) return;
+    editDirtyRef.current = true;
     if (changed.when_json !== undefined) {
       whenDirtyRef.current = true;
+      setWhenDirty(true);
       if (whenSyncTimer.current) { clearTimeout(whenSyncTimer.current); whenSyncTimer.current = null; }
     }
   };
   const updateRow = (i, patch) => {
     const next = rows.map((r, j) => (j === i ? { ...r, ...patch } : r));
     whenDirtyRef.current = false;
+    setWhenDirty(false);
+    editDirtyRef.current = true;
     setRows(next);
     scheduleSync(next, combiner);
   };
   const removeRow = (i) => {
     const next = rows.filter((_, j) => j !== i);
     whenDirtyRef.current = false;
+    setWhenDirty(false);
+    editDirtyRef.current = true;
     setRows(next);
     scheduleSync(next, combiner);
   };
   const changeCombiner = (v) => {
     whenDirtyRef.current = false;
+    setWhenDirty(false);
+    editDirtyRef.current = true;
     setCombiner(v);
     scheduleSync(rows, v);
   };
@@ -321,6 +342,8 @@ export default function RulesPage() {
     setEditing(rec ? rec.name : null);
     setAiScopes([]);
     progRef.current = true;
+    setWhenDirty(false);
+    editDirtyRef.current = false;
     if (rec) {
       form.setFieldsValue({
         name: rec.name, priority: rec.priority, action: rec.action,
@@ -343,8 +366,11 @@ export default function RulesPage() {
           if (d.parsed) pre = d.parsed;
         } catch { /* 保持空白，手动改 when_json */ }
       }
+      // 解析不出且 when 非平凡 → 构造器空白是「解析不出」不是「无条件」
+      setUnparsed(!pre && !!(rec.when && rec.when !== 'always'));
       prefillBuilder(pre);
     } else {
+      setUnparsed(false);
       form.setFieldsValue({
         name: '', priority: 100, action: 'allow', description: '',
         when_json: '{"text contains_any": ["关键词1", "关键词2"]}',
@@ -399,6 +425,8 @@ export default function RulesPage() {
       }
       const cmb = cur.length ? combiner : (s.combiner || 'any');
       whenDirtyRef.current = false;
+      setWhenDirty(false);
+      editDirtyRef.current = true; // AI 生成的匹配项也是未保存改动
       setCombiner(cmb);
       setRows(merged);
       scheduleSync(merged, cmb);
@@ -431,6 +459,8 @@ export default function RulesPage() {
         ? await api(`/policies/${encodeURIComponent(editing)}`, { method: 'PUT', body: JSON.stringify(body) })
         : await api('/policies', { method: 'POST', body: JSON.stringify(body) });
       message.success(r.ok ? '已保存并生效' : '完成');
+      editDirtyRef.current = false;
+      setWhenDirty(false);
       setModalOpen(false);
       load();
     } catch (e) { if (e.errorFields) return; message.error(errText(e)); }
@@ -439,6 +469,20 @@ export default function RulesPage() {
   const del = async (name) => {
     try { await api(`/policies/${encodeURIComponent(name)}`, { method: 'DELETE' }); load(); }
     catch (e) { message.error(errText(e)); }
+  };
+
+  // 关弹窗（取消/X/ESC）走这里：改过就确认一次，防静默丢草稿
+  const requestClose = () => {
+    if (editDirtyRef.current) {
+      Modal.confirm({
+        title: '放弃未保存的修改？',
+        content: '弹窗里的规则内容还没保存，关闭后不会保留。',
+        okText: '放弃修改', okButtonProps: { danger: true }, cancelText: '继续编辑',
+        onOk: () => { editDirtyRef.current = false; setEditing(null); setModalOpen(false); },
+      });
+      return;
+    }
+    setEditing(null); setModalOpen(false);
   };
 
   const cols = [
@@ -485,27 +529,32 @@ export default function RulesPage() {
           }} />
       </Card>
 
-      <Card title={<>拦截模式 on_block<Tip term="on_block" /></>} size="small" style={{ marginTop: 12 }}>
+      <Card title={<>拦截模式 on_block<Tip term="on_block" /></>} size="small" style={{ marginTop: 'var(--gw-sp-12)' }}>
         <Space align="center" wrap>
           <Switch checked={onBlockMode === 'reject'} loading={onBlockLoading}
             onChange={toggleOnBlock}
             checkedChildren="reject（真实 403）" unCheckedChildren="fallback_local（转内网回答）" />
-          <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+          <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)', marginLeft: 'var(--gw-sp-8)' }}>
             {onBlockMode === 'reject'
               ? 'block 规则命中时客户端直接收到 403，密钥不送入任何模型上下文'
-              : 'block 规则命中时转内网本地模型回答（内容不出境，审计记 downgraded_from: block）'}
+              : 'block 规则命中时转内网本地模型回答（内容不出境，审计记 downgraded_from: <命中的规则名>）'}
           </Text>
         </Space>
       </Card>
 
       <L2RulesCard />
 
-      <Card title="历史版本（每次保存前快照；回滚走校验+原子落盘）" style={{ marginTop: 12 }}>
+      <Card title="历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
         {versions.length ? (
-          <Table rowKey="id" size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed" dataSource={versions} columns={[
+          <Table rowKey="id" size="small" scroll={{ y: 400 }} pagination={false} tableLayout="fixed" dataSource={versions} columns={[
             /* 列宽全 % + tableLayout=fixed；操作列两个链接按钮，14% 够放 */
             { title: '时间', dataIndex: 'ts', width: '16%' },
-            { title: '预览', dataIndex: 'yaml_text', width: '70%', ellipsis: true },
+            { title: '变更内容（与下一更新状态比）', width: '70%', ellipsis: true,
+              render: (_, r) => {
+                const cs = r.changes;
+                const text = (Array.isArray(cs) && cs.length) ? cs.join('；') : '无变化（内容相同）';
+                return <span title={text}>{text}</span>;
+              } },
             { title: '操作', width: '14%', render: (_, r) => (
               <Space size={4}>
                 <Button size="small" type="link" onClick={() => viewVersion(r.id)}>查看</Button>
@@ -523,11 +572,11 @@ export default function RulesPage() {
 
       <Modal title="版本内容" open={verView != null} onCancel={() => setVerView(null)}
         footer={null} width={720}>
-        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 12 }}>{verView || ''}</pre>
+        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-12)' }}>{verView || ''}</pre>
       </Modal>
 
       <Modal title={editing ? `编辑规则：${editing}` : '新增规则'} open={modalOpen}
-        destroyOnClose onOk={submit} onCancel={() => setModalOpen(false)} width={680}>
+        destroyOnClose onOk={submit} onCancel={requestClose} width={680}>
         <Form form={form} layout="vertical" onValuesChange={onFormValuesChange}>
           <Space style={{ width: '100%' }} size="middle">
             <Form.Item name="name" label="规则名" rules={[{ required: true }]}>
@@ -544,7 +593,12 @@ export default function RulesPage() {
               ]} />
             </Form.Item>
           </Space>
-          <Card title={<>匹配方式构造器 <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>（字段悬停看说明）</Text></>} style={{ marginBottom: 12 }}>
+          <Card title={<>匹配方式构造器 <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)', fontWeight: 'normal' }}>（字段悬停看说明）</Text>
+            {unparsed && <Tag color="orange" style={{ marginLeft: 'var(--gw-sp-8)', fontWeight: 'normal' }}>
+              原条件解析不出（手写形状），JSON 原样保留；在下方填齐新条件会替换它
+            </Tag>}
+            {whenDirty && <Tag color="orange" style={{ marginLeft: 'var(--gw-sp-8)', fontWeight: 'normal' }}>JSON 已手改，构造器同步暂停（再改构造器任一条件即恢复）</Tag>}
+          </>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
             <Space direction="vertical" style={{ width: '100%' }} size={6}>
               {rows.map((r, i) => {
                 const mt = String(r.key || '').split('|')[1] || '';
@@ -552,7 +606,7 @@ export default function RulesPage() {
                 return (
                   <Space key={i} align="center" wrap>
                     <Tooltip title={choice ? choice.desc : undefined} overlayStyle={{ maxWidth: 400 }}>
-                      <Text style={{ display: 'inline-block', minWidth: 200, paddingLeft: 12 }}>{choice ? choice.label : (r.key || '—')}</Text>
+                      <Text style={{ display: 'inline-block', minWidth: 200, paddingLeft: 'var(--gw-sp-12)' }}>{choice ? choice.label : (r.key || '—')}</Text>
                     </Tooltip>
                     <Input id={rows.length === 1 ? 'rule-match-value' : `rule-row-value-${i}`}
                       style={{ minWidth: 260 }} placeholder={VALUE_HINT[mt] || '匹配项'}
@@ -571,7 +625,7 @@ export default function RulesPage() {
                 </Radio.Group>
               )}
             </Space>
-            <Space style={{ marginTop: 8 }} wrap>
+            <Space style={{ marginTop: 'var(--gw-sp-8)' }} wrap>
               {/* 覆盖范围：自定义下拉——选项内嵌 Tooltip 会被 rc-select 悬停重渲染吞掉
                 （实测含 delay=0），悬停说明挂自建列表行上，与行字段标签同款 antd Tooltip；
                 display:none 带上原生菜单仅为挂载 OptionList，恢复 rc-select 键盘机制
@@ -597,7 +651,7 @@ export default function RulesPage() {
                             }}>
                             <span style={{ width: 16, height: 16, flexShrink: 0, border: '1px solid',
                               borderColor: on ? '#1677ff' : 'var(--gw-border)', borderRadius: 2,
-                              background: on ? '#1677ff' : 'var(--gw-surface)', color: '#fff', fontSize: 12,
+                              background: on ? '#1677ff' : 'var(--gw-surface)', color: '#fff', fontSize: 'var(--gw-fs-12)',
                               lineHeight: '16px', textAlign: 'center' }}>{on ? '✓' : ''}</span>
                             <span>{o.label}</span>
                           </div>

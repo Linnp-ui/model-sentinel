@@ -3,8 +3,9 @@
 > 对应用户侧文档：`docs/user-manual.md`。内部运维细节另见 `agents/`（部署/端口/策略/坑位）。
 > 铁律：**密钥明文只许出现在运行时内存和 admin 密码框**，禁止写进任何入库文件、脚本、日志。
 
-管理台地址：`http://<网关IP>:8080/admin/app`，管理员密码登录，会话保持 7 天。
-局域网 HTTP = 非安全上下文，复制类按钮均有降级方案，可直接用。
+管理台地址：`https://10.0.0.10:8080/admin/app`，管理员密码登录，会话保持 7 天。
+浏览器提示证书不受信任 = 没装内网 CA：管理台「系统 → 证书安装」页有逐步指引和
+「直接下载 CA 证书」按钮（`/ca.crt` 免登录），用户侧同见 `docs/user-manual.md` 1.1。
 
 ---
 
@@ -40,7 +41,7 @@
 
 ### 3.2 L2 拦截配置
 
-判定档 scope（最近用户消息 / 工具结果 / 长文尾部）+ 判密阈值（confidence ≥ 阈值才算命中），
+判定档 scope（最近用户消息 / 工具结果 / 历史消息 / 长文抽样）+ 判密阈值（confidence ≥ 阈值才算命中），
 落盘 `model_policy.yaml`，热重载生效。L2 提示词（system + user 模板）可在线改，
 空串=还原默认，占位符 `{filename} {sheet_names} {headers} {preview}`。
 
@@ -55,8 +56,24 @@
 
 ### 4.1 对外模型别名
 
-`/v1/models` 的对外名 → (provider, model) 候选链，顺序即优先级，首个为默认。
+`/v1/models` 的对外名 → (provider, model) 候选链。链首怎么定：**成员档位不足两种**
+（如 `local-model` 单候选）= 顺序定链首，首个启用为默认；**档位 ≥2 种**（如 `Auto-AB`）=
+档位定链首，顺序只影响故障切换次序和同档并列。**无移序操作**，调序=删了重加。
 改名=整组重命名（旧名立即 404）；删除不可恢复。候选只能从外部候选/内网模型表里选。
+
+- **复杂度路由（定死常开，无开关）**：每轮用户发言由 L2 内网小模型判复杂度
+  （1 轻 / 2 中 / 3 重），把「够用最省」的候选提到链首；判不出来、或启用成员档位
+  不足两种时按原顺序（单档位组行为与从前相同，也不发判定调用）。
+  档位（1/2/3）在「编辑」弹窗逐候选设置，新增候选默认 2。
+  留痕在响应 `gateway.intent = {level, ms, cached, sticky}`（审计页无此列，排障看响应体）。
+- **会话档位粘性**：env `AI_GATEWAY_INTENT_STICKY_MIN`（分钟，默认 30，0=关）窗口内
+  档位**只升不降**——防止同一会话中途换模型废掉上游 prompt cache；判定失败时用会话档顶上。
+  存独立 Redis 键 `gateway:stickytier:<sid>`（别删，删了粘性失效但不影响路由）。
+- **对外展示白名单**：env `AI_GATEWAY_PUBLIC_MODELS`（逗号分隔，**空=全量**）只收窄
+  `/v1/models` 的**可发现性**，不改可路由性——没列出的名字老客户端照常能点名调用。
+  现网 = `Auto-AB,local-model`：
+  - `Auto-AB`：三档复杂度路由 = 内网 qwen2.5:7b（1 轻，不出境）/ deepseek-flash（2 中）/ deepseek-v4-pro（3 重）
+  - `local-model`：单候选内网主力，intent=0 直连本地
 
 ### 4.2 外部候选
 
@@ -69,7 +86,7 @@
 |---|---|
 | 网址 | 仅 laya 类**非 chat 协议**模型填 `/classify` 地址；chat 模型空着，走 provider 的 base_url |
 | 健康 | 点「检查」：有网址的走 classify 探针，无网址的走 provider 连通检查；只读，不耗 token |
-| 启用 | 只控制在 `/v1/models` 里出不出现——开则客户端可见可点，关则仅登记（审查下拉/别名候选里照常可选） |
+| 启用 | **两个作用，别只当成可见性开关**：① `/v1/models` 是否展示（现网由 `AI_GATEWAY_PUBLIC_MODELS` 白名单最终决定）；② **裸内网模型名（如 `qwen2.5:7b`）钉回内网 provider 的判据**——关掉后该名字会落回默认外网 provider ⇒ **内容静默出境**。**内网 chat 模型一律保持启用**；想从列表隐藏走白名单，别关启用 |
 
 注意：laya 没有 chat 协议，启用后会出现在 `/v1/models`，但客户端点名它会掉进默认外网 provider
 发坏请求（上游 4xx）。**laya 保持停用**，只做登记。
@@ -127,7 +144,8 @@ provider key 为 write-only 配置，只写不回显，ops 日志只记长度。
 
 | 改了什么 | 生效方式 |
 |---|---|
-| `policy.yaml`、`routing.yaml`、`model_policy.yaml`、`l2_overrides.yaml`、provider key | 热重载/即时生效，**不重启** |
+| `policy.yaml`、`routing.yaml`、`model_policy.yaml`、`l2_overrides.yaml`、provider key、别名组/档位（管理台） | 热重载/即时生效，**不重启** |
+| `.env`（`AI_GATEWAY_PUBLIC_MODELS` / `AI_GATEWAY_INTENT_STICKY_MIN` / 各 L2 开关等） | 改完**必须重启**（systemd `EnvironmentFile`） |
 | `src/gateway/*.py` | 必须 `sudo systemctl restart gateway.service` |
 | `web/admin` 前端 | `npm run build`（直写 `static/admin`），**不重启**，源码与产物同一次提交 |
 
@@ -147,6 +165,8 @@ MainPID 必须变，否则等于没重启。生产推代码完整流程见 `agen
 | 现象 | 查哪里 |
 |---|---|
 | 外发 503 | 状态条外网 key 灯；Provider 页补 key；`validate_environment` |
+| 用户报「浏览器提示不安全 / 脚本 TLS 报错」 | 用户没装内网 CA：指到管理台「系统 → 证书安装」页或 `https://10.0.0.10:8080/ca.crt`（免登录）；SDK 客户端可只指向 CA 文件不装系统 |
+| 用户脚本解析不到错误原因 | 错误体契约：4xx/5xx 看 `detail.type` + `detail.message`（401 是纯文案；黑名单 403 双写 `detail`+`error`）；速查表在用户说明书 §2 |
 | 灰区内容全走本地、审计 `l2_unavailable` | L2 服务挂了（8002/8003），`AI_GATEWAY_L2_FAIL_MODE=open` 会改成放行（默认降本地） |
 | 某 provider 持续失败 | 熔断页看状态，可手动 open/closed；生产阈值 2 次/30s 窗口/恢复 10s |
 | L2 全走缓存、延迟 0 | `latency_ms==0` = 没真实调用（disabled/缓存/空输入），查缓存键或开关 |

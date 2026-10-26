@@ -125,16 +125,23 @@ _FILE_MARK_RULES = frozenset({
 })
 
 
+# 可用性兜底规则：转本地不是因为内容判密，而是因为系统不可用/超预算。
+# 这类命中**不标会话机密**——否则 L2 抖一次（或长文超预算），整个对话被锁本地 7 天。
+NON_CONFIDENTIAL_RULES = frozenset({
+    "l2_unavailable", "review_text_overflow",
+    "first_chunk_fallback", "prompt_too_long_fallback",
+})
+
+
 def responses_should_mark(rule_name: str | None, action: str | None,
                            file_ctx: dict | None) -> bool:
-    """responses \u547d\u4e2d\u540e\u662f\u5426\u6c61\u67d3 session+client\uff08\u7eaf\u51fd\u6570\uff0c\u53ef\u5355\u6d4b\uff09\u3002
+    """responses 命中后是否污染 session+client（纯函数，可单测）。
 
-    \u53ea\u6709\u9644\u4ef6/\u5185\u8054\u6587\u4ef6\u53c2\u4e0e\u65f6\u624d\u6807\u8bb0\uff1a\u7eaf\u6587\u672c\u89c4\u5219\u547d\u4e2d
-    \uff08\u5982\u7eaf\u7c98\u8d34\u8eab\u4efd\u8bc1\uff09\u4fdd\u6301\u73b0\u72b6\u4e0d\u6807\u8bb0\u3002
+    2026-10-26 起与 chat/messages 同口径：机密判定（含纯文本粘贴 / L2 判密）都标记
+    ——第一轮判密 ⇒ 同会话后续轮粘本地。只排除可用性兜底（不是内容判定）。
+    `file_ctx` 参数保留兼容旧调用方，不再参与判断。
     """
     if action not in ("route_local", "block"):
         return False
-    if (file_ctx or {}).get("filename"):
-        return True
-    return rule_name in _FILE_MARK_RULES
+    return rule_name not in NON_CONFIDENTIAL_RULES
 

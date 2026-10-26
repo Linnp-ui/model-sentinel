@@ -72,12 +72,12 @@ function EventStreamCard({ events, go }) {
       }>
       {/* 只列最近 5 条（EV_RECENT_MAX），不需要嵌套滚动容器 */}
       {recent.length === 0 ? (
-        <Alert type="success" showIcon message="本窗口无降级事件（外发链路全绿：无流式降级、无本地路由、L2 正常）" />
+        <Alert type="success" showIcon message="本窗口无三类降级事件（流式降级 / 本地路由 / L2 不可用）；5xx、熔断另见统计页与 Provider 页" />
       ) : (
         <>
           <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" tableLayout="fixed" columns={cols} dataSource={recent}
             pagination={false} />
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>
             本时间窗内最近 {recent.length} 条（最多 {EV_RECENT_MAX} 条）；逐条明细点右上「审计明细 →」进审计页
           </Typography.Text>
         </>
@@ -103,12 +103,12 @@ function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {
       onClick={go ? nav : undefined}
       onKeyDown={go ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); nav(); } } : undefined}
       style={{ borderLeft: `3px solid ${bar ?? color ?? '#e2e4ea'}`, cursor: go ? 'pointer' : 'default' }}
-      styles={{ body: { height: 96, padding: '12px 16px', display: 'flex', flexDirection: 'column' } }}>
-      <T type="secondary" style={{ fontSize: 14, height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 4, fontSize: 20, lineHeight: 1, position: 'relative', top: -1, color: 'var(--gw-primary)' }}>→</span>}</T>
+      styles={{ body: { height: 96, padding: 'var(--gw-sp-12) var(--gw-sp-16)', display: 'flex', flexDirection: 'column' } }}>
+      <T type="secondary" style={{ fontSize: 'var(--gw-fs-14)', height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 'var(--gw-sp-4)', fontSize: 20, lineHeight: 1, position: 'relative', top: -1, color: 'var(--gw-primary)' }}>→</span>}</T>
       {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看 */}
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--gw-sp-6)' }}>
         <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
-        {suffix && <T type="secondary" style={{ fontSize: 12 }}>{suffix}</T>}
+        {suffix && <T type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{suffix}</T>}
       </div>
     </Card>
   );
@@ -228,11 +228,11 @@ export default function OverviewPage() {
         <Alert type="info" showIcon message="初次使用指引"
           action={<Button size="small" type="link" style={{ padding: 0 }} onClick={dismissGuide}>不再提醒</Button>}
           description={
-            <ul style={{ margin: '4px 0 0', paddingLeft: 18, lineHeight: 1.8 }}>
+            <ul style={{ margin: 'var(--gw-sp-4) 0 0', paddingLeft: 'var(--gw-sp-16)', lineHeight: 1.8 }}>
               <li>先在「API KEY 管理」登记客户端 KEY —— 未登记的 key 调 /v1/* 直接 401</li>
-              <li>快速验证：「路由检查」页干跑（文本 / 文件都支持，不落审计），或 README 的三行 curl</li>
-              <li>改规则 / 路由后先到「路由检查」页干跑验证（生产同款决策链，不产生真实流量）</li>
-              <li>看不懂的词？鼠标悬停标题旁的 <span style={{ color: 'var(--gw-faint)' }}>ⓘ</span> 看白话解释（L1/L2、provider、熔断、影子…）</li>
+              <li>快速验证：「规则测试与检查」页干跑（文本 / 文件都支持，不落审计），或 README 的三行 curl</li>
+              <li>改规则 / 路由后先到「规则测试与检查」页干跑验证（生产同款决策链，不产生真实流量）</li>
+              <li>有不懂的地方？鼠标悬停带 <span style={{ color: 'var(--gw-faint)' }}>ⓘ</span> 的指标/标题/列头看白话解释（各页面都有：L1/L2、provider、熔断、影子…）</li>
             </ul>
           }
           onClose={() => setGuideSessionHidden(true)} />
@@ -249,12 +249,12 @@ export default function OverviewPage() {
       <Spin spinning={loading}>
       <Row gutter={[16, 16]}>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-qps" title={<>当前 QPS<Tip term="qps" /></>} bar="#1677ff"
+          <Kpi testid="ov-qps" title={<>QPS（近 10 tick）<Tip term="qps" /></>} bar="#1677ff"
             value={d && d.qps != null ? d.qps.toFixed(1) : '-'} suffix="req/s"
             go="/stats" hint="跳统计页：QPS 趋势 / 分位延迟 / 运行指标" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
-          <Kpi testid="ov-err" title={<>错误率 5xx+429（近10tick）<Tip text="5xx = 网关或上游自己出错；429 = 请求太密集被限流。取最近 10 个采样点（约几分钟）的平均值。" /></>}
+          <Kpi testid="ov-err" title={<>错误率 5xx+429（近10tick）<Tip text="5xx = 网关或上游自己出错；429 = 请求太密集被限流。取最近 10 个采样点（约 100 秒）的平均值。" /></>}
             value={d && d.err != null ? (d.err * 100).toFixed(1) + '%' : '-'}
             color={errColor} bar="#722ed1" go="/stats"
             hint="跳统计页：错误率趋势（5xx+429 近 10 tick 口径）" />
@@ -288,7 +288,7 @@ export default function OverviewPage() {
               <UPlotChart height={300} yVal={qpsAxis} series={qpsSeries} />
             ) : (
               <>
-                <T type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 8 }}>
+                <T type="secondary" style={{ fontSize: 'var(--gw-fs-12)', display: 'block', marginBottom: 'var(--gw-sp-8)' }}>
                   窗口 {winCalls} 次调用 · {(ch.ts || []).length} 桶仅 {nzBuckets} 桶有流量 → 日粒度（北京时区）
                 </T>
                 <DailyHeatmap points={dailyCounts} testid="ov-qps-daily" fill />
@@ -303,7 +303,7 @@ export default function OverviewPage() {
             ) : (
               <>
                 {/* 与统计页同图同编码：点大小含义只在那里有提示，落地页补同款 */}
-                <T type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 4 }}>
+                <T type="secondary" style={{ fontSize: 'var(--gw-fs-12)', display: 'block', marginBottom: 'var(--gw-sp-4)' }}>
                   散点：点大小 ∝ 桶内样本数 n（小样本桶的分位数≈单请求值）
                 </T>
                 <UPlotChart height={300} yVal={msAxis} series={latSeries} />

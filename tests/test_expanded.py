@@ -302,7 +302,7 @@ def test_alias_provider_must_resolve():
         for n in ("rt-caseprov", "rt-badprov"):
             try:
                 store.delete_alias_group(n)
-            except ValueError:
+            except (KeyError, ValueError):
                 pass
 
 
@@ -356,7 +356,7 @@ def test_provider_rename_cascades_alias_and_policy(monkeypatch, tmp_path):
         for n in ("rt-rename",):
             try:
                 store.delete_alias_group(n)
-            except ValueError:
+            except (KeyError, ValueError):
                 pass
 
 
@@ -381,7 +381,7 @@ def test_alias_group_rename():
         for n in ("rt-new", "rt-b", "rt-old"):
             try:
                 store.delete_alias_group(n)
-            except ValueError:
+            except (KeyError, ValueError):
                 pass
 
 def test_all_local_alias_skips_l1_l2():
@@ -893,14 +893,31 @@ def test_mark_session_hit():
     store = get_session_store()
     sid = "pytest-sess-%d" % int(time.time() * 1000)
     assert store.is_confidential(sid) is False
-    # allow 不标；无文件名（纯文本）不标；无 session 不标
+    # allow 不标；无 session 不标；可用性兜底（L2 不可用）不标 —— L2 抖一次不该锁会话 7 天
     _main._mark_session_hit(sid, {"action": "allow", "name": "x"}, "chat-inline-image")
-    _main._mark_session_hit(sid, {"action": "route_local", "name": "x"}, "")
-    _main._mark_session_hit("", {"action": "block", "name": "x"}, "chat-inline-image")
+    _main._mark_session_hit("", {"action": "route_local", "name": "x"}, "chat-inline-image")
+    _main._mark_session_hit(sid, {"action": "route_local", "name": "l2_unavailable"}, "chat-inline-image")
     assert store.is_confidential(sid) is False
-    # 内联图命中 route_local → 标上
-    _main._mark_session_hit(sid, {"action": "route_local", "name": "pii_weighted_route_local"}, "chat-inline-image")
+    # 2026-10-26：纯文本机密判定（无文件参与）也标 → 同会话后续轮粘本地
+    _main._mark_session_hit(sid, {"action": "route_local", "name": "l2_confidential"}, "")
     assert store.is_confidential(sid) is True
+
+
+def test_diff_policy_texts():
+    # 历史版本「变更内容」摘要：每行 = 该快照与下一更新状态的差
+    from src.gateway.policy_admin import diff_policy_texts
+    old = "policies:\n- name: 甲\n  priority: 5\n  action: block\n- name: 乙\n  priority: 10\n  action: route_local\n  description: 旧\n"
+    new = "policies:\n- name: 甲\n  priority: 3\n  action: block\n- name: 丙\n  priority: 12\n  action: allow\n"
+    c = diff_policy_texts(old, new)
+    assert "新增「丙」" in c
+    assert "删除「乙」" in c
+    assert "「甲」优先级 5→3" in c
+    # 相同内容无变化；坏 yaml 不炸
+    assert diff_policy_texts(old, old) == []
+    assert diff_policy_texts(":::not yaml:::", old) == ["无法解析，无法对比"]
+    # 仅描述变化 → 字段级中文摘要
+    c2 = diff_policy_texts(old, old.replace("description: 旧", "description: 新"))
+    assert c2 == ["「乙」改: 描述"]
 
 # ---------- 14. 提及数据文件名（workbuddy 粘贴表格）也视为文件参与 ----------
 def test_mentioned_data_filename():
@@ -939,6 +956,17 @@ def test_codex_session_id():
     assert _main._codex_session_id({"input": [{"role": "assistant", "content": "x"}]}) is None
     assert _main._codex_session_id({}) is None
     assert _main._codex_session_id(None) is None
+
+def test_responses_should_mark_pure_text():
+    # 2026-10-26：纯文本机密判定也标会话（第一轮判密 ⇒ 同会话粘本地）；
+    # 可用性兜底不标（L2 抖一次不该锁会话 7 天）。
+    from src.gateway.responses_filectx import responses_should_mark
+    assert responses_should_mark("l2_confidential", "route_local", {}) is True
+    assert responses_should_mark("pii_weighted_route_local", "route_local", {}) is True
+    assert responses_should_mark("financial_local_only", "route_local", {"filename": "x.xlsx"}) is True
+    assert responses_should_mark("l2_unavailable", "route_local", {}) is False
+    assert responses_should_mark("review_text_overflow", "route_local", {}) is False
+    assert responses_should_mark("default_allow", "allow", {"filename": "x.xlsx"}) is False
 
 # ---------- 16. codex 桥接：每次请求唯一 response id（静态 id 会让 codex 无法收尾/复制/分支） ----------
 def _bridge_resp_id(monkeypatch):

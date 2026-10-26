@@ -31,7 +31,15 @@ export const fetchJson = async (path, opts = {}) => {
     throw new Error('未登录');
   }
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail) || `HTTP ${r.status}`);
+  if (!r.ok) {
+    // 422 校验错是数组（[{loc,msg}]）：拼成可读文本，别把 JSON 原样甩给用户
+    const d = body.detail;
+    const text = typeof d === 'string' ? d
+      : Array.isArray(d)
+        ? d.map((x) => `${(x.loc || []).slice(1).join('.') || '请求'}: ${x.msg || JSON.stringify(x)}`).join('；')
+        : JSON.stringify(d) || `HTTP ${r.status}`;
+    throw new Error(text);
+  }
   return body;
 };
 

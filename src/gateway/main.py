@@ -52,6 +52,8 @@ from typing import Any, Optional
 import httpx
 
 from fastapi import FastAPI, Header, UploadFile, File, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, Response, StreamingResponse
 
@@ -103,7 +105,7 @@ from .session_store import get_session_store, extract_session_id
 
 from .metrics import get_current_status, get_metrics, set_current_status, GATEWAY_VERSION
 from .redaction import redact_audit_entry
-from .responses_filectx import extract_responses_filectx, responses_should_mark
+from .responses_filectx import NON_CONFIDENTIAL_RULES, extract_responses_filectx, responses_should_mark
 
 from .stat_scope import is_blocked, is_local_route, resolve_action, to_beijing
 
@@ -163,6 +165,15 @@ app = FastAPI(title="Secure Gateway — 大模型请求统一审查出口", vers
 # 且流式响应整体不压缩；上游已带 content-encoding 的响应也不重复压。
 # compresslevel=6（默认 9 对 400KB 级 chunk CPU 偏高，收益差 1%）。
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_zh(request: Request, exc: RequestValidationError):
+    """管理台请求体校验错统一中文；/v1 保持 FastAPI 原始形状（协议契约不动）。"""
+    if request.url.path.startswith("/admin"):
+        from src.gateway.admin_api import _verrors
+        return JSONResponse(status_code=422, content={"detail": _verrors(exc)})
+    return await request_validation_exception_handler(request, exc)
 
 
 # P2: middleware 抓 HTTP 响应码, set_current_status() 写到 ContextVar;
@@ -278,7 +289,7 @@ def auth(authorization: Optional[str] = Header(None), x_api_key: Optional[str] =
     elif x_api_key:
         token = x_api_key.strip()
     if not token:
-        raise HTTPException(401, "missing api key")
+        raise HTTPException(401, "缺少 API key（请带 Authorization: Bearer <key> 或 x-api-key 头）")
     if request is not None:
         _memo = getattr(getattr(request, "state", None), "gw_key_entry", None)
         if _memo and _memo[1]:  # P1: 中间件已命中登记表，跳过重复 DB
@@ -299,7 +310,7 @@ def auth(authorization: Optional[str] = Header(None), x_api_key: Optional[str] =
         pass
     # 未登记一律 401：env dev key 与上游验签（fail-open）兜底已删。
     # 迁移中的合法 key 先登记进表（admin UI / create_api_key），再收紧不断流。
-    raise HTTPException(401, "invalid api key")
+    raise HTTPException(401, "API key 未登记或无效（到管理台「API KEY 管理」登记，或找管理员）")
 
 async def _bind_identity_ctx(identity: Identity = Depends(auth)) -> Identity:
     """把身份写进**事件循环这一侧**的 ContextVar（routing 层准入门禁要读它）。
@@ -316,10 +327,35 @@ async def _bind_identity_ctx(identity: Identity = Depends(auth)) -> Identity:
 
     ⚠️ ``/v1/*`` 端点一律用 ``Depends(_bind_identity_ctx)``，**不要**再用
     ``Depends(auth)`` —— 少这一层就没有准入身份（fail-closed 成全量 503）。
+
+    费用上限（weekly_cost_cap）也统一在这里判：它是配额不是限流 ——
+    ``/v1/{path}`` 兜底代理没有限流 dep、限流关闭（RPM/RPS=0）时
+    ``_make_rate_limit_dep`` 提前 return，放那边上限会被静默关掉 ⇒ 放所有
+    /v1 端点必过的唯一入口。
     """
     try:
         if _identity_v2() and isinstance(identity, Identity):
             _set_current_identity(identity)
+    except Exception:
+        pass
+    try:
+        kid = getattr(identity, "key_id", None)
+        if kid:
+            from .admin_store import get_admin_store
+            from .stats_service import key_weekly_cost
+            _store = get_admin_store()
+            _cap = _store.get_key_weekly_cap(kid)
+            if _cap > 0:
+                _spend = key_weekly_cost(_store, kid)
+                if _spend >= _cap:
+                    get_metrics().inc_rate_limited("cost", "weekly_cost_cap")
+                    raise HTTPException(
+                        status_code=429,
+                        detail={"type": "quota_exceeded", "scope": "cost",
+                                "spend": round(_spend, 4), "cap": _cap},
+                    )
+    except HTTPException:
+        raise
     except Exception:
         pass
     return identity
@@ -335,25 +371,8 @@ def _make_rate_limit_dep(scope: str, rpm_env: str, rps_env: str = None):
         xak = request.headers.get("x-api-key", "")
         client_ip = _resolve_client_ip(request)
         key = _rl_key(authz, xak, client_ip, identity_key=_identity_bind_key(request))
-        try:
-            if getattr(identity, "key_id", None):
-                from .admin_store import get_admin_store
-                from .stats_service import key_weekly_cost
-                _store = get_admin_store()
-                _cap = _store.get_key_weekly_cap(identity.key_id)
-                if _cap > 0:
-                    _spend = key_weekly_cost(_store, identity.key_id)
-                    if _spend >= _cap:
-                        get_metrics().inc_rate_limited(scope, "weekly_cost_cap")
-                        raise HTTPException(
-                            status_code=429,
-                            detail={"type": "quota_exceeded", "scope": scope,
-                                    "spend": round(_spend, 4), "cap": _cap},
-                        )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+        # 费用上限不在这里判：见 _bind_identity_ctx（配额要覆盖全部 /v1 入口，
+        # 且限流关闭时仍生效；放这里 RPM/RPS=0 提前 return 会静默关掉配额）。
         ok, retry, reason = get_limiter().check(key, scope=scope)
         if not ok:
             get_metrics().inc_rate_limited(scope, reason)
@@ -564,18 +583,23 @@ def _mentioned_data_filename(text):
 
 
 def _mark_hit_context(session_id, key_id, session_name, taint_name, decision):
-    """命中后双轨标记：会话机密 + key 级文件污染；任一失败不阻断主链。"""
+    """命中后双轨标记：会话机密 + key 级文件污染；任一失败不阻断主链。
+
+    2026-10-26：纯文本机密判定也标会话（第一轮判密 ⇒ 同会话后续轮粘本地）；
+    可用性兜底（NON_CONFIDENTIAL_RULES）不标——那不是内容判定。
+    """
     try:
-        if (decision or {}).get("action") not in ("route_local", "block"):
+        d = decision or {}
+        if d.get("action") not in ("route_local", "block") or d.get("name") in NON_CONFIDENTIAL_RULES:
             return
-        if session_id and session_name:
+        if session_id:
             get_session_store().mark_confidential(
                 session_id,
-                {"name": session_name, "rule": (decision or {}).get("name"), "action": (decision or {}).get("action")},
+                {"name": session_name or "text-hit", "rule": d.get("name"), "action": d.get("action")},
             )
         _name = _mentioned_data_filename(taint_name or "")
         if key_id and _name:
-            get_session_store().mark_tainted_file(key_id, _name, (decision or {}).get("name") or "")
+            get_session_store().mark_tainted_file(key_id, _name, d.get("name") or "")
     except Exception:
         pass
 
@@ -583,15 +607,18 @@ def _mark_hit_context(session_id, key_id, session_name, taint_name, decision):
 def _mark_session_hit(session_id, decision, name=""):
     """命中（route_local/block）即标 session，后续同会话粘本地；与 files/check 同口径。
 
-    沿用 responses 既有约定：只有文件参与（name 非空）才标记，纯文本命中不标。
-    标记失败绝不影响主链路。
+    2026-10-26：纯文本机密判定也标（此前「无文件参与不标」约定作废）；
+    可用性兜底（NON_CONFIDENTIAL_RULES）不标。标记失败绝不影响主链路。
     """
     try:
-        if session_id and name and (decision or {}).get("action") in ("route_local", "block"):
-            get_session_store().mark_confidential(
-                session_id,
-                {"name": name, "rule": (decision or {}).get("name"), "action": (decision or {}).get("action")},
-            )
+        d = decision or {}
+        if (not session_id or d.get("action") not in ("route_local", "block")
+                or d.get("name") in NON_CONFIDENTIAL_RULES):
+            return
+        get_session_store().mark_confidential(
+            session_id,
+            {"name": name or "text-hit", "rule": d.get("name"), "action": d.get("action")},
+        )
     except Exception:
         pass
 
@@ -818,7 +845,7 @@ def _audit_preview_responses(body, text: str) -> str:
 def _l2_source_text(kind: str, payload, merged_text: str) -> str:
     """未截断的 L2 源文本 = 用户 query + 内联 OCR 文本。
 
-    `_select_l2_text` 只是它的 `[:1200]` 视图；`tail` scope 从同一个源取第 2 段 ——
+    `_select_l2_text` 只是它的 `[:1200]` 视图；`long_text` scope 从同一个源按窗抽样 ——
     共用同一个源，避免「同一语义两份实现」（MEMORY §2 纪律）。
     """
     q = ""
@@ -900,13 +927,96 @@ def _tool_text_responses(body) -> str:
     return ""
 
 
+def _prev_user_text_chat(messages, limit: int = 2) -> str:
+    """最后一条用户消息<b>之前</b>的最近 limit 条 user 正文（多轮追问自指：
+    「改成 24055 吧」单独判 NORMAL，带上轮才判得出）。只取 user，跳过 tool 调用/结果。"""
+    texts = []
+    try:
+        for m in messages or []:
+            d = m if isinstance(m, dict) else None
+            role = (d.get("role") if d else getattr(m, "role", ""))
+            if role != "user":
+                continue
+            if d:
+                if d.get("tool_calls") or d.get("tool_call_id"):
+                    continue
+                c = d.get("content")
+            else:
+                if getattr(m, "tool_calls", None) or getattr(m, "tool_call_id", None):
+                    continue
+                c = getattr(m, "content", "")
+            s = _msg_content_to_str(c).strip()
+            if s:
+                texts.append(s)
+    except Exception:
+        pass
+    if len(texts) <= 1:
+        return ""
+    return "\n".join(texts[-(limit + 1):-1])
+
+
+def _prev_user_text_anthropic(body, limit: int = 2) -> str:
+    """同 _prev_user_text_chat，anthropic 形状（user 消息 str / text 块）。"""
+    texts = []
+    try:
+        msgs = (body.get("messages") or []) if isinstance(body, dict) else []
+        for m in msgs:
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str) and c.strip():
+                texts.append(c.strip())
+            elif isinstance(c, list):
+                ts = [b.get("text", "") for b in c
+                      if isinstance(b, dict) and b.get("type") in ("text", "input_text") and b.get("text")]
+                s = " ".join(ts).strip()
+                if s:
+                    texts.append(s)
+    except Exception:
+        pass
+    if len(texts) <= 1:
+        return ""
+    return "\n".join(texts[-(limit + 1):-1])
+
+
+def _prev_user_text_responses(body, limit: int = 2) -> str:
+    """同 _prev_user_text_chat，responses 形状（input 里的 user 消息）。"""
+    texts = []
+    try:
+        inp = body.get("input") if isinstance(body, dict) else None
+        if isinstance(inp, list):
+            for item in inp:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") in ("function_call_output", "function_call"):
+                    continue
+                if item.get("role") not in (None, "user"):
+                    continue
+                c = item.get("content")
+                if isinstance(c, str) and c.strip():
+                    texts.append(c.strip())
+                elif isinstance(c, list):
+                    ts = [b.get("text", "") for b in c
+                          if isinstance(b, dict) and b.get("type") in ("input_text", "text") and b.get("text")]
+                    s = " ".join(ts).strip()
+                    if s:
+                        texts.append(s)
+    except Exception:
+        pass
+    if len(texts) <= 1:
+        return ""
+    return "\n".join(texts[-(limit + 1):-1])
+
+
 # ---- L2 scope 名（docs/l2-scope-extension-plan-2026-09-16.md §3.1）----
 _L2_SCOPE_LAST_USER = "last_user"
 _L2_SCOPE_TOOL = "tool"
-_L2_SCOPE_TAIL = "tail"
-# 明确排除的 scope：system 见 §3.8，history 见 §3.7（它是判决失忆，不是视野盲区）。
-# 写进配置只留痕、不产块 —— 防止有人以为「配上就生效」。
-_L2_SCOPE_EXCLUDED = ("system", "developer", "instructions", "history")
+_L2_SCOPE_LONG = "long_text"
+_L2_SCOPE_HISTORY = "history"
+# 明确排除的 scope：system 见 §3.8。写进配置只留痕、不产块 —— 防止有人以为「配上就生效」。
+# history 曾在 §3.7 排除（「判决失忆，不是视野盲区」），2026-10-26 实测多轮追问
+# 「改成 24055 吧」单独判 NORMAL 出境、带上轮判密 ⇒ 恢复为可用档。
+_L2_SCOPE_EXCLUDED = ("system", "developer", "instructions")
 _L2_SCOPE_MAX_BLOCKS = 5      # = classify_chunks 的 chunks[:5] 硬上限
 # 灰区强制 L2 下限（env 可调）：L1 放行且 risk_score >= FLOOR 的文本，无论长短都送
 # L2 语义复核（短句语义泄密是 L1 格式规则的真空带）。
@@ -933,6 +1043,14 @@ def _l2_gray_floor() -> int:
     except (TypeError, ValueError):
         return 20
     return max(0, min(20, v))
+
+
+def _l2_always() -> bool:
+    """L2 常开开关（env 即时生效）：true 时所有 L1 放行请求都送 L2 语义复核，
+    不再只看灰区分值 —— risk=0 的语义泄密（「薪酬明细」「改成 24055 吧」）L1 完全
+    打不中，实测回放 120 条 risk=0 放行文本有 4 条 L2 会判密。白名单 5% 抽样与
+    本地别名直通不受影响。关掉即回灰区口径。"""
+    return (os.getenv("AI_GATEWAY_L2_ALWAYS", "false") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _l2_gray_trigger(findings) -> bool:
@@ -979,7 +1097,7 @@ def _l2_scope_cfg() -> dict:
     静默降级必须留痕（MEMORY §1 贯穿性判断）。
     """
     d = {"scopes": [_L2_SCOPE_LAST_USER], "chunk_chars": 1200,
-         "budget_chars": 5000}
+         "budget_chars": 6000}
     try:
         from .model_policy import (review_budget_chars, review_chunk_chars,
                                    review_scopes)
@@ -991,12 +1109,34 @@ def _l2_scope_cfg() -> dict:
     return d
 
 
+def _l2_long_windows(src: str, cc: int, limit: int, start: int = 0) -> list:
+    """源文本按 cc 切窗，最多 limit 段：段数够就全取，超了均匀抽样并保住真正的尾段。
+
+    `start` 默认从第 2 段起（首段由 `last_user` 覆盖）；只开 long_text 时传 0，
+    否则前 cc 字会成盲区。
+    """
+    if limit <= 0 or len(src) <= start:
+        return []
+    rest = src[start:]
+    n = (len(rest) + cc - 1) // cc
+    if n <= limit:
+        idx = list(range(n))
+    elif limit == 1:
+        idx = [n - 1]          # 只有 1 个槽位时给尾部（前段有 last_user 兜）
+    else:
+        idx = sorted({round(i * (n - 1) / (limit - 1)) for i in range(limit)})
+    return [rest[i * cc:(i + 1) * cc] for i in idx]
+
+
 def _select_l2_scopes(kind: str, payload, merged_text: str) -> list:
     """按 scope 名切 L2 视野块，返回 [(scope, text), ...]。
 
     - 空块不返回（少了就不发这次调用）。
     - `last_user` 走 `_select_l2_text` ⇒ **与历史行为逐字节一致**（默认档唯一成员）。
-    - `tool` = 最后一条工具结果；`tail` = 源文本 `[chunk_chars : 2*chunk_chars]`（长粘贴尾部）。
+    - `tool` = 最后一条工具结果；`long_text` = 源文本从第 2 段起均匀抽样（最多占满
+      剩余槽位，含真正的尾段）——1 段只能看 1200 字，长粘贴的后半段会整段漏掉。
+    - `history` = 最后一条用户消息之前的最近 2 条 user 正文（尾部截到 chunk）——
+      多轮追问「改成 24055 吧」单独判 NORMAL，带上轮才判得出。
     - 预算先到先用；`last_user` 不受预算裁剪（它是判定基线，不能被配置饿死）。
     """
     cfg = _l2_scope_cfg()
@@ -1004,7 +1144,7 @@ def _select_l2_scopes(kind: str, payload, merged_text: str) -> list:
     cc = max(1, int(cfg["chunk_chars"] or 1200))
     budget = max(0, int(cfg["budget_chars"] or 0))
     src = ""
-    if _L2_SCOPE_TAIL in names:
+    if _L2_SCOPE_LONG in names:
         try:
             src = _l2_source_text(kind, payload, merged_text)
         except Exception:
@@ -1020,32 +1160,51 @@ def _select_l2_scopes(kind: str, payload, merged_text: str) -> list:
                 tool = _tool_text_responses(payload)
         except Exception:
             tool = ""
+    hist = ""
+    if _L2_SCOPE_HISTORY in names:
+        try:
+            if kind == "chat":
+                hist = _prev_user_text_chat(payload)
+            elif kind == "anthropic":
+                hist = _prev_user_text_anthropic(payload)
+            elif kind == "responses":
+                hist = _prev_user_text_responses(payload)
+        except Exception:
+            hist = ""
 
     out = []
     used = 0
+
+    def _add(name, t, counted=True):
+        nonlocal used
+        t = (t or "").strip()
+        if not t or len(out) >= _L2_SCOPE_MAX_BLOCKS:
+            return
+        if counted and budget and used + len(t) > budget:
+            return
+        if counted:
+            used += len(t)
+        out.append((name, t))
+
+    # 单块档先占位，long_text 只用剩余槽位 —— 否则长文窗口会把 tool 挤掉。
+    # 任一档命中即整体命中，顺序只影响归因。
     for name in names:
         if name in _L2_SCOPE_EXCLUDED:
             _l2_scope_warn(f"scope {name!r} 已在方案 §3.7/§3.8 排除，配置项被忽略")
-            continue
-        if name == _L2_SCOPE_LAST_USER:
-            t = _select_l2_text(kind, payload, merged_text)
+        elif name == _L2_SCOPE_LAST_USER:
+            _add(name, _select_l2_text(kind, payload, merged_text), counted=False)
         elif name == _L2_SCOPE_TOOL:
-            t = tool[:cc]
-        elif name == _L2_SCOPE_TAIL:
-            t = src[cc:cc * 2]
+            _add(name, tool[:cc])
+        elif name == _L2_SCOPE_HISTORY:
+            _add(name, hist[-cc:])          # 尾部截断：离当前轮最近的上一轮最有指代意义
+        elif name == _L2_SCOPE_LONG:
+            continue
         else:
             _l2_scope_warn(f"未知 scope {name!r}，已忽略")
-            continue
-        t = (t or "").strip()
-        if not t:
-            continue
-        if name != _L2_SCOPE_LAST_USER and budget and used + len(t) > budget:
-            continue
-        used += len(t)
-        out.append((name, t))
-    if len(names) > _L2_SCOPE_MAX_BLOCKS:
-        _l2_scope_warn(f"scope 数量 {len(names)} 超过上限 {_L2_SCOPE_MAX_BLOCKS}，"
-                       f"超出部分会被 classify_chunks 静默丢弃: {names}")
+    if _L2_SCOPE_LONG in names:
+        start = 0 if _L2_SCOPE_LAST_USER not in names else cc
+        for w in _l2_long_windows(src, cc, _L2_SCOPE_MAX_BLOCKS - len(out), start):
+            _add(_L2_SCOPE_LONG, w)
     return out
 
 
@@ -1383,7 +1542,21 @@ async def _json_body(request: Request) -> Any:
                                          "message": "请求体不是合法 JSON"})
 
 
-async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "") -> tuple[dict, dict, dict | None]:
+def _intent_source(l2_chunks, l2_text, text) -> str:
+    """复杂度判定的输入 = 最后一条用户消息（含内联 OCR），不是整段会话历史。
+
+    取 L2 的 last_user 块：同一轮 tool 回合里它逐字不变 ⇒ intent_router 的文本缓存
+    天然把「一次用户发言」收敛成一次判定（换一句话才重判）。
+    """
+    if l2_chunks:
+        for _s, _t in l2_chunks:
+            if _s == _L2_SCOPE_LAST_USER and _t:
+                return _t
+        return (l2_chunks[0][1] if l2_chunks else "") or text
+    return l2_text or text
+
+
+async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "", session_hint: Optional[str] = None) -> tuple[dict, dict, dict | None]:
     """
 
     纯文本审查（chat / messages / responses 共用）：
@@ -1397,6 +1570,8 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
     """
     text, _overflow = _cap_review_text(text)
+    from .intent_router import ctx_set as _intent_ctx_reset
+    _intent_ctx_reset(None)   # 同 task 二次审查（files_check）时不留上一轮的档位
     if model and _all_local_alias(model):
         return {"action": "allow", "name": "local_alias_bypass"}, {}, None
 
@@ -1407,7 +1582,7 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
     if extra_findings:
         text_findings.update(extra_findings)
     _note_risk(text_findings)
-    session_id = extract_session_id(request.headers) if request is not None else None
+    session_id = (extract_session_id(request.headers) if request is not None else None) or session_hint
     session_conf = _is_session_confidential(session_id)
     # 文件名污染（客户端无感会话替代）：正文提及同 key 下曾判机密的文件名即命中。
     # key 取身份绑定键（与限流同口径）；干跑/无身份时 key 为空即跳过。
@@ -1446,10 +1621,21 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
     l2_result = None
 
+    # 复杂度路由（别名组 intent=1）：与 L2 判密并行跑，判不出来就不改候选顺序。
+    # 只判「最后一条用户消息」（同一轮 tool 回合反复携带同一段文字 ⇒ 缓存命中，只判一次）。
+    _intent_task = None
+    if decision.get("action") == "allow":
+        try:
+            from .intent_router import plan as _intent_plan
+            _intent_task = _intent_plan(model, _intent_source(l2_chunks, l2_text, text))
+        except Exception:
+            _intent_task = None
+
     # 2026-10-19：/v1/embeddings 已收口到本函数（灰区 L2 与 chat 同源，见 embeddings 端点）。
     # files_check 的单块文件式 L2 走自己的路径（门槛同为灰区，见 files_check）。
     _dec_blocks = l2_chunks or [(_L2_SCOPE_LAST_USER, l2_text or text)]
-    if (decision.get("action") == "allow" and _l2_gray_trigger(text_findings)
+    if (decision.get("action") == "allow"
+            and (_l2_always() or _l2_gray_trigger(text_findings))
             and (session_conf or not _wl_l2_skip(request))):
 
         if not l2_chunks:
@@ -1465,9 +1651,39 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
             _hit = (l2_result or {}).get("scope") or _hit
         if isinstance(l2_result, dict):
             # P2 留痕：命中块 + 实际跑过的块（「被哪一类内容拦下」要可查）
-            l2_result["scope"] = _hit
+            if is_degraded(l2_result):
+                # 降级块归因：没有块产出结论，scope 不得归给首块（会像「首块拦的」）；
+                # 真实归因 = degraded_scopes（哪些块失败），审计页一并渲染
+                l2_result["scope"] = None
+            else:
+                l2_result["scope"] = _hit
             l2_result["scopes_run"] = [s for s, _ in _dec_blocks]
             l2_result.setdefault("degraded_scopes", [])
+
+        # A/B 影子（2026-10-26）：AI_GATEWAY_L2_HISTORY_SHADOW 开且本次真跑了 history 块时，
+        # 再判一次「无 history」口径，只留痕（l2.history_shadow 进审计）不改判决。
+        # 影子期多轮请求在主判定后串行多一次 L2（~200ms），实验结束关 env 即恢复。
+        if (os.getenv("AI_GATEWAY_L2_HISTORY_SHADOW", "false") or "").strip().lower() in ("1", "true", "yes", "on") \
+                and any(_s == _L2_SCOPE_HISTORY for _s, _ in _dec_blocks) \
+                and isinstance(l2_result, dict):
+            _rest = [(_s, _t) for _s, _t in _dec_blocks if _s != _L2_SCOPE_HISTORY]
+            if _rest:
+                try:
+                    if len(_rest) == 1:
+                        _hs = await small_classify(_rest[0][1], filename="", headers=[], sheet_names=[])
+                    else:
+                        _hs = await classify_chunks([_t for _s, _t in _rest],
+                                                    filename="", headers=[], sheet_names=[],
+                                                    scopes=[_s for _s, _ in _rest])
+                    l2_result["history_shadow"] = {
+                        "label": (_hs or {}).get("label"),
+                        "confidence": (_hs or {}).get("confidence"),
+                        "reason": (_hs or {}).get("reason"),
+                        "latency_ms": (_hs or {}).get("latency_ms"),
+                        "degraded": bool((_hs or {}).get("degraded")),
+                    }
+                except Exception as e:
+                    l2_result["history_shadow"] = {"error": str(e)[:120]}
 
         _d = _l2_decision(l2_result)
         # P2b: decision-side scope metrics —— 判定块也要进 scope 指标。
@@ -1490,6 +1706,19 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
             if request is not None:
                 request.state.gw_block_reason = f"l2:{_hit}:{(l2_result or {}).get('reason') or 'confidential'}"
 
+    if _intent_task is not None:
+        from .intent_router import apply_sticky as _intent_sticky
+        from .intent_router import ctx_set as _intent_ctx_set
+        if decision.get("action") != "allow":
+            # 判决已转本地/拦截 ⇒ 别名组根本不参与路由，别再等这次判定（本地调用已发出，取消即可）
+            _intent_task.cancel()
+            _intent_ctx_set(None)
+        else:
+            try:
+                # 会话级档位粘性：窗口内只升不降（换模型=废掉上一模型的 prompt cache）
+                _intent_ctx_set(_intent_sticky(session_id, await _intent_task))
+            except Exception:
+                _intent_ctx_set(None)
     return decision, text_findings, l2_result
 
 
@@ -1584,6 +1813,22 @@ def _alias_ctx_now():
     return ctx_now()
 
 
+def _intent_meta() -> dict | None:
+    """复杂度判定留痕（仅开了 intent 的别名组有值）：判成几档、耗时、是否缓存命中。
+
+    sticky=true = 本次生效档位由会话粘性抬升（或判定失败时沿用会话档），见 intent_router.apply_sticky。
+    """
+    try:
+        from .intent_router import ctx_info
+        c = ctx_info()
+        if not c:
+            return None
+        return {"level": c.get("level"), "ms": c.get("ms"), "cached": bool(c.get("cached")),
+                "sticky": bool(c.get("sticky"))}
+    except Exception:
+        return None
+
+
 def _gateway_meta(
     decision: dict,
     prov,
@@ -1604,6 +1849,7 @@ def _gateway_meta(
         "policy_rule": decision.get("name"),
         "alias": ((_alias_ctx_now() or {}).get("name")) or "",
         "alias_failover": ((_alias_ctx_now() or {}).get("failover")) or [],
+        "intent": _intent_meta(),
         "layer": "L2" if l2_result and decision.get("name") == "l2_confidential" else "L1",
         "downgraded_from": downgraded,
         "override_denied": notes.get("override_denied"),
@@ -1757,7 +2003,7 @@ def _resolve_actual_model(model, provider):
 def log_entry(entry: dict, *, count: bool = True):
     redact_audit_entry(entry)
 
-    # 模型列记实际：别名请求放行/本地路由时 model 还是别名（如 AB-flash），
+    # 模型列记实际：别名请求放行/本地路由时 model 还是别名（如 Auto-AB），
     # 这里按落点 provider 解析成真实模型（deepseek-flash）。无落点（拦截/失败）保持原样。
     if entry.get("model") and entry.get("provider"):
         try:
@@ -2056,12 +2302,13 @@ def _health_payload() -> dict:
 
 @app.get("/v1/models")
 async def list_models(identity: Identity = Depends(_bind_identity_ctx)):
-    """OpenAI compatible model list — 对外别名组（AB-flash / AB-pro）+ 内网主力模型
+    """OpenAI compatible model list — 对外别名组 + 内网主力模型
     （model_policy.internal_models，可直连点名）+ 用户自注册模型。
 
     列表构造在 admin_api.build_public_models（与管理端 /models/public 单一真源，
-    两端必然一致）；用户自注册模型（/v1/models/register）保持展示，不受别名机制
-    影响。上游真实模型目录不再对外暴露（真实模型名请求仍兼容）。
+    两端必然一致），末尾按 AI_GATEWAY_PUBLIC_MODELS 白名单收窄展示（空=全量；
+    只影响可发现性，点名路由不受影响）。上游真实模型目录不再对外暴露
+    （真实模型名请求仍兼容）。
     """
     return {"object": "list", "data": _admin_api.build_public_models()}
 
@@ -2716,7 +2963,8 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     file_ctx = extract_responses_filectx(body, text)
     decision, text_findings, l2_result = await _review_text(
         text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-        l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""))
+        l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""),
+        session_hint=session_id)
 
 
     decision, downgraded = _block_to_fallback(decision)
@@ -2975,7 +3223,7 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
     # 2026-10-13 起对齐 _review_text：加灰区门槛（risk_score >= 20 才跑 L2），
     # 与 chat/messages/responses 的 L2 触发语义一致。
     l2_result = None
-    if decision.get("action") == "allow" and _l2_gray_trigger(text_findings):
+    if decision.get("action") == "allow" and (_l2_always() or _l2_gray_trigger(text_findings)):
 
         chunks = file_info.get("chunks") or [text[:2000]]
         if len(chunks) > 1:
@@ -3207,8 +3455,15 @@ _ADMIN_LOGIN_PAGE_TMPL = """<!doctype html>
 <title>Secure Gateway — 管理登录</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  /* 不引外部字体（内网无出口客户端 @import 是 render-blocking 依赖，安全产品登录页不自带外网依赖）；
+     font-family 已有 system-ui 兜底。深浅两套：手动切深色跟随系统偏好（登录页是独立模板，不走 data-theme） */
   :root{--bg:#F8FAFC;--panel:#FFFFFF;--line:#E2E8F0;--line-strong:#CBD5E1;--muted:#64748B;--text:#0F172A;--accent:#1E40AF;--accent-600:#1E3A8A;--err:#DC2626}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#0B1220;--panel:#111A2C;--line:#2A3A55;--line-strong:#3B4E70;--muted:#8CA3C7;--text:#E6EEFB;--accent:#3B82F6;--accent-600:#2563EB;--err:#F87171}
+    .card{box-shadow:0 8px 30px rgba(0,0,0,.5)}
+    input{background:#0B1220}
+    input::placeholder{color:#5B7396}
+  }
   *{box-sizing:border-box}
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui;-webkit-font-smoothing:antialiased}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:32px;width:340px;box-shadow:0 8px 30px rgba(15,23,42,.08)}
@@ -3275,7 +3530,7 @@ async def admin_login_submit(request: Request, next: Optional[str] = None):
             pw = ""
     ip = _resolve_client_ip(request) or "unknown"
     if _admin_login_throttled(ip):
-        raise HTTPException(429, "too many login attempts, retry in 5 minutes")
+        raise HTTPException(429, "登录尝试过于频繁，请 5 分钟后重试")
     if not _verify_admin_pw(pw):
         _admin_login_fail(ip)
         return HTMLResponse(
@@ -3878,8 +4133,11 @@ async def _admin_ip_filter_mw(request: Request, call_next):
             )
         except Exception:
             pass
+        # 双写包装：detail 与其余错误统一口径（type+中文 message），error 保 OpenAI
+        # SDK 兼容（SDK 认 error 信封）——两边都是同一事实，改文案要同步
         return JSONResponse(
-            {"error": {"type": "key_blocked", "message": "client key is blacklisted"}},
+            {"detail": {"type": "key_blocked", "message": "该 key 已被拉黑（key_blacklist），请联系管理员"},
+             "error": {"type": "key_blocked", "message": "client key is blacklisted"}},
             status_code=403,
         )
 

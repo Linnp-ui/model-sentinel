@@ -1,10 +1,13 @@
-"""对外模型别名（AB-flash / AB-pro）动态路由。
+"""对外模型别名组动态路由（如 Auto-AB）。
 
 - /v1/models 只暴露别名组；客户端 model=别名 时按组内候选链路由。
 - 候选链来自 Admin Console 配置（admin_store.alias_group/alias_member，5s TTL 缓存）。
 - 请求内失败立即切下一候选；熔断（键 = provider::model，复用 CircuitBreaker，与点名请求
   共用同一份状态）打开的候选跳过，即"非偶然性错误"记忆；全部候选不可用则抛最后一个错误
   （上游 4xx 透明透传原则）。
+- 选头（打哪个候选）可被「复杂度路由」改写：别名组开了 intent 时，main._review_text 用
+  内网小模型判本轮复杂度，alias_candidates 据此把「够用且最省」的候选提到链首
+  （见 intent_router.py）。判定失败/未开启时顺序与历史逐字相同。
 """
 from __future__ import annotations
 
@@ -50,17 +53,30 @@ def find_alias(req_model: str) -> Optional[Dict[str, Any]]:
 
 
 def alias_candidates(group: Dict[str, Any], skip: int = 0) -> List[Dict[str, Any]]:
-    """组内可用候选（跳过熔断打开的前缀成员）。skip: 已尝试的候选数。"""
+    """组内可用候选：跳过熔断打开的、跳过本请求已失败的，再按复杂度路由选头。
+
+    排序契约：返回链首 = 本次要打的候选；其余保持优先级顺序做故障切换。
+    ``idx`` 仍是组内原始下标（``skip`` 也按原始下标算，语义与旧版一致）；
+    复杂度判定结果由 ``main._review_text`` 写进 intent_router 的请求级 ContextVar，
+    这里只读 —— 判不出来（None）时顺序与旧版逐字相同。
+    """
     breaker = get_breaker()
+    _tried = {(t or "").lower() for t in ((_alias_ctx.get() or {}).get("failover") or [])}
     out: List[Dict[str, Any]] = []
     for i, c in enumerate(group.get("candidates") or []):
         if i < skip:
             continue
+        if f"{c['provider']}/{c['model']}".lower() in _tried:
+            # 本请求内已试过且失败：不再进链（route_chat 的故障切换靠这条推进，
+            # 不再用 skip 推算，避免「选头换位后 skip 会误跳健康候选」）
+            continue
         cb_key = _cb_key(c["provider"], c["model"])
         if not breaker.allow(cb_key):
             continue
-        out.append({"provider": c["provider"], "model": c["model"], "idx": i})
-    return out
+        out.append({"provider": c["provider"], "model": c["model"], "idx": i,
+                    "tier": c.get("tier") or 2})
+    from .intent_router import ctx_level, select
+    return select(out, ctx_level())
 
 
 def _cb_key(provider: str, model: str) -> str:

@@ -23,7 +23,7 @@ const L2Detail = ({ rec }) => {
     /* 展开行是单 td 横跨整表且被 theme 强制居中：限宽 + 块居中，
        文字左对齐由 theme.css 的 .audit-l2detail 翻回（同 ellipsis 例外口径），
        不然宽屏下详情像悬浮在超宽空带中间 */
-    <Space className="audit-l2detail" direction="vertical" size={2} style={{ fontSize: 12, maxWidth: 880, margin: '0 auto' }}>
+    <Space className="audit-l2detail" direction="vertical" size={2} style={{ fontSize: 'var(--gw-fs-12)', maxWidth: 880, margin: '0 auto' }}>
       <Space wrap>
         <Text strong>主判定：</Text>
         <Tag color={l2.label === 'CONFIDENTIAL' ? 'red' : 'green'}>{l2.label || '?'}</Tag>
@@ -31,7 +31,7 @@ const L2Detail = ({ rec }) => {
         <Text type="secondary">{l2.reason || ''}</Text>
         {l2.latency_ms !== undefined && <Text type="secondary">{l2.latency_ms}ms</Text>}
         {l2.cached && <Tag>缓存</Tag>}
-        {l2.degraded && <Tag color="orange">降级:{l2.degraded_reason || ''}</Tag>}
+        {l2.degraded && <Tag color="orange">降级:{l2.degraded_reason || ''}{(l2.degraded_scopes || []).length ? `（块: ${l2.degraded_scopes.join('、')}）` : ''}</Tag>}
       </Space>
       <Space wrap>
         <Text strong>影子(laya)：</Text>
@@ -59,7 +59,7 @@ const AUDIT_ACTIONS = [
 ];
 // 时间窗选项与总览页共用 RANGES（同一 since 值），避免两处窗口口径漂移
 const AUDIT_RANGES = [
-  { value: '', label: '全部时间' },
+  { value: '', label: '全部留存（热窗 5000 条）' },
   ...RANGES.map((r) => ({ value: r.since, label: r.label })),
 ];
 
@@ -157,7 +157,7 @@ export default function AuditPage() {
     { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
     { title: <>{'用户query'}<Tip term="query" /></>, dataIndex: 'text_preview', width: '25%',
       render: (v) => (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--gw-sp-4)', maxWidth: '100%' }}>
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
             title={v}>{v || '—'}</span>
           {v && <Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制用户query"
@@ -190,8 +190,8 @@ export default function AuditPage() {
       {data && (
         <>
           <Card>
-            <Space wrap style={{ marginLeft: 16, columnGap: 60, rowGap: 12 }}>
-              <Statistic data-testid="audit-stat-total" title={<>命中总数<Tip text="这段时间里被记录下来的请求条数（每个请求一条）。" /></>} value={data.kpi.total} />
+            <Space wrap style={{ marginLeft: 'var(--gw-sp-16)', columnGap: 60, rowGap: 'var(--gw-sp-12)' }}>
+              <Statistic data-testid="audit-stat-total" title={<>命中总数<Tip text="审计记录条数（流式失败会补一行；含模型登记/注销行）。" /><span style={{ color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)' }}>（{data.kpi.source === 'window' ? '热窗' : '审计库'}）</span></>} value={data.kpi.total} />
               <Statistic data-testid="audit-stat-allow" title={<>放行<Tip term="allow" /></>} value={data.kpi.c_allow} valueStyle={{ color: '#389e0d' }} />
               <Statistic data-testid="audit-stat-route" title={<>本地路由<Tip term="route_local" /></>} value={data.kpi.c_route} valueStyle={{ color: '#d46b08' }} />
               <Statistic data-testid="audit-stat-block" title={<>阻断<Tip term="block" /></>} value={data.kpi.c_block} valueStyle={{ color: '#cf1322' }} />

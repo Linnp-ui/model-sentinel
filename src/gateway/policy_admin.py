@@ -26,6 +26,7 @@ from .policy import PolicyDoc, decide, invalidate_policy_cache, load_policy, DEF
 CONTENT_TYPE_FIELD = {
     "prompt": "text",           # 用户query
     "filename": "file.filename",  # 文件名
+    "ext": "file.ext",          # 文件扩展名（引擎 file.ext in 精确匹配特判）
     "file": "file.text",        # 文件内容（含 OCR 抽取文本）
     "sheet_names": "file.sheet_names",  # 工作表名（list，仅文件分支注入）
     "headers": "file.headers",  # 表头行（list，仅文件分支注入）
@@ -61,11 +62,14 @@ _TRUTHY = ("1", "true", "yes", "on", "是", "开")
 # 表内只留现网 policy.yaml 实际在用的组合（2026-10-13 精简）：in/not_in、
 # 非用户query regex、模型名/客户端登记名/OCR 字段已从下拉移除——引擎支持不变，
 # policy.yaml 手写照样生效（hour_range 同理只走手写），构造器不再提供。
-# size / hour_range 自带字段（不绑内容类型，见 build_when），故不在表内。
+# 2026-10-23 补回文件扩展名 ext·in：「只匹配 Excel/PDF」是高频真实需求，
+# 引擎对 file.ext in 本有精确匹配特判（policy._eval_cond），构造器此前无入口。
+# size / hour_range / pii_score 自带字段（不绑内容类型，见 build_when），故不在表内。
 MATCH_CHOICES: List[Tuple[str, str, str, str]] = [
     ("prompt", "regex", "用户query · 正则", "匹配项=正则表达式（Python re 语法）：请求文本里任何位置匹配到就算命中。例：AKIA[0-9A-Z]{16} 圈 AWS 密钥、[0-9]{17}[0-9Xx] 圈身份证号。适合格式固定、要精确圈定的内容；写不好正则建议改用「包含任一」。请求文本=chat 的提示词正文、文件预检的解析文字"),
     ("prompt", "contains", "用户query · 包含任一", "匹配项=逗号分隔的关键词：请求文本包含任意一个词就算命中（多词之间是「或」，例：工资表, 薪资）。不区分大小写，词在句子中间也算（「查看工资表」命中「工资表」）。要所有词都出现：拆成多行并在下方选「全部命中」"),
     ("filename", "contains", "文件名 · 包含任一", "匹配项=逗号分隔的关键词：文件名包含任意一个词就算命中（例：报表, 财务）。不区分大小写，salary_2024.xlsx 命中 salary。只对带附件的请求生效"),
+    ("ext", "in", "文件扩展名 · 精确任一", "匹配项=逗号分隔的扩展名（不带点，例：xlsx, pdf）：附件扩展名与任意一个完全相等才命中（不区分大小写，不做子串——填 xlsx 不会命中 xls）。只对带附件的请求生效，纯文本请求扩展名为空、永不命中"),
     ("file", "contains", "文件内容 · 包含任一", "匹配项=逗号分隔的关键词：附件解析出的正文文字包含任意一个词就算命中（例：财务报表, 资产负债）。不区分大小写；图片 OCR 识别出的文字也落在这里"),
     ("sheet_names", "contains", "工作表名 · 包含任一", "匹配项=逗号分隔的关键词：任何一张工作表的名字包含任意一个词就算命中（例：工资, 预算）。只对能解析出表格的文件生效（xlsx/csv）"),
     ("headers", "contains", "表头 · 包含任一", "匹配项=逗号分隔的关键词：表头（表格第一行的列名）包含任意一个词就算命中（例：姓名, 身份证, 金额）。不区分大小写；只对能解析出表格的文件生效（xlsx/csv）"),
@@ -224,9 +228,53 @@ def restore_policy_yaml(yaml_text: str, operator: str = "", source: str = "rollb
     """回滚：把历史快照写回 policy.yaml（同样走 Pydantic 校验 + 原子落盘 + 现状再快照，可反悔）。"""
     doc = yaml.safe_load(yaml_text)
     if not isinstance(doc, dict) or not isinstance(doc.get("policies"), list):
-        raise ValueError("invalid policy yaml (no policies list)")
+        raise ValueError("policy.yaml 不合法：缺少 policies 列表")
     _write_doc(doc, operator=operator, source=source)
     return len(doc["policies"])
+
+
+_FIELD_ZH = {"action": "动作", "description": "描述", "when": "条件", "target": "定向"}
+
+
+def _rules_map(yaml_text: str) -> dict:
+    """policy.yaml 文本 → {规则名: 规则 dict}；结构不合法 raise。"""
+    doc = yaml.safe_load(yaml_text or "") or {}
+    if not isinstance(doc, dict) or not isinstance(doc.get("policies"), list):
+        raise ValueError("policy.yaml 不合法：缺少 policies 列表")
+    out = {}
+    for p in doc["policies"]:
+        if isinstance(p, dict) and p.get("name"):
+            out[p["name"]] = p
+    return out
+
+
+def diff_policy_texts(old_text: str, new_text: str) -> list:
+    """两份 policy.yaml 快照按规则名对比，返回中文变更摘要（空列表 = 无变化）。
+
+    历史版本展示用：每版快照的「变更」= 与下一更新状态（最新版则与现网文件）的差。
+    """
+    try:
+        old, new = _rules_map(old_text), _rules_map(new_text)
+    except Exception:
+        return ["无法解析，无法对比"]
+    changes = []
+    for name in new:
+        if name not in old:
+            changes.append(f"新增「{name}」")
+    for name in old:
+        if name not in new:
+            changes.append(f"删除「{name}」")
+    for name, p in old.items():
+        q = new.get(name)
+        if q is None:
+            continue
+        if p.get("priority") != q.get("priority"):
+            changes.append(f"「{name}」优先级 {p.get('priority')}→{q.get('priority')}")
+        others = [k for k in set(p) | set(q)
+                  if k not in ("name", "priority") and p.get(k) != q.get(k)]
+        if others:
+            changes.append(f"「{name}」改: " + "、".join(_FIELD_ZH.get(k, k) for k in sorted(others)))
+    return changes
 
 
 def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None,
@@ -236,11 +284,11 @@ def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None,
     policies: List[Dict[str, Any]] = data.get("policies", []) if isinstance(data, dict) else []
     name = str(rule.get("name", "")).strip()
     if not name:
-        raise ValueError("rule name is required")
+        raise ValueError("规则名称不能为空")
     # 唯一性：新建时禁止重名；更新同名规则放行；重命名时目标名不得已存在
     for p in policies:
         if p.get("name") == name and name != (original_name or ""):
-            raise ValueError(f"rule name already exists: {name}")
+            raise ValueError(f"规则名已存在：{name}")
     if original_name:
         policies = [p for p in policies if p.get("name") != original_name]
     policies = [p for p in policies if p.get("name") != name] + [rule]
@@ -250,6 +298,10 @@ def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None,
 
 
 def delete_policy(name: str, operator: str = "") -> bool:
+    # 前端 RulesPage 已隐藏「default_allow」的删除按钮，后端同样拒（此前只有前端挡，
+    # 直接打 API 能删掉兜底规则 → 审计/干跑再没有可归因的default_allow）
+    if name == "default_allow":
+        raise ValueError("default_allow是兜底规则，不可删除")
     data = yaml.safe_load(_policy_path().read_text(encoding="utf-8")) or {}
     policies: List[Dict[str, Any]] = data.get("policies", []) if isinstance(data, dict) else []
     kept = [p for p in policies if p.get("name") != name]
@@ -290,10 +342,10 @@ def build_when(content_type: str, match_type: str, match_value: Any) -> Dict[str
         return {"all" if a < b else "any": lo_hi}
     field = CONTENT_TYPE_FIELD.get(content_type)
     if not field:
-        raise ValueError(f"unknown content_type: {content_type}")
+        raise ValueError(f"未知 content_type：{content_type}")
     op = MATCH_TYPE_OP.get(match_type)
     if not op:
-        raise ValueError(f"unknown match_type: {match_type}")
+        raise ValueError(f"未知 match_type：{match_type}")
     if op == "matches_regex":
         # 预编译校验正则合法性
         re.compile(str(match_value))
@@ -301,11 +353,11 @@ def build_when(content_type: str, match_type: str, match_value: Any) -> Dict[str
     if op in ("contains_any", "in", "not_in"):
         vals = match_value if isinstance(match_value, list) else [x.strip() for x in str(match_value).split(",") if x.strip()]
         if not vals:
-            raise ValueError(f"{op} needs at least one value")
+            raise ValueError(f"{op} 至少需要一个值")
         return {f"{field} {op}": vals}
     if op == "==":  # bool 开关：非真值串一律 False
         return {f"{field} ==": str(match_value).strip().lower() in _TRUTHY}
-    raise ValueError(f"unsupported match_type: {match_type}")
+    raise ValueError(f"不支持的 match_type：{match_type}")
 
 
 def build_when_group(combiner: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -367,7 +419,7 @@ def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = ""
     }
     hit = decide(load_policy(_policy_path()), ctx)
     return {
-        "matched": hit.get("name") != "默认放行" or hit.get("action") != "allow",
+        "matched": hit.get("name") != "default_allow" or hit.get("action") != "allow",
         "rule": hit.get("name"),
         "action": hit.get("action"),
         "target": hit.get("target"),

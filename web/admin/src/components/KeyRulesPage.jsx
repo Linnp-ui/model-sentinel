@@ -14,7 +14,7 @@ const sevColor = { high: 'red', warn: 'orange', info: 'blue' };
 const APPLY_UI = {
   black: { label: '一键拉黑', danger: true, confirm: (s) => `确认拉黑 ${s.key_name || s.ip || ''}？` },
   white: { label: '一键加白', danger: false, confirm: (s) => `确认将 ${s.key_name || ''} 加入白名单（跳 L2，保留 L1+抽样）？` },
-  unwhite: { label: '撤销白名单', danger: false, confirm: () => '确认撤销该白名单规则？' },
+  unwhite: { label: '撤销白名单', danger: false, confirm: () => '确认撤销该白名单规则？（仅「策略建议」来源可撤销，手工规则请到列表移除）' },
   reorder: { label: '一键重排优先级', danger: false, confirm: () => '确认按触发次数重排 L1 规则优先级（一次排到底）？' },
   remove_rule: { label: '一键删除规则', danger: true, confirm: (s) => `确认删除规则 ${s.apply.rule_name || ''}？（policy.yaml 已入库可回滚）` },
   add_limit: { label: '一键加限流', danger: false, confirm: (s) => `确认给 ${s.apply.limit_model || ''} 加全局限流 ${s.apply.limit_rpm}/分钟？` },
@@ -118,7 +118,7 @@ function SuggestThresholdsModal({ open, onClose, onSaved, focusType }) {
   };
   // 阈值行：左边标题 + 它驱动的建议类型（与卡片上的条目同名，便于对号入座），右边输入框
   const rowShell = (label, tag, right) => (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 'var(--gw-sp-4)' }}>
       <Space size={6} style={{ minWidth: 0 }}>
         <Text style={{ whiteSpace: 'nowrap' }}>{label}：</Text>
         {tag && <Tag color="blue" style={{ marginInlineEnd: 0 }}>{tag}</Tag>}
@@ -151,7 +151,7 @@ function SuggestThresholdsModal({ open, onClose, onSaved, focusType }) {
     { key: 'tier', label: 'KEY 分级', hint: '规则 0 生效于 KEY 分级观察窗口（下面可改）；次数类按分级窗口换算。' },
     { key: 'rules', label: '规则维护', hint: '规则 4/5/6 生效于本组窗口（0 = 跟随 KEY 分级窗口）。' },
     { key: 'limit', label: '限流建议', hint: '规则 7：两个条件同时满足才建议加限流（0 = 该条件不参与判断）；与窗口长度无关，不换算。' },
-    { key: 'runtime', label: '运行态 & 条数', hint: '规则 8~11 系统健康（0 = 关闭该规则）+ 建议条数上限。' },
+    { key: 'runtime', label: '运行态 & 条数', hint: '规则 8~10 系统健康（0 = 关闭该规则）+ 规则 11 熔断（无阈值）+ 建议条数上限。' },
   ];
   const rowsOf = (key) => ({
     violation: [
@@ -193,17 +193,17 @@ function SuggestThresholdsModal({ open, onClose, onSaved, focusType }) {
     <Modal title={<Space size={10}>调节建议阈值
       {/* 口径说明不常驻：挂在「口径说明」文字+问号上，悬停才看 */}
       <Popover placement="bottomLeft" title="阈值口径说明" content={
-        <div style={{ maxWidth: 400, fontSize: 12, lineHeight: 1.7 }}>
+        <div style={{ maxWidth: 400, fontSize: 'var(--gw-fs-12)', lineHeight: 1.7 }}>
           <div>次数类阈值只填一个基准值（24 小时窗口口径），系统按<b>该规则实际生效的窗口</b>自动换算
             ——窗口越长累计越多，阈值等比放大。</div>
-          <div style={{ marginTop: 6 }}>比率/速率类（错误率、异常处置率、限流的累计调用数与峰值分钟）
+          <div style={{ marginTop: 'var(--gw-sp-6)' }}>比率/速率类（错误率、异常处置率、限流的累计调用数与峰值分钟）
             与窗口长度无关，不放大。</div>
-          <div style={{ marginTop: 6 }}>两个拉黑口径是两条独立规则，不是同一件事：窗口型「异常处置拉黑」
-            只看面板窗口内的异常处置次数（抓突发）；「分级拉黑」看 30 天窗口的调用数/次数/率三项同时满足
+          <div style={{ marginTop: 'var(--gw-sp-6)' }}>两个拉黑口径是两条独立规则，不是同一件事：窗口型「异常处置拉黑」
+            只看面板窗口内的异常处置次数（抓突发）；「分级拉黑」看分级观察窗口（默认 30 天）的调用数/次数/率三项同时满足
             （抓长期高异常率）。同一个 KEY 只出一条拉黑建议（分级优先，窗口型让位）。</div>
         </div>
       }>
-        <span style={{ cursor: 'help', fontSize: 12, color: 'rgba(0,0,0,0.45)', whiteSpace: 'nowrap' }}>
+        <span style={{ cursor: 'help', fontSize: 'var(--gw-fs-12)', color: 'rgba(0,0,0,0.45)', whiteSpace: 'nowrap' }}>
           口径说明 <QuestionCircleOutlined />
         </span>
       </Popover>
@@ -215,7 +215,7 @@ function SuggestThresholdsModal({ open, onClose, onSaved, focusType }) {
           key: g.key, label: g.label,
           children: (
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
-              <Text type="secondary" style={{ fontSize: 12 }}>{g.hint}</Text>
+              <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{g.hint}</Text>
               {rowsOf(g.key)}
             </Space>
           ),
@@ -228,6 +228,7 @@ export function SuggestionCard({ onApplied }) {
   const [hours, setHours] = useState(168);
   const [loading, setLoading] = useState(false);
   const [sug, setSug] = useState([]);
+  const [sugErr, setSugErr] = useState('');
   const [sugMeta, setSugMeta] = useState(null);
   const [thOpen, setThOpen] = useState(false);
   const [thFocus, setThFocus] = useState(null);
@@ -242,8 +243,11 @@ export function SuggestionCard({ onApplied }) {
     try {
       const s = await api(`/suggestions?hours=${h}`);
       if (h !== hoursRef.current) return; // 切窗后旧窗请求落地 → 丢弃
-      setSug(s.items || []); setSugMeta(s.meta || null);
-    } catch (e) { if (!silent && h === hoursRef.current) message.error(errText(e)); }
+      setSug(s.items || []); setSugMeta(s.meta || null); setSugErr('');
+    } catch (e) {
+      if (h === hoursRef.current) setSugErr(errText(e));
+      if (!silent && h === hoursRef.current) message.error(errText(e));
+    }
     // 摘遮罩双守卫：seq 防同窗双击刷新互拆；hoursRef 防切窗后、新 load 启动前
     // 旧窗请求先落地把刚接上的遮罩拆掉
     finally { if (!silent && seq === seqRef.current && h === hoursRef.current) setLoading(false); }
@@ -267,15 +271,18 @@ export function SuggestionCard({ onApplied }) {
       </Space>}>
       <Spin spinning={loading}>
       {sug.length === 0
-        ? <Alert type="success" showIcon
-            message="当前无建议：各指标均在阈值内"
+        ? (sugErr
+          ? <Alert type="warning" showIcon
+              message={`建议加载失败：${sugErr}（30s 轮询会自动重拉）`} />
+          : <Alert type="success" showIcon
+            message="当前无建议：已启用规则均未触发"
             description={sugMeta
               ? <Space direction="vertical" size={4}>
                   <span>{`触发口径 ${sugMeta.trigger}；KEY 分级窗口 ${Math.round(sugMeta.key_tier_window_hours / 24)} 天，规则 1/2/3 窗口 ${sugMeta.window_hours} 小时。`}</span>
                   <Button size="small" icon={<SlidersOutlined />}
                     onClick={() => { setThFocus(null); setThOpen(true); }}>查看/调整阈值</Button>
                 </Space>
-              : null} />
+              : null} />)
         : <List
             size="small"
             dataSource={sug}

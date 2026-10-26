@@ -3,37 +3,38 @@
 > 内网统一出口：你的请求先过内容审查，再发往外网大模型或内网本地模型。
 > 一句话承诺：**凡是判为机密的内容，不出境**——由内网本地模型回答，或直接拦截。
 
-网关地址（找管理员确认）：`http://<网关IP>:8080`
-
 ---
 
 ## 1. 快速开始
 
-### 1.1 获取 key
+### 1.1 安装 HTTPS 证书
 
-key 由管理员登记发放（未登记的 key 直接 401，连本地模型也调不了）。key 只能走公司额度，
+网关用**内网自签 CA** 发证书。把 CA 装进本机信任库一次后：浏览器不再提示「不安全」，
+curl/SDK 的 TLS 校验也能正常通过。不装也能调（`curl -k`），但别长期使用不安全模式。
+
+**下载证书**：
+
+```bash
+# 浏览器打开（首次会提示不安全，「高级 → 继续前往」即可下载）
+https://10.0.0.10:8080/ca.crt
+```
+
+**安装**：
+
+| 平台 | 装法 |
+|---|---|
+| Windows | 双击 `.crt` → 安装证书 → 当前用户 → 受信任的根证书颁发机构；或 PowerShell `certutil -user -addstore Root gateway-internal-ca.crt`。**装完重启浏览器** |
+| macOS | 双击 → 钥匙串访问 → 系统 → 找到 `Gateway Internal CA` → 信任 → 始终信任 |
+| Linux | `sudo cp gateway-internal-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates` |
+| Firefox | 不走系统证书库：设置 → 隐私与安全 → 证书 → 查看证书 → 导入，勾「信任此 CA 以标识网站」 |
+| 命令行客户端 | `curl --cacert gateway-internal-ca.crt`；Python `REQUESTS_CA_BUNDLE=`、Node `NODE_EXTRA_CA_CERTS=`、Go `SSL_CERT_FILE=` 指向该文件即可 |
+
+### 1.2 获取 key
+
+key 由管理员登记发放（未登记的 key 直接 401，连本地模型也调不了）。登记用的就是
+**公司原本分发的 DeepSeek API key**（你直连 DeepSeek 时用的那个 `sk-...`），找管理员
+登记即可；**没有 DeepSeek key 的，向管理员（张鹏）申请**。key 只能走公司额度，
 不要写进公开仓库、不要发给外部人员。
-
-### 1.2 第一次调用（OpenAI 协议）
-
-```bash
-curl http://<网关IP>:8080/v1/chat/completions \
-  -H "Authorization: Bearer <你的key>" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "<别名，如 AB-flash>",
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-```
-
-### 1.3 查看可用模型
-
-```bash
-curl http://<网关IP>:8080/v1/models -H "Authorization: Bearer <你的key>"
-```
-
-返回的 `id` 列表就是你能填进 `"model"` 的全部值，**以这个接口为准**，别信文档里写的旧名字。
-其中对外别名（如 `AB-flash`）会自动选最优供应商；内网模型可直连点名。
 
 ---
 
@@ -41,72 +42,30 @@ curl http://<网关IP>:8080/v1/models -H "Authorization: Bearer <你的key>"
 
 - 两种带 key 方式都认：`Authorization: Bearer <key>` 或 `x-api-key: <key>`。
 - `/v1/` 下所有接口都必须带 key。
-- **不要**自己带 `X-Upstream-Api-Key`（网关统一用公司额度，自带会直接 400）。
 
 | 现象 | 含义 | 怎么办 |
 |---|---|---|
 | 401 | 无 key / 未登记的 key | 检查 key 是否填对，找管理员登记 |
 | 403 黑名单 | key 被拉黑 | 找管理员 |
-| 403 policy_violation | 内容被安全策略拦截（见第 4 节） | 改内容重发，不要反复重试同样内容 |
+| 403 policy_violation | 内容被安全策略拦截 | 改内容重发，不要反复重试同样内容 |
 | 429 + `Retry-After` | 触发限流 | 按 `Retry-After` 秒数退避重试 |
 | 503 | 网关侧无可用 key/模型 | 稍后重试，不行找管理员 |
 
----
+**怎么读返回体**（一眼判断发生了什么）：
 
-## 3. 支持的协议
-
-与原生协议兼容，把 base_url 指到网关即可：
-
-| 用途 | 接口 | 说明 |
-|---|---|---|
-| 对话/生成 | `POST /v1/chat/completions` | OpenAI 协议，支持流式（`stream:true`） |
-| 向量 | `POST /v1/embeddings` | 与 chat 同一审查链（L1 + L2 灰区），机密内容自动转内网 embedding 模型 |
-| Anthropic 客户端 | `POST /v1/messages`（+ `count_tokens`） | 协议自动转换 |
-| Codex 类客户端 | `POST /v1/responses` | 附件走文件名/表头审查 |
-| 文件预检 | `POST /v1/files/check` | 先查文件能不能发，再决定调不调用 |
-| 自助注册模型 | `POST /v1/models/register` | 注册外网模型走网关（域名须在白名单内） |
-
-图片直传（`image_url` 内联图）会走 OCR 识别后再审查，含敏感信息的图同样会被转本地或拦截。
+- **成功（200）**：顶层 `model` = 实际回答你的模型（不是别名）；`gateway.action`（`allow`=放行 / `route_local`=转本地）+ `gateway.local`（`true`=内网模型回答，内容未出境）+ `gateway.policy_rule`（命中哪条规则）就是全部关键信息。
+- **失败（4xx/5xx）**：看 `detail.type`（如 `rate_limited` / `key_blocked` / `provider_not_configured`）+ `detail.message` 中文说明；429 另有 `Retry-After` 头。
+- **两个例外**：401 的 `detail` 是纯文案（没有 type）；黑名单 403 同时带 `error` 字段（OpenAI SDK 兼容，读哪个都一样）。
 
 ---
 
-## 4. 内容审查：你的内容会怎样
-
-每次请求先过两层审查，毫秒级，无感：
-
-1. **L1 规则**（1–3ms）：身份证、手机号、银行卡、密钥、密钥字样等命中即处理。
-2. **L2 小模型**（仅可疑内容触发，约 +230ms）：语义判定是否为机密。
-
-三种结局：
-
-| 结局 | 你看到的 | 含义 |
-|---|---|---|
-| 放行 | 外网大模型正常回答 | 内容安全 |
-| 本地回答 | 状态 200，但回答来自内网本地模型 | 内容涉密，**未出境**；回答质量可能低于外网大模型，属正常 |
-| 拦截 | 403 `policy_violation` | 命中拦截规则（如密钥明文、极敏感信息），未转发 |
-
-注意：
-
-- 同一会话建议带 `X-Session-ID` 请求头（一串你自己生成的固定 ID）：会话内一旦出现过涉密内容，
-  同会话后续请求会延续走本地，防止上下文拼凑泄密。
-- 附件（PDF/Excel/Word/图片）会解析全文审查；超大文件（>20MB）或纯扫描件可能降级处理。
-- 反复用不同问法试探同一份涉密内容没有意义，结论一致；确需外发走审批线下流程。
-
----
-
-## 5. FAQ
+## 3. FAQ
 
 **Q：回答怎么突然变“笨”了？**
 A：被转到本地模型了（内容涉密）。换不涉密的问法，或确认该内容是否真有必要外发。
 
 **Q：403 policy_violation 里的 rule 名是什么意思？**
 A：命中的规则名，方便定位是哪类内容触发。规则名对不上业务？找管理员核对。
-
-**Q：请求变慢了（多出几百毫秒）？**
-A：触发了 L2 语义审查，正常开销。秒级延迟一般是上游生成本身。
-
-**Q：key 突然 401？**
-A：key 被管理员注销/轮换了，重新申请。不要把 key 硬编码在多人共享的脚本里。
 
 **Q：文件传不上去？**
 A：先调 `/v1/files/check` 看结论；确认扩展名真实（网关按文件魔数识别，改后缀没用）。

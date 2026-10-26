@@ -40,7 +40,7 @@ export default function DailyHeatmap({ points, unit = '次', testid, fill = fals
   return (
     // fill：占满卡片剩余高度（30d 窗下热力图只有两行，卡片下半空着）——行高跟着拉满
     <div data-testid={testid} style={{
-      display: 'grid', gridTemplateColumns: columns, gap: 8,
+      display: 'grid', gridTemplateColumns: columns, gap: 'var(--gw-sp-8)',
       ...(fill ? { flex: 1, minHeight: 0, gridAutoRows: 'minmax(0, 1fr)' } : {}),
     }}>
       {points.map((p) => {
@@ -52,7 +52,7 @@ export default function DailyHeatmap({ points, unit = '次', testid, fill = fals
         return (
           <div key={p.day} title={`${p.day}：${p.v} ${unit}`}
             style={{ background: p.v > 0 ? `rgba(22,119,255,${alpha.toFixed(3)})` : 'var(--gw-track)',
-              borderRadius: 4, padding: '8px 4px', textAlign: 'center', color: fg,
+              borderRadius: 4, padding: 'var(--gw-sp-8) var(--gw-sp-4)', textAlign: 'center', color: fg,
               // 格子自身是查询容器 ⇒ 下面字号用 cqw 跟着格子宽度走：
               // 格子大了不再显得字太小，格子小了不溢出（固定 px 做不到）
               containerType: 'inline-size',

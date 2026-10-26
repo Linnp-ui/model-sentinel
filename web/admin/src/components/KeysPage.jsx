@@ -126,7 +126,7 @@ export default function KeysPage() {
           </Form.Item>
           <Form.Item name="owner" label="归属团队"><Input id="key-owner" /></Form.Item>
           <Form.Item name="note" label="备注"><Input.TextArea id="key-note" rows={2} /></Form.Item>
-          <Form.Item name="weekly_cost_cap" label={<>{'每周费用上限（元，0=不限）'}<Tip text="按这个 KEY 的 token 用量折算的内部费用；超过上限会进建议卡（不是自动断）。" /></>}><Input id="key-cost-cap" type="number" min={0} style={{ width: '100%' }} /></Form.Item>
+          <Form.Item name="weekly_cost_cap" label={<>{'近 7 天费用上限（元，0=不限）'}<Tip text="按这个 KEY 近 7 天 token 用量折算的内部费用；达到上限后请求直接 429 拒绝（不是提示）。" /></>}><Input id="key-cost-cap" type="number" min={0} style={{ width: '100%' }} /></Form.Item>
         </Form>
       </Modal>
       <Modal title="生成 API KEY" open={genOpen}
@@ -141,9 +141,9 @@ export default function KeysPage() {
           <Form.Item name="note" label="备注"><Input.TextArea id="gen-note" rows={2} placeholder="选填" /></Form.Item>
         </Form>
         {genResult && (
-          <div style={{ marginTop: 12 }}>
+          <div style={{ marginTop: 'var(--gw-sp-12)' }}>
             <Alert type="warning" showIcon message="KEY 明文只在此处显示一次，请立即保存。" />
-            <Space style={{ marginTop: 8, display: 'flex', flexDirection: 'column' }}>
+            <Space style={{ marginTop: 'var(--gw-sp-8)', display: 'flex', flexDirection: 'column' }}>
               <Text code style={{ wordBreak: 'break-all' }}>{genResult.key_plain}</Text>
               <Button
                 icon={<CopyOutlined />}
@@ -164,15 +164,15 @@ export default function KeysPage() {
         onOk={doImport} okText="开始导入" confirmLoading={impBusy}
         onCancel={() => { setImpOpen(false); setImpText(''); setImpResult(null); }}
         destroyOnClose>
-        <Alert type="info" showIcon style={{ whiteSpace: 'pre-wrap', marginBottom: 12 }}
+        <Alert type="info" showIcon style={{ whiteSpace: 'pre-wrap', marginBottom: 'var(--gw-sp-12)' }}
           message={<div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.8 }}>{IMPORT_HINT}</div>} />
         <Input.TextArea id="imp-text" rows={9} value={impText} onChange={(e) => setImpText(e.target.value)}
           placeholder={'张三,sk-abcdefghijklmnop\n李四,sk-zyxwvutsrqponmlk\n# 下面是只写 key 的写法\nsk-0011223344556677'} />
         {impResult && (
-          <div style={{ marginTop: 12 }}>
+          <div style={{ marginTop: 'var(--gw-sp-12)' }}>
             <Alert type={impResult.added ? 'success' : 'warning'} showIcon
               message={`共 ${impResult.results.length} 行，新增 ${impResult.added} 条（KEY 明文不会回显，只回掩码）`} />
-            <Table size="small" style={{ marginTop: 8 }} rowKey="line" pagination={false}
+            <Table size="small" style={{ marginTop: 'var(--gw-sp-8)' }} rowKey="line" pagination={false}
               tableLayout="fixed" dataSource={impResult.results}
               columns={[
                 { title: '行号', dataIndex: 'line', width: '10%' },

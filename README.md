@@ -36,6 +36,15 @@
 
 - **文件维度预检**：xlsx 表名/表头/内容、PDF 文本层/水印、docx、图片 OCR（tesseract/paddle，
   缺引擎 fail-closed 转本地，绝不静默放行）；扩展名不可信，按 magic bytes 嗅探
+- **对外模型名 `Auto-AB` / `local-model`**：`/v1/models` 只暴露这两个可发现的对话模型
+  （`AI_GATEWAY_PUBLIC_MODELS` 白名单只收窄**可发现性**，不影响点名调用）；`Auto-AB` 是
+  别名组，按本轮任务复杂度（1 轻 / 2 中 / 3 重）由 L2 小模型选头，会话级档位粘性只升不降；
+  `local-model` 单候选直连本地（内容不出境）
+- **L2 常开语义复核**：`AI_GATEWAY_L2_ALWAYS=true` 时所有 L1 放行请求都送 L2——risk=0 的
+  语义泄密 L1 完全打不中（实测回放 120 条 risk=0 放行文本，4 条被 L2 判密），代价 +~230ms/请求
+- **错误返回体统一**：成功看顶层 `model`（实际模型）+ `gateway.action/local/policy_rule`；
+  失败看 `detail.type`（`key_blocked` / `rate_limited` / `quota_exceeded` / `model_not_chat` …），
+  401 区分「缺 API key」与「key 未登记/无效」，黑名单 403 同时带 `detail` 与 `error`（SDK 兼容）
 - **L2 双后端 + 影子双跑**：`AI_GATEWAY_L2_BACKEND=qwen|laya`；影子期主后端权威、
   laya 同流量并行打标，数据达标后一键切换；L2 提示词可管理台热改
 - **L2 一键重训管道**：审计人工标注 ≥10 条 → `POST /admin/api/l2/retrain`
@@ -135,11 +144,11 @@ docker-compose.yml / Dockerfile
 | priority | 规则 | 行为 |
 |---|---|---|
 | 3 | block_secrets | AKIA/PEM私钥/ghp_/sk-ant/sk-32hex/aws_secret -> block（压过全部 route_local；`on_block: fallback_local` 时降本地） |
-| 5 | pii_weighted_route_local | PII 加权评分 >= 60 -> 本地 |
+| 5 | tainted_file_ref | 正文提及已判密文件名 -> 本地 |
 | 10 | financial_local_only | 表头/表名/文件名财务关键词 -> 本地 |
 | 12 | session_route_local | 会话已判密 -> 本地 |
 | 13 | unparsed_binary_route_local | 解析不出的二进制 -> 本地（fail-closed） |
-| 20 | tainted_file_ref | 提及已判密文件名 -> 本地 |
+| 20 | pii_weighted_route_local | PII 加权评分 >= 60 -> 本地 |
 | 30 | ocr_empty_image_route_local | OCR 空结果图片 -> 本地（fail-closed） |
 | 40 | drawing_local_only | 扩展名/水印/内容含"机密/图纸" -> 本地 |
 | 100 | default_allow | 放行外网 |

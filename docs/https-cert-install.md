@@ -3,6 +3,11 @@
 网关已切到 HTTPS（端口 8080）。浏览器首次访问会提示"不安全/证书不受信任"，
 是因为网关使用**内网自签 CA**，需要把 CA 装进本机信任库一次即可。
 
+> **管理台里也有这份说明**：控制台「系统 → 证书安装」页（`web/admin/src/components/CertGuidePage.jsx`）
+> 是这份文档的网页版：各平台步骤相同，页面多一个「直接下载 CA 证书」按钮并自动填好
+> 本机真实地址（不用手填 IP）；下面「一键下载 CA」一节只有文档有。控制台要管理员密码
+> （证书下载本身 `/ca.crt` 免登录）。改文档的步骤时顺手改那个页面。
+
 ## 一键下载 CA
 
 浏览器打开（会先弹"不安全"，点"高级 → 继续前往"即可下载）：
@@ -48,7 +53,7 @@ sudo update-ca-certificates
 
 ## 命令行客户端
 
-- curl：`curl --cacert gateway-internal-ca.crt https://<网关IP>:8080/...`
+- curl：`curl --cacert gateway-internal-ca.crt https://<网关IP>:8080/health`（`--cacert` 仅未装 CA 时需要；`/health` 免 key）
 - Python/requests：`REQUESTS_CA_BUNDLE=gateway-internal-ca.crt`
 - Node：`NODE_EXTRA_CA_CERTS=gateway-internal-ca.crt`
 - Go (codex/reqwest)：`SSL_CERT_FILE=gateway-internal-ca.crt`

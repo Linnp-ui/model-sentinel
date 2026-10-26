@@ -23,6 +23,8 @@ export const RULE_ZH = {
   block_secrets: '拦截密钥',
   session_route_local: '会话机密转内网',
   tainted_file_ref: '文件名转内网',
+  unparsed_binary_route_local: '未解析二进制转内网',
+  ocr_empty_image_route_local: '空图转内网',
   '未解析二进制转内网': '二进制转内网',
   '文件名污染转内网': '文件名转内网',
   empty_image: '空图转内网',
@@ -66,7 +68,7 @@ export function SystemBuiltinMark() {
   return (
     <Tooltip title={SYSTEM_RULE_HINT}>
       <InfoCircleOutlined aria-label="系统内置判定" data-testid="system-builtin-mark"
-        style={{ color: 'var(--gw-muted)', fontSize: 12, marginInlineStart: 4 }} />
+        style={{ color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)', marginInlineStart: 'var(--gw-sp-4)' }} />
     </Tooltip>
   );
 }
@@ -85,8 +87,8 @@ export function RuleZh({ name, fallback = '—' }) {
 // 图例：把「标记代表什么」写在明处（光看 ⓘ 不知道含义）
 export function SystemBuiltinLegend() {
   return (
-    <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-      <InfoCircleOutlined style={{ marginInlineEnd: 4 }} />
+    <Typography.Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)', display: 'block', marginTop: 'var(--gw-sp-8)' }}>
+      <InfoCircleOutlined style={{ marginInlineEnd: 'var(--gw-sp-4)' }} />
       ⓘ 系统内置判定：网关自己的 fail-safe / 降级 / L2 结论，不是可配置的规则（规则管理页里没有它）
     </Typography.Text>
   );

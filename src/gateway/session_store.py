@@ -28,6 +28,13 @@ except ImportError:
 DEFAULT_TTL_SECONDS = int(os.getenv("AI_GATEWAY_SESSION_TTL", "1800"))  # 30 min
 KEY_PREFIX = "gateway:session:"
 TAINT_PREFIX = "gateway:taint:"
+STICKY_PREFIX = "gateway:stickytier:"
+# 粘性档位键的 Redis TTL：调用方窗口（env）+ 余量；过期即惰性失效，不依赖它判窗口
+_STICKY_KEY_TTL = 90 * 60
+
+
+def now_ok(ts: int, window_s: int) -> bool:
+    return ts > 0 and time.time() - ts <= window_s
 
 
 def _taint_key(key_id: str, filename: str) -> Optional[str]:
@@ -226,6 +233,65 @@ class SessionStore:
         if self._r_disabled:
             return "memory (redis disabled)"
         return "memory (no REDIS_URL)"
+
+    # ---- 复杂度路由档位粘性（2026-10-26，见 intent_router._apply_sticky）----
+    # 独立 Redis 键：不能挂 gateway:session:<sid> —— mark_confidential 整份覆盖写，
+    # 会把档位冲掉。窗口 = 距上次使用（每次使用刷新），由调用方按 env 判，这里只管存取。
+
+    def mark_sticky_tier(self, sid: str, tier: int) -> None:
+        """记会话已达档位（只升不降：与已有值取 max，时间戳刷新 = 窗口随使用重置）。"""
+        try:
+            tier = int(tier)
+        except (TypeError, ValueError):
+            return
+        sid = _normalize_session_id(sid)
+        if not sid or tier not in (1, 2, 3):
+            return
+        now = int(time.time())
+        try:
+            if self._r is not None:
+                key = f"{STICKY_PREFIX}{sid}"
+                try:
+                    raw = self._r.get(key)
+                    prev = json.loads(raw).get("tier", 0) if raw else 0
+                except Exception:
+                    prev = 0
+                self._r.set(key, json.dumps({"tier": max(tier, prev), "ts": now}),
+                            ex=_STICKY_KEY_TTL)
+                return
+        except Exception:
+            self._r = None
+            self._r_disabled = True
+        with self._mem_lock:
+            d = self._mem.setdefault("__sticky_tier__", {})
+            prev = d.get(sid) or {}
+            d[sid] = {"tier": max(tier, int(prev.get("tier") or 0)), "ts": now}
+
+    def get_sticky_tier(self, sid: Optional[str], window_s: int):
+        """窗口内（window_s 秒，相对上次使用）返回 (tier, ts)；关（<=0）/无/过期 ⇒ None。"""
+        if window_s <= 0:
+            return None
+        sid = _normalize_session_id(sid)
+        if not sid:
+            return None
+        if self._r is not None:
+            try:
+                raw = self._r.get(f"{STICKY_PREFIX}{sid}")
+                if raw:
+                    d = json.loads(raw)
+                    if now_ok(d.get("ts", 0), window_s):
+                        return (int(d.get("tier") or 0), int(d.get("ts") or 0))
+                return None
+            except Exception:
+                self._r = None
+                self._r_disabled = True
+        with self._mem_lock:
+            d = (self._mem.get("__sticky_tier__") or {}).get(sid)
+            if not d or not now_ok(d.get("ts", 0), window_s):
+                if d:
+                    (self._mem.get("__sticky_tier__") or {}).pop(sid, None)
+                return None
+            return (int(d.get("tier") or 0), int(d.get("ts") or 0))
 
 
 _store: Optional[SessionStore] = None

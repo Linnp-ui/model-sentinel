@@ -27,6 +27,8 @@ RULE_ZH = {
     "block_secrets": "拦截密钥",
     "session_route_local": "会话机密转内网",
     "tainted_file_ref": "文件名转内网",
+    "unparsed_binary_route_local": "未解析二进制转内网",
+    "ocr_empty_image_route_local": "空图转内网",
     "未解析二进制转内网": "二进制转内网",
     "文件名污染转内网": "文件名转内网",
     "empty_image": "空图转内网",

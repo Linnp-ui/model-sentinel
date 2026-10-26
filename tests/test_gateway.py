@@ -585,6 +585,28 @@ def test_public_models_excludes_non_chat_internal():
     assert "laya-multilingual" not in ids, ids
 
 
+def test_public_models_allowlist(monkeypatch):
+    # 对外只展示一个模型：白名单只收窄「可发现性」，不影响可路由性。
+    # 空值必须回到旧行为（全量），否则本次改动会静默砍掉线上客户端的模型列表。
+    from src.gateway.admin_api import build_public_models
+    full = [m["id"] for m in build_public_models()]
+    assert len(full) >= 2, full
+    monkeypatch.setenv("AI_GATEWAY_PUBLIC_MODELS", f" {full[0]} , {full[0]} ")
+    assert [m["id"] for m in build_public_models()] == [full[0]]
+    monkeypatch.setenv("AI_GATEWAY_PUBLIC_MODELS", "")
+    assert [m["id"] for m in build_public_models()] == full
+
+
+def test_public_models_allowlist_no_match_warns(monkeypatch, caplog):
+    # 白名单名字写错/模型已改名 ⇒ /v1/models 静默空列表，必须留痕（否则只等客户端投诉）
+    import logging
+    from src.gateway.admin_api import build_public_models
+    monkeypatch.setenv("AI_GATEWAY_PUBLIC_MODELS", "definitely-not-a-model")
+    with caplog.at_level(logging.WARNING, logger="gateway"):
+        assert build_public_models() == []
+    assert any("匹配不到任何模型" in r.message for r in caplog.records), caplog.text
+
+
 def test_rate_limit_rps_enforced_alongside_rpm(monkeypatch):
     # 2026-10-21 修：此前 rpm>0 时 rps 分支不可达 ⇒ AI_GATEWAY_RATE_LIMIT_RPS 是死配置
     # （实测 20 并发全 200、无 429）。现在两个桶都要过。
@@ -601,6 +623,32 @@ def test_rate_limit_rps_enforced_alongside_rpm(monkeypatch):
         assert retry >= 1
     finally:
         get_limiter().reset()
+
+
+def test_weekly_cost_cap_enforced_when_rate_limiter_off(monkeypatch):
+    # 费用上限是配额不是限流：必须覆盖全部 /v1/* 入口、限流关闭（RPM/RPS=0）时
+    # 仍生效。2026-10-23 修：此前检查在 _make_rate_limit_dep 内、rpm<=0 提前
+    # return 之后 ⇒ 限流一关配额静默失效；且 /v1/{path} 兜底代理没有限流 dep。
+    import src.gateway.stats_service as _ss
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    kid, _name, _via = store.find_key_entry(KEY)
+    monkeypatch.setenv("AI_GATEWAY_RATE_LIMIT_RPM", "0")
+    monkeypatch.setenv("AI_GATEWAY_RATE_LIMIT_RPS", "0")
+    monkeypatch.setattr(_ss, "key_weekly_cost", lambda s, k, ttl=60.0: 10.0)
+    try:
+        store.update_api_key(kid, weekly_cost_cap=5)
+        r1 = client.post("/v1/chat/completions", headers=H,
+                         json={"model": "deepseek/deepseek-chat",
+                               "messages": [{"role": "user", "content": "hi"}]})
+        assert r1.status_code == 429, r1.text
+        assert r1.json()["detail"]["type"] == "quota_exceeded"
+        # 兜底代理入口（无 _rate_limit_* dep）同样 429
+        r2 = client.post("/v1/moderations", headers=H, json={"input": "hi"})
+        assert r2.status_code == 429, r2.text
+        assert r2.json()["detail"]["type"] == "quota_exceeded"
+    finally:
+        store.update_api_key(kid, weekly_cost_cap=0)
 
 
 def test_cand_key_gates_per_candidate():
@@ -655,7 +703,39 @@ def test_classify_chunks_carries_shadow():
     assert out["shadow_label"] == "CONFIDENTIAL" and out["shadow_conf"] == 0.99
     assert out["shadow_probabilities"] == {"CONFIDENTIAL": 0.99, "NORMAL": 0.01}
 
-def test_idle_whitelist_suggests_revoke():
+def test_l2_cache_key_uses_full_text():
+    # 旧键取 text[:800]：两段前 800 字相同、结论不同的文本会互相命中缓存
+    # （实测第二段机密文本直接返回 NORMAL cached=True）⇒ 键必须覆盖全文
+    from src.gateway.small_model import _cache_key
+    prefix = "公" * 800
+    assert _cache_key(prefix + "工资表", "", [], []) != _cache_key(prefix + "天气", "", [], [])
+
+def test_l2_long_text_samples_tail_and_mid(monkeypatch):
+    # 旧 tail 只取 [chunk, 2*chunk)（第 1200~2400 字），3000 字之后的机密字段整段漏掉；
+    # long_text 必须均匀抽样到真正的尾段，且总块数 ≤ 5、不重复 last_user 首段
+    from src.gateway import main as _m
+    monkeypatch.setattr(_m, "_l2_scope_cfg", lambda: {
+        "scopes": ["last_user", "tool", "long_text"],
+        "chunk_chars": 1200, "budget_chars": 6000})
+    src = "HEADMARK" + "x" * 1992 + "MIDMARK" + "x" * 3980 + "TAILMARK"
+    payload = [{"role": "user", "content": src},
+               {"role": "tool", "content": "TOOLMARK"}]
+    blocks = _m._select_l2_scopes("chat", payload, src)
+    assert len(blocks) <= _m._L2_SCOPE_MAX_BLOCKS
+    joined = "\n".join(t for _, t in blocks)
+    assert "TAILMARK" in joined and "MIDMARK" in joined and "TOOLMARK" in joined
+    assert "HEADMARK" not in "".join(t for s, t in blocks if s == "long_text")
+
+def test_l2_long_text_only_covers_head(monkeypatch):
+    # 只勾 long_text（不勾 last_user）时首段不能被跳过，否则前 1200 字成盲区
+    from src.gateway import main as _m
+    monkeypatch.setattr(_m, "_l2_scope_cfg", lambda: {
+        "scopes": ["long_text"], "chunk_chars": 1200, "budget_chars": 6000})
+    src = "HEADMARK" + "x" * 1500
+    blocks = _m._select_l2_scopes("chat", [{"role": "user", "content": src}], src)
+    assert blocks and blocks[0][0] == "long_text" and "HEADMARK" in blocks[0][1]
+
+
     # 规则6：30天零调用的白名单建议撤销（unwhite 复用）；建白不久的靠 created_at 跳过
     import time as _time
     from src.gateway.admin_store import get_admin_store
@@ -692,6 +772,10 @@ def test_blacklist_block_keeps_key_identity():
                         json={"model": "vllm_local/qwen2.5:7b",
                               "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 403, r.text[:200]
+        body = r.json()
+        # 双写包装契约：detail 与其余错误统一（脚本读 detail），error 保 OpenAI SDK 兼容
+        assert body.get("detail", {}).get("type") == "key_blocked", body
+        assert body.get("error", {}).get("type") == "key_blocked", body
         groups = {g["label"]: g for g in store.stats_group("2000-01-01 00:00:00", "2099-01-01 00:00:00", "key_name")}
         assert groups[name]["blocked"] >= 1, groups
     finally:
@@ -710,6 +794,7 @@ def test_unregistered_key_401_not_logged_as_traffic():
                     json={"model": "vllm_local/qwen2.5:7b",
                           "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 401, r.text[:200]
+    assert "未登记" in r.text, "401 文案要区分「未登记」，别让用户猜"
     _time.sleep(0.2)  # 明细是 fire-and-forget（executor 线程），留一拍再看
     with store._mem_lock:
         assert not [x for x in store._logs if x.get("status_code") == 401]
@@ -1026,6 +1111,217 @@ def test_l2_gray_trigger_no_upper_bound_on_risk():
     assert f["weighted_pii_score"] >= 60
     assert decide(load_policy(), {"text": "x", "file": {}, "findings": f,
                                   "session": {}, "tainted_file": {}}).action == "route_local"
+
+def test_l2_always_switch(monkeypatch):
+    # L2 常开：risk=0 的语义泄密（L1 完全打不中）也要送审 —— 实测回放 120 条 risk=0
+    # 放行文本有 4 条 L2 会判密（3.3% 漏报）。开关关 = 灰区口径不变。
+    from src.gateway import main as _m
+    calls = []
+
+    async def _fake(text, **kw):
+        calls.append(text)
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest"}
+
+    monkeypatch.setattr(_m, "small_classify", _fake)
+    body = {"model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "薪酬明细已核对完毕，周五前把草案发我。"}]}
+    monkeypatch.delenv("AI_GATEWAY_L2_ALWAYS", raising=False)
+    r = client.post("/v1/chat/completions", headers=H, json=body)
+    assert r.json()["gateway"]["action"] == "allow"
+    assert not calls, "开关关时 risk=0 不应送 L2"
+    monkeypatch.setenv("AI_GATEWAY_L2_ALWAYS", "true")
+    r = client.post("/v1/chat/completions", headers=H, json=body)
+    assert r.json()["gateway"]["action"] == "route_local"
+    assert r.json()["gateway"]["policy_rule"] == "l2_confidential"
+    assert calls
+
+
+def test_l2_history_scope_covers_prev_turn(monkeypatch):
+    # 多轮追问「把第三列改成 24055」单独判 NORMAL 出境（实测案例）：history 档必须把
+    # 上一轮 user 正文带进 L2，且不重复当前轮。
+    from src.gateway import main as _m
+    monkeypatch.setattr(_m, "_l2_scope_cfg", lambda: {
+        "scopes": ["last_user", "tool", "history", "long_text"],
+        "chunk_chars": 1200, "budget_chars": 6000})
+    payload = [
+        {"role": "user", "content": "这份薪酬表核对一下"},
+        {"role": "assistant", "content": "好的，已核对"},
+        {"role": "user", "content": "把第三列改成 24055"},
+    ]
+    blocks = _m._select_l2_scopes("chat", payload, "把第三列改成 24055")
+    names = [s for s, _ in blocks]
+    assert names[0] == "last_user" and "history" in names
+    assert len(blocks) <= _m._L2_SCOPE_MAX_BLOCKS
+    hist = dict(blocks)["history"]
+    assert "薪酬表" in hist and "改成 24055" not in hist
+
+
+def test_l2_history_e2e_multi_turn(monkeypatch):
+    # 端到端：常开 L2 + history 档，第二轮短句（risk=0）的 L2 输入里必须含第一轮内容
+    from src.gateway import main as _m
+    seen = []
+
+    async def _fake(text, **kw):
+        seen.append(text)
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest"}
+
+    monkeypatch.setattr(_m, "small_classify", _fake)
+    monkeypatch.delenv("AI_GATEWAY_L2_ALWAYS", raising=False)
+    # 机制测试显式开 history（生产 scopes 已裁撤，机制保留待重新启用）
+    monkeypatch.setattr(_m, "_l2_scope_cfg", lambda: {
+        "scopes": ["last_user", "tool", "history", "long_text"],
+        "chunk_chars": 1200, "budget_chars": 6000})
+
+    async def _fake_chunks(chunks, **kw):
+        seen.extend(chunks)
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest",
+                "scope": "history", "scopes_run": ["last_user", "history"]}
+
+    monkeypatch.setattr(_m, "classify_chunks", _fake_chunks)
+    monkeypatch.setenv("AI_GATEWAY_L2_ALWAYS", "true")
+    body = {"model": "gpt-4o-mini", "messages": [
+        {"role": "user", "content": "这份薪酬表核对一下"},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": "把第三列改成 24055"}]}
+    r = client.post("/v1/chat/completions", headers=H, json=body)
+    assert r.json()["gateway"]["action"] == "route_local"
+    assert any("薪酬表" in t for t in seen), "L2 输入未含上一轮内容：多轮追问仍会漏"
+
+
+def test_l2_history_shadow_ab(monkeypatch):
+    # history A/B 影子：AI_GATEWAY_L2_HISTORY_SHADOW 开时，主判决带 history，
+    # 再留痕一次「无 history」口径（l2.history_shadow），不改判决。
+    from src.gateway import main as _m
+    seen = []
+
+    async def _fake(text, **kw):
+        seen.append(text)
+        return {"label": "NORMAL", "confidence": 0.9, "reason": "pytest"}
+
+    async def _fake_chunks(chunks, **kw):
+        seen.extend(chunks)
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest",
+                "scope": "history", "scopes_run": list(kw.get("scopes") or [])}
+
+    monkeypatch.setattr(_m, "small_classify", _fake)
+    monkeypatch.setattr(_m, "classify_chunks", _fake_chunks)
+    # 机制测试显式开 history（生产 scopes 已裁撤，机制保留待重新启用）
+    monkeypatch.setattr(_m, "_l2_scope_cfg", lambda: {
+        "scopes": ["last_user", "tool", "history", "long_text"],
+        "chunk_chars": 1200, "budget_chars": 6000})
+    monkeypatch.setenv("AI_GATEWAY_L2_ALWAYS", "true")
+    monkeypatch.setenv("AI_GATEWAY_L2_HISTORY_SHADOW", "true")
+    body = {"model": "gpt-4o-mini", "messages": [
+        {"role": "user", "content": "这份薪酬表核对一下"},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": "把第三列改成 24055"}]}
+    r = client.post("/v1/chat/completions", headers=H, json=body)
+    gw = r.json()["gateway"]
+    assert gw["action"] == "route_local", "影子不得改判决（主判定带 history）"
+    hs = gw.get("l2", {}).get("history_shadow")
+    assert hs and "label" in hs, "缺 history_shadow 留痕"
+    # 主判定 2 块（last_user+history）+ 影子 1 块（last_user，不含上轮）
+    assert len(seen) == 3 and "薪酬表" not in seen[2]
+
+
+def test_text_l2_hit_sticks_session_local(monkeypatch):
+    # 2026-10-26：第一轮纯文本 L2 判密（无文件参与）⇒ 同会话第二轮直接粘本地。
+    # 此前纯文本命中不标会话 ⇒ 第二轮孤立短句 allow 出境（多轮漏报）。
+    import time as _time
+    from src.gateway import main as _m
+    from src.gateway.session_store import get_session_store
+    calls = []
+
+    async def _fake(text, **kw):
+        calls.append(text)
+        return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest"}
+
+    monkeypatch.setattr(_m, "small_classify", _fake)
+    sid = "pytest-sticky-%d" % int(_time.time() * 1000)
+    h = {**H, "X-Session-ID": sid}
+    r1 = client.post("/v1/chat/completions", headers=h, json={
+        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "工资表核对一下"}]})
+    assert r1.json()["gateway"]["action"] == "route_local"
+    assert get_session_store().is_confidential(sid) is True, "纯文本判密必须标会话"
+    # 第二轮无害短句：L1 会话规则直接转本地，不再送 L2
+    r2 = client.post("/v1/chat/completions", headers=h, json={
+        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "今天天气如何"}]})
+    g2 = r2.json()["gateway"]
+    assert g2["action"] == "route_local"
+    assert g2.get("policy_rule") == "session_route_local"
+    assert len(calls) == 1, "第二轮应在 L1 短路，不再送 L2"
+
+
+def test_l2_unavailable_does_not_stick_session(monkeypatch):
+    # 可用性兜底不标会话：L2 抖一次（degraded→route_local）不该把会话锁本地 7 天
+    import time as _time
+    from src.gateway import main as _m
+    from src.gateway.session_store import get_session_store
+
+    async def _fake(text, **kw):
+        return {"label": "NORMAL", "confidence": 0.5, "reason": "degraded", "degraded": True,
+                "degraded_reason": "timeout", "latency_ms": 1}
+
+    monkeypatch.setattr(_m, "small_classify", _fake)
+    sid = "pytest-nostick-%d" % int(_time.time() * 1000)
+    h = {**H, "X-Session-ID": sid}
+    r1 = client.post("/v1/chat/completions", headers=h, json={
+        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "工资表核对一下"}]})
+    assert r1.json()["gateway"]["action"] == "route_local"  # fail-safe 转本地
+    assert get_session_store().is_confidential(sid) is False, "l2_unavailable 不得标会话"
+    r2 = client.post("/v1/chat/completions", headers=h, json={
+        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "今天天气如何"}]})
+    assert r2.json()["gateway"]["action"] == "allow"
+
+
+def test_l2_degraded_not_attributed_to_first_block(monkeypatch):
+    # 降级块归因：没有块产出结论时 scope 不得归给首块（会像「首块拦的」）；
+    # 真实归因 = degraded_scopes。
+    from src.gateway import main as _m
+
+    async def _fake(text, **kw):
+        return {"label": "NORMAL", "confidence": 0.5, "reason": "degraded", "degraded": True,
+                "degraded_reason": "timeout", "latency_ms": 1}
+
+    monkeypatch.setattr(_m, "small_classify", _fake)
+    r = client.post("/v1/chat/completions", headers=H, json={
+        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "工资表核对一下"}]})
+    g = r.json()["gateway"]
+    assert g["action"] == "route_local"
+    l2 = g.get("l2") or {}
+    assert l2.get("degraded") is True
+    assert l2.get("scope") is None, "降级结果不得归因到首块"
+    assert l2.get("degraded_scopes") == []
+    assert l2.get("scopes_run") == ["last_user"]
+
+
+def test_model_policy_rejects_unknown_scope(monkeypatch, tmp_path):
+    # 保存口校验 scope 名：拼错（tail/lastuser）此前静默入库、运行期静默忽略
+    # ⇒ 用户以为开了档其实没审。现在 422 挡死；只留痕不产块的排除名放行。
+    mp_path = tmp_path / "model_policy_test.yaml"
+    mp_path.write_text(
+        "model_policy:\n  review_model:\n    threshold: 0.7\n    scopes: [last_user]\n"
+        "    chunk_chars: 1200\n    budget_chars: 6000\n", encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
+    from src.gateway import model_policy as _mp
+    _mp.invalidate_model_policy_cache()
+
+    def _put(scopes):
+        return client.put("/admin/api/model-policy", json={
+            "external_candidates": [], "internal_models": [], "model_limits": [],
+            "load_balance_mode": "none",
+            "review_model": {"threshold": 0.7, "scopes": scopes,
+                             "chunk_chars": 1200, "budget_chars": 6000}})
+
+    assert _put(["last_user", "tool", "history", "long_text"]).status_code == 200
+    r = _put(["last_user", "tail"])
+    assert r.status_code == 422 and "tail" in r.text
+    # 排除名（只留痕不产块）是已知名，放行
+    assert _put(["last_user", "system"]).status_code == 200
+    # 422 不落盘：文件里仍是上一版
+    assert "tail" not in mp_path.read_text(encoding="utf-8")
+    _mp.invalidate_model_policy_cache()
+
 
 def test_l1_rules_catch_obfuscated_negative_samples():
     # 回归（2026-10-08）：160 条矩阵里 7 条机密样本 L1 risk=0，L2 压根不被调用，直接出境。
@@ -1769,9 +2065,20 @@ def test_policy_version_rollback(monkeypatch, tmp_path):
     assert r.status_code == 200, r.text
     invalidate_policy_cache()
     assert "pytest-rollback-rule" in [p["name"] for p in policy_admin.list_policies()]
+    r2 = client.post("/admin/api/policies", json={
+        "name": "pytest-rollback-rule2", "priority": 6, "action": "block",
+        "when": {"text contains_any": ["pytest-rollback-marker2"]}})
+    assert r2.status_code == 200, r2.text
+    invalidate_policy_cache()
 
     vs = client.get("/admin/api/policy/versions", params={"limit": 50}).json()["items"]
-    vid = next(v["id"] for v in vs if v["source"] == "save")
+    save_rows = [v for v in vs if v["source"] == "save"][:2]  # 最新两行 = 本测试两次保存
+    # 变更摘要：最新版与现网比；其余行与下一更新行比（相邻全文，不是 200 字预览——
+    # 先截断再比会把邻行误读成「只剩首条规则」）
+    assert [v["rule_count"] for v in save_rows] == [2, 1]
+    assert save_rows[0]["changes"] == ["新增「pytest-rollback-rule2」"]
+    assert save_rows[1]["changes"] == ["新增「pytest-rollback-rule」"]
+    vid = save_rows[1]["id"]
     full = client.get(f"/admin/api/policy/versions/{vid}").json()
     assert [p["name"] for p in _yaml.safe_load(full["yaml_text"])["policies"]] == ["base-allow"]
     assert full["rule_count"] == 1
@@ -1782,8 +2089,95 @@ def test_policy_version_rollback(monkeypatch, tmp_path):
     assert "pytest-rollback-rule" not in [p["name"] for p in policy_admin.list_policies()]
     vs2 = client.get("/admin/api/policy/versions", params={"limit": 50}).json()["items"]
     assert vs2[0]["source"] == "rollback"
-    assert vs2[0]["rule_count"] == 2  # 回滚前现状（base-allow + pytest 规则）
+    assert vs2[0]["rule_count"] == 3  # 回滚前现状（base-allow + 两条 pytest 规则）
     assert client.get("/admin/api/policy/versions/999999").status_code == 404
+
+
+def test_delete_default_allow_rule_rejected(monkeypatch, tmp_path):
+    """控制台声明「default_allow不可删」，此前只有前端挡、API 直调可删。回归：后端 422 且文件不变。"""
+    import yaml as _yaml
+    from src.gateway.policy import invalidate_policy_cache
+
+    pol = tmp_path / "policy_test_default.yaml"
+    pol.write_text(
+        "policies:\n"
+        "  - name: default_allow\n    priority: 100\n    action: allow\n    when: always\n"
+        "  - name: tmp-keep\n    priority: 5\n    action: block\n"
+        "    when:\n      any:\n        - text contains_any: [pytest-default-marker]\n",
+        encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(pol))
+    invalidate_policy_cache()
+
+    r = client.delete("/admin/api/policies/default_allow")
+    assert r.status_code == 422, r.text
+    assert "default_allow" in r.text
+    # 文件未被改写（守卫在写盘前）
+    names = [p["name"] for p in _yaml.safe_load(pol.read_text(encoding="utf-8"))["policies"]]
+    assert names == ["default_allow", "tmp-keep"]
+    # 建议卡 remove_rule 通道同样被拒（同一共享函数）
+    r = client.post("/admin/api/suggestions/apply", json={"kind": "remove_rule", "rule_name": "default_allow"})
+    assert r.status_code == 422, r.text
+    invalidate_policy_cache()
+
+
+def test_duplicate_key_name_rejected():
+    """KEY 榜/审计按名称归因，同名两 key 会合并成不可区分的一行。回归：新建与改名都拒 422。"""
+    import secrets as _secrets
+    import time as _time
+    tag = f"pytest-dup-{_time.time_ns()}"
+    k1, k2, k3 = (f"gw-pytest-{_secrets.token_hex(8)}" for _ in range(3))
+    r1 = client.post("/admin/api/keys", json={"key": k1, "name": tag})
+    assert r1.status_code == 200, r1.text
+    try:
+        r2 = client.post("/admin/api/keys", json={"key": k2, "name": tag})
+        assert r2.status_code == 422, r2.text
+        assert "已被使用" in r2.text
+        r3 = client.post("/admin/api/keys", json={"key": k3, "name": tag + "-b"})
+        assert r3.status_code == 200, r3.text
+        kid3 = r3.json()["item"]["id"]
+        try:
+            r4 = client.patch(f"/admin/api/keys/{kid3}", json={"name": tag})
+            assert r4.status_code == 422, r4.text
+            assert "已被使用" in r4.text
+        finally:
+            client.delete(f"/admin/api/keys/{kid3}")
+    finally:
+        client.delete(f"/admin/api/keys/{r1.json()['item']['id']}")
+
+
+def test_keys_import_name_taken_marks_duplicate():
+    """导入时名称撞车要标 duplicate（此前只测了 key 值撞车；这条走 AlreadyRegistered 分支）。"""
+    import secrets as _secrets
+    import time as _time
+    tag = f"pytest-impname-{_time.time_ns()}"
+    r0 = client.post("/admin/api/keys", json={"key": f"gw-pytest-{_secrets.token_hex(8)}", "name": tag})
+    assert r0.status_code == 200, r0.text
+    try:
+        r = client.post("/admin/api/keys/import",
+                        json={"text": f"{tag},gw-pytest-{_secrets.token_hex(8)}"})
+        assert r.status_code == 200, r.text
+        row = r.json()["results"][0]
+        assert row["status"] == "duplicate", row
+        assert "名称已被使用" in row["message"]
+        assert r.json()["added"] == 0
+    finally:
+        client.delete(f"/admin/api/keys/{r0.json()['item']['id']}")
+
+
+def test_update_missing_key_404():
+    """改一条已被删掉的 key 要 404，别回「已保存」（MySQL 盲 UPDATE 分支靠 rowcount）。"""
+    r = client.patch("/admin/api/keys/999999999", json={"name": "pytest-missing"})
+    assert r.status_code == 404, r.text
+    assert "不存在" in r.text
+
+
+def test_admin_validation_error_is_chinese():
+    """请求体校验错（FastAPI 层）也要中文：管理台分支走 _verrors，且不回显 input。"""
+    r = client.post("/admin/api/keys", json={"key": "x" * 8, "name": "n" * 200})
+    assert r.status_code == 422, r.text
+    d = r.json()["detail"][0]
+    assert d["msg"] == "内容过长", d
+    assert "input" not in d, d
 
 
 def test_events_stream_shape():
@@ -2327,6 +2721,68 @@ def test_parse_when_roundtrip_and_switch_rules():
                     json={"when": {"any": [{"tainted_file.hit == true": True}]}})
     assert r.status_code == 200 and r.json()["parsed"]["content_type"] == "tainted_file"
     assert client.post("/admin/api/policies/parse-when", json={"when": "always"}).json()["parsed"] is None
+
+
+def test_when_nested_any_all_rejected():
+    """嵌套 any/all 壳静默永不命中（引擎只剥一层壳，嵌套壳掉进 _eval_cond 恒 False）。
+
+    回归点：Pydantic 在加载/保存时 fail-fast 拒绝，不再落到「保存成功、干跑不命中、
+    线上零报错」的静默失效家族；单层 any/all 组与非条件项的误伤检查。
+    """
+    import pytest
+    from pydantic import ValidationError
+    from src.gateway.policy import PolicyDoc
+
+    ok = {"policies": [{"name": "a", "priority": 1, "action": "allow",
+                        "when": {"any": [{"text contains_any": ["x"]}, {"file.ext in": ["xlsx"]}]}}]}
+    assert PolicyDoc.model_validate(ok)  # 单层组不受影响
+    for bad in [
+        # any 组内再嵌 all 壳 / all 组内再嵌 any 壳
+        {"policies": [{"name": "a", "priority": 1, "action": "allow",
+                       "when": {"any": [{"all": [{"text contains_any": ["x"]}, {"file.ext in": ["xlsx"]}]},
+                                          {"text contains_any": ["y"]}]}}]},
+        {"policies": [{"name": "a", "priority": 1, "action": "allow",
+                       "when": {"all": [{"any": [{"text contains_any": ["x"]}]},
+                                          {"time.hour >=": 9}]}}]},
+        # 条件项不是对象（引擎会按 str 迭代抛 AttributeError ⇒ 请求路径 500）
+        {"policies": [{"name": "a", "priority": 1, "action": "allow",
+                       "when": {"any": "oops"}}]},
+    ]:
+        with pytest.raises(ValidationError):
+            PolicyDoc.model_validate(bad)
+    # 端点层：value_error 的 ctx 挂 ValueError 实例，e.errors() 原样进 422 detail
+    # 会让 FastAPI 序列化炸成 500——必须 422 且 body 可 JSON 解析
+    r = client.post("/admin/api/policies",
+                    json={"name": "嵌套端点-临时", "priority": 1000, "action": "route_local",
+                          "when": {"any": [{"all": [{"text contains_any": ["x"]}]},
+                                             {"text contains_any": ["y"]}]}})
+    assert r.status_code == 422, f"嵌套 when 应 422 而非 {r.status_code}: {r.text[:200]}"
+    import json as _json
+    _json.loads(r.text)  # detail 必须可序列化
+
+
+def test_builder_ext_field_roundtrip():
+    """文件扩展名构造器入口：file.ext in 精确匹配语义 + build/parse 往返 + 下拉数据源含 ext。
+
+    回归点：(1) 引擎对 file.ext in 走精确匹配（无 in 运算符的子串回退，大小写不敏感）；
+            (2) 构造器产物能逆解析回控件值；(3) 纯文本（无扩展名）永不命中。
+    """
+    from src.gateway import policy_admin
+    from src.gateway.policy import _match_when
+
+    w = policy_admin.build_when("ext", "in", "xlsx, pdf")
+    assert w == {"file.ext in": ["xlsx", "pdf"]}
+    p = policy_admin.parse_when(w)
+    assert p == {"content_type": "ext", "match_type": "in", "match_value": "xlsx, pdf"}
+    assert _match_when(w, {"file": {"ext": "XLSX"}})          # 大小写不敏感
+    assert not _match_when(w, {"file": {"ext": "xlsm"}})      # 精确匹配，非子串
+    assert not _match_when(w, {})                              # 纯文本无扩展名
+    # 下拉数据源含 ext 且 build-when 端点放行（BuildWhenReq pattern 随 CONTENT_TYPE_FIELD 派生）
+    r = client.get("/admin/api/policies/match-choices")
+    assert any(c["content_type"] == "ext" for c in r.json()["choices"])
+    rr = client.post("/admin/api/policies/build-when",
+                     json={"content_type": "ext", "match_type": "in", "match_value": "xlsx, pdf"})
+    assert rr.status_code == 200 and rr.json()["when"] == w
 
 
 def test_build_when_group_multi_conditions():

@@ -308,7 +308,7 @@ export default function UPlotChart({ series, height = 180, yVal = null, scales =
   if (!ready) {
     return (
       <div style={{ height, display: 'flex', alignItems: 'center',
-        justifyContent: 'center', color: 'var(--gw-muted)', fontSize: 12, background: 'var(--gw-empty)' }}
+        justifyContent: 'center', color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)', background: 'var(--gw-empty)' }}
         data-testid="metrics-chart">
         暂无数据
       </div>

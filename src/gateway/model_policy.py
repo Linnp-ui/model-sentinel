@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 DEFAULT_MODEL_POLICY = Path(__file__).parent.parent.parent / "model_policy.yaml"
 
@@ -80,6 +80,12 @@ class ModelLimit(BaseModel):
     note: str = ""
 
 
+# L2 scope 名权威清单：4 个产块（与 main.py 的 _L2_SCOPE_* 常量同步）+ 3 个只留痕
+# 不产块（main._L2_SCOPE_EXCLUDED，写进配置防「以为配上就生效」）。
+L2_SCOPE_KNOWN = ("last_user", "tool", "long_text", "history",
+                  "system", "developer", "instructions")
+
+
 class ReviewModelCfg(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -89,8 +95,20 @@ class ReviewModelCfg(BaseModel):
     # chunk_chars  每块送审字符上限；budget_chars 全部块总预算，先到先用。
     scopes: List[str] = Field(default_factory=lambda: ["last_user"])
     chunk_chars: int = Field(default=1200, ge=1, le=20000)
-    budget_chars: int = Field(default=5000, ge=0, le=200000)
+    budget_chars: int = Field(default=6000, ge=0, le=200000)
     note: str = ""
+
+    @field_validator("scopes")
+    @classmethod
+    def _scopes_known(cls, v: List[str]) -> List[str]:
+        # 拼错的 scope 名（如 tail/lastuser）此前静默入库、运行期静默忽略
+        # ⇒ 用户以为开了档其实没审。保存口 422 挡死。
+        unknown = [s for s in v if s not in L2_SCOPE_KNOWN]
+        if unknown:
+            raise ValueError(
+                f"未知 scope：{unknown}；可用：{ '、'.join(L2_SCOPE_KNOWN) }"
+                f"（system/developer/instructions 只留痕不产块）")
+        return v
 
 
 class ModelPolicy(BaseModel):

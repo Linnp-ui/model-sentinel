@@ -39,8 +39,8 @@ export default function MetricsSection({ hours = 24 }) {
     return () => { alive = false; clearInterval(t); };
   }, [hours]);
   const CHART_TABS = ['qps', 'err', 'lat', 'l2'];
-  if (err) return <Alert type="error" message={`运行指标刷新失败：${err}（显示上次数据）`} style={{ marginTop: 12 }} />;
-  if (!data) return <Card title="运行指标" style={{ marginTop: 12 }} loading />;
+  if (err) return <Alert type="error" message={`运行指标刷新失败：${err}（显示上次数据）`} style={{ marginTop: 'var(--gw-sp-12)' }} />;
+  if (!data) return <Card title="运行指标" style={{ marginTop: 'var(--gw-sp-12)' }} loading />;
   const { ticks } = data;
 
   const msFmt = (v) => Math.round(v).toLocaleString('en-US');
@@ -133,7 +133,7 @@ export default function MetricsSection({ hours = 24 }) {
   const cur = (bigWin && chartTab === 'l2') ? null : (chartDefs[CHART_TABS.includes(chartTab) ? chartTab : 'qps']);
 
   return (
-    <Card title={<>运行指标<Tip text="网关自己的实时状况：每秒多少请求、错了多少、快不快、审查小模型跑了多少。" /></>} style={{ marginTop: 12 }}
+    <Card title={<>运行指标<Tip text="网关自己的实时状况：每秒多少请求、错了多少、快不快、审查小模型跑了多少。" /></>} style={{ marginTop: 'var(--gw-sp-12)' }}
        extra={<Space>
          <Segmented size="small" value={chartTab} onChange={setChartTab}
           options={[
@@ -144,22 +144,22 @@ export default function MetricsSection({ hours = 24 }) {
           ]} />
       </Space>}>
       {!cur ? (
-        <Alert type="info" showIcon style={{ margin: '12px 0' }}
+        <Alert type="info" showIcon style={{ margin: 'var(--gw-sp-12) 0' }}
           message="L2 序列只有环里有（request_log 未记逐请求 L2 数据），切回 24h 窗口查看" />
       ) : cur.empty ? (
-        <Alert type="info" showIcon style={{ margin: '12px 0' }} message={cur.empty} />
+        <Alert type="info" showIcon style={{ margin: 'var(--gw-sp-12) 0' }} message={cur.empty} />
       ) : (
         <>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 'var(--gw-sp-12)', marginBottom: 'var(--gw-sp-8)', flexWrap: 'wrap' }}>
             {cur.tags && (
-              <span style={{ fontSize: 11, fontWeight: 400 }}>
+              <span style={{ fontSize: 'var(--gw-fs-12)', fontWeight: 400 }}>
                     {cur.tags.map((s) => { if (s.name === 'qps_total') return null; const n = avg(s.points.map((p) => p?.v)); return (
-                      <Text key={s.name} type="secondary" style={{ marginLeft: 10, fontSize: 14 }}>
+                      <Text key={s.name} type="secondary" style={{ marginLeft: 'var(--gw-sp-8)', fontSize: 'var(--gw-fs-14)' }}>
                         {s.name} 均值 {n == null ? '-' : (s.fmt || cur.fmt)(n)}
                       </Text>); })}
               </span>
             )}
-            <Text type="secondary" style={{ fontSize: 14 }}>
+            <Text type="secondary" style={{ fontSize: 'var(--gw-fs-14)' }}>
               {cur.hint ? `${cur.hint} · ` : ''}{bigWin ? '' : '环数据（延迟分位走分桶） · 滚轮缩放 · 拖拽框选放大 · 双击回到全景'}
             </Text>
           </div>
@@ -171,8 +171,8 @@ export default function MetricsSection({ hours = 24 }) {
             <UPlotChart height={380} yVal={cur.yVal} series={cur.series} />
           )}
           {cur.second && (
-            <div style={{ marginTop: 12 }}>
-              <Text type="secondary" style={{ fontSize: 11 }}>{cur.second.label}</Text>
+            <div style={{ marginTop: 'var(--gw-sp-12)' }}>
+              <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{cur.second.label}</Text>
               <UPlotChart height={180} yVal={cur.second.yVal} series={cur.second.series} />
             </div>
           )}

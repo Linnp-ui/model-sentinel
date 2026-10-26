@@ -33,7 +33,7 @@ export const G = {
   rpm: 'RPM：每分钟最多允许的请求数，防止某个模型被打爆。',
 
   // —— 数字指标 ——
-  qps: 'QPS：每秒进来的请求数，用来看当前有多忙。',
+  qps: 'QPS：每秒进来的请求数，取近 10 tick（约 100 秒）的平均值。',
   p95: 'P95：95% 的请求比这个快（网关自己的耗时，不含上游模型生成时间）。',
   token: 'Token：模型计费的最小单位（1 个汉字大约 1~2 个 token），也用来估算花了多少钱。',
   active_ip: '活跃 IP：这段时间里发起过请求的来源地址数量。',
@@ -71,6 +71,6 @@ export const G = {
 export const Tip = ({ term, text, style }) => (
   <Tooltip title={text || G[term] || ''} overlayStyle={{ maxWidth: 380 }}>
     <QuestionCircleOutlined role="img" aria-label="术语说明"
-      style={{ color: 'var(--gw-faint)', fontSize: 12, marginInlineStart: 4, verticalAlign: 'middle', cursor: 'help', ...style }} />
+      style={{ color: 'var(--gw-faint)', fontSize: 'var(--gw-fs-12)', marginInlineStart: 'var(--gw-sp-4)', verticalAlign: 'middle', cursor: 'help', ...style }} />
   </Tooltip>
 );

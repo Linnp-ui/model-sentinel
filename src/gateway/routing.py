@@ -544,7 +544,9 @@ def resolve(
 
     # 模型限流（model_policy.model_limits）：最终目标的全局 RPM，超限 429。
     # 放在 resolve 出口 = 所有端点（chat/messages/responses/embeddings/兜底转发）
-    # 与 fallback 换候选路径同一卡口；按「最终落到的模型」计，别名/前缀重写后不逃限。
+    # 共用同一卡口；按「最终落到的模型」计，别名/前缀重写后不逃限。
+    # 注意：fallback 换候选（_mp_next）不经过 resolve ⇒ 换到的候选**不再复检**，
+    # 限流只管 resolve 出口的首个模型（管理台文案与此一致，别再改回）。
     try:
         from .model_policy import model_rpm
         from .rate_limit import get_limiter
@@ -739,7 +741,6 @@ async def route_chat(
     _ar = _alias_resolve(payload, decision, headers)
     if _ar is not None:
         prov, model, alias, _idx0 = _ar
-        _alias_next = _idx0 + 1
     else:
         alias = None
         prov, model, _ = resolve(decision, payload, headers, kind="chat")
@@ -791,14 +792,19 @@ async def route_chat(
         nxt = None
         if alias is not None:
             from .alias_router import alias_candidates as _alias_candidates
-            for cand in _alias_candidates(alias, skip=_alias_next):
+            # 已失败的候选由 alias_ctx.failover 排除（上面刚记过），不靠下标推算：
+            # 复杂度路由选头会换位，按 idx 递推会误跳健康候选。
+            for cand in _alias_candidates(alias):
                 pcfg = cfg.get(cand["provider"]) or find_provider(cand["provider"])
                 if pcfg is None or pcfg.local or pcfg.kind != "chat":
                     continue
                 if not (_cand_key(rc, pcfg) or pcfg.local):
                     continue
+                if f"{pcfg.name}/{cand['model']}" in tried:
+                    # 双保险：候选排除与 failover 记账万一对不上（大小写/自定义 provider），
+                    # 也不能把同一个候选再打一遍（否则本循环不终止）
+                    continue
                 nxt = (pcfg, cand["model"], 0)
-                _alias_next = cand["idx"] + 1
                 break
         else:
             # _pinned_local 时不给任何候选 -> 本地失败直接 fail-loud，原文不出境

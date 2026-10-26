@@ -135,7 +135,7 @@ def _get_client() -> httpx.AsyncClient:
 
 def _cache_key(text: str, filename: str, headers: list, sheet_names: list) -> str:
     import hashlib
-    h = hashlib.md5(f"{text[:800]}|{filename}|{','.join(headers or [])}|{','.join(sheet_names or [])}".encode()).hexdigest()
+    h = hashlib.md5(f"{text}|{filename}|{','.join(headers or [])}|{','.join(sheet_names or [])}".encode()).hexdigest()
     return h
 
 SYSTEM_PROMPT = os.getenv("AI_GATEWAY_L2_SYSTEM_PROMPT") or """你是企业机密分类器。判断用户内容是否属于机密，必须输出严格JSON。

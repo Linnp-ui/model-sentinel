@@ -21,6 +21,26 @@ body.ant-scrolling-effect { width: auto !important; }
   --gw-text-2: rgba(0, 0, 0, 0.6);
   --gw-red-text: #cf1322;   /* 语义色文字：深底上要换亮档，见下方暗色块 */
   --gw-orange-text: #ad4e00;
+
+  /* ---------------- 间距 / 字号刻度（DESIGN.md §3 §4 的唯一落点） ----------------
+     全站垂直节奏与字号只走这几档。JSX 内联样式也引用同一组变量
+     （style={{ marginTop: 'var(--gw-sp-8)' }}），改节奏/字号只改这一处，
+     不必再翻 300 处内联字面量。深浅两套相同 ⇒ 只在 :root 声明一次。
+     间距基数 4px：4 / 6（紧凑段间距）/ 8 / 12 / 16 / 24
+     字号阶梯：12（次要说明）/ 13（表格正文）/ 14（正文）/ 16（卡片标题）/ 18（页面标题）/ 24（KPI 数字）
+     一次性展示尺寸（图标 20 / 徽章大数字 22 / 总览 KPI 32 / 冷门单值）不进刻度，留字面量。 */
+  --gw-sp-4: 4px;
+  --gw-sp-6: 6px;
+  --gw-sp-8: 8px;
+  --gw-sp-12: 12px;
+  --gw-sp-16: 16px;
+  --gw-sp-24: 24px;
+  --gw-fs-12: 12px;
+  --gw-fs-13: 13px;
+  --gw-fs-14: 14px;
+  --gw-fs-16: 16px;
+  --gw-fs-18: 18px;
+  --gw-fs-24: 24px;
 }
 [data-theme='dark'] {
     --gw-primary: #597ef7;
@@ -66,10 +86,10 @@ body { background: var(--gw-bg); color: var(--gw-text); }
    antd small 卡默认 head min-height=38px/font=14px/body=12px，
    normal 卡 min-height=56px/font=16px/body=24px —— 全部对齐到 normal 值 */
 .ant-card-head {
-  padding-inline-start: 24px !important;
-  padding-inline-end: 24px !important;
+  padding-inline-start: var(--gw-sp-24) !important;
+  padding-inline-end: var(--gw-sp-24) !important;
   min-height: 56px !important;
-  font-size: 18px !important;
+  font-size: var(--gw-fs-18) !important;
 }
 .ant-card-head-title { padding: 0 !important; }
 /* 单元格不换行：fixed 布局缩宽时 % 列等比缩小，压到最窄列宽后表内横向滚动而不是
@@ -78,7 +98,9 @@ body { background: var(--gw-bg); color: var(--gw-text); }
 /* 空表提示是用户要读的正文（如「尚未检查，点右上角…」），antd 默认 0.25 在白底仅 1.83:1 */
 .ant-table-tbody > tr.ant-table-placeholder > td { color: var(--gw-text-2) !important; }
 /* code 字号统一 12px：antd 默认 0.85em 会随父级缩到 10.2/11.9px（表内 URL、key 掩码、规则上下文名） */
-code { font-size: 12px !important; }
+code { font-size: var(--gw-fs-12) !important; }
+/* 证书安装页例外：行内 code 芯片与步骤正文/命令块同号（14px），其余页沿用 12px */
+.cert-guide code { font-size: var(--gw-fs-14) !important; }
 /* 每列最窄列宽：rc-table 默认 tableLayout=fixed，列宽只认 col 的 %，单元格
    min-width/内容宽都不参与布局 ⇒ ellipsis 列可被压到 0、各表横滚起点互不相同
    （2026-10 实测；auto 布局也不行——Blink 把 nowrap 全文宽当硬下限，长文本列
@@ -117,12 +139,12 @@ code { font-size: 12px !important; }
    给 3 < .app-topbar 的 10 ⇒ 滚动时表头从状态条下方穿过（不遮状态条） */
 .ant-table-sticky-holder { top: var(--app-topbar-h, 0px) !important; }
 /* 卡内正文基准 14→16（antd 默认）：继承生效，显式字号组件（KPI 标签/注释行等）不受影响 */
-.ant-card-body { font-size: 16px; }
+.ant-card-body { font-size: var(--gw-fs-16); }
 /* Statistic title 被 antd css-xxx 硬编码 14px、不吃卡体继承（同 head/cell 的 !important 因） */
-.ant-statistic-title { font-size: 16px !important; }
+.ant-statistic-title { font-size: var(--gw-fs-16) !important; }
 /* 表格单元格左右留白对称（small 表基础 padding 8px → 24px；原只加左侧
    导致左 24/右 8 不对称、内容偏右，17 张表都受影响。审计表 :39 另限定 12/12） */
-.ant-table-cell { padding-left: 24px !important; padding-right: 24px !important; }
+.ant-table-cell { padding-left: var(--gw-sp-24) !important; padding-right: var(--gw-sp-24) !important; }
 /* 表头与内容一律居中：管理台 17 张表、列宽各异，左对齐时表头与内容对不上（列窄时尤甚）。
    !important 必需——antd 的 css-xxx 内联类会压掉普通 text-align。 */
 .ant-table thead > tr > th,
@@ -134,7 +156,7 @@ code { font-size: 12px !important; }
 
 /* 审计表 10 列且窄（最小 110px），表头挤在左边认不出对应哪列：左右留白对称。
    只审计表需要，用组件根 class 限定作用域，别改全局 .ant-table-cell。 */
-.audit-table .ant-table-cell { padding-left: 12px !important; padding-right: 12px !important; }
+.audit-table .ant-table-cell { padding-left: var(--gw-sp-12) !important; padding-right: var(--gw-sp-12) !important; }
 /* 展开列（仅审计表有 expandable）：antd 默认 48px 太宽，收到 24px（箭头 icon 14px 够放）。
    宽度在 rc-table 注入的 <col class="ant-table-expand-icon-col"> 上（fixed 布局 col 压过 th，
    选 th 的 .ant-table-row-expand-icon-cell 不生效，2026-10 实测） */
@@ -147,7 +169,7 @@ code { font-size: 12px !important; }
   display: flex;
   flex-direction: column;
   justify-content: center;
-  margin-bottom: 12px;
+  margin-bottom: var(--gw-sp-12);
 }
 .ant-card-body > [data-testid="l2cfg-section"] { width: 100%; }
 /* 加载遮罩立即接上：antd 嵌套 Spin 的内容模糊（opacity 0.3s）与白罩（::after
@@ -286,7 +308,7 @@ code { font-size: 12px !important; }
 .file-pick { color: transparent; background: transparent; border: 0; padding: 0; }
 .file-pick::file-selector-button {
   height: 32px; padding: 0 15px; border: 1px solid transparent; border-radius: 8px;
-  background: var(--gw-primary); color: #fff; font-size: 14px; line-height: 1.5714; cursor: pointer;
+  background: var(--gw-primary); color: #fff; font-size: var(--gw-fs-14); line-height: 1.5714; cursor: pointer;
   box-shadow: 0 2px 0 rgba(5, 5, 5, 0.06);
 }
 .file-pick::file-selector-button:hover { background: #597ef7; color: #fff; }

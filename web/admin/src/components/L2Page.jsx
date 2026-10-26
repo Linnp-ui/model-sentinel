@@ -13,20 +13,20 @@ const { Text } = Typography;
 // 矩阵让"漏报嫌疑/误报嫌疑"结构性突出；格色与下方分歧表四列一致
 function CellsMatrix({ cells, agreeRate, testid }) {
   const cell = (v, bg, label) => (
-    <div style={{ background: bg, borderRadius: 6, padding: '12px 8px', textAlign: 'center' }}>
+    <div style={{ background: bg, borderRadius: 6, padding: 'var(--gw-sp-12) var(--gw-sp-8)', textAlign: 'center' }}>
       <div style={{ fontSize: 22, fontWeight: 700, color: '#fff' }}>{v}</div>
-      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.95)' }}>{label}</div>
+      <div style={{ fontSize: 'var(--gw-fs-12)', color: 'rgba(255,255,255,0.95)' }}>{label}</div>
     </div>
   );
   return (
-    <div data-testid={testid} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr', gap: 6, maxWidth: 360 }}>
-      <div style={{ fontSize: 14, color: 'var(--gw-muted)', alignSelf: 'center', paddingRight: 4 }}>一致率 {agreeRate}</div>
-      <div style={{ textAlign: 'center', fontSize: 14, color: 'var(--gw-muted)' }}>影判 密</div>
-      <div style={{ textAlign: 'center', fontSize: 14, color: 'var(--gw-muted)' }}>影判 放</div>
-      <div style={{ fontSize: 14, color: 'var(--gw-muted)', alignSelf: 'center' }}>主判 密</div>
+    <div data-testid={testid} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr', gap: 'var(--gw-sp-6)', maxWidth: 360 }}>
+      <div style={{ fontSize: 'var(--gw-fs-14)', color: 'var(--gw-muted)', alignSelf: 'center', paddingRight: 'var(--gw-sp-4)' }}>一致率 {agreeRate}</div>
+      <div style={{ textAlign: 'center', fontSize: 'var(--gw-fs-14)', color: 'var(--gw-muted)' }}>影判 密</div>
+      <div style={{ textAlign: 'center', fontSize: 'var(--gw-fs-14)', color: 'var(--gw-muted)' }}>影判 放</div>
+      <div style={{ fontSize: 'var(--gw-fs-14)', color: 'var(--gw-muted)', alignSelf: 'center' }}>主判 密</div>
       {cell(cells.cc, '#237804', '一致')}
       {cell(cells.cn, '#ad4e00', <Tooltip title="主判说密、影子说放 —— 影子可能漏掉了本该拦下的（漏报方向更要紧）"><span style={{ cursor: 'help' }}>漏报嫌疑</span></Tooltip>)}
-      <div style={{ fontSize: 14, color: 'var(--gw-muted)', alignSelf: 'center' }}>主判 放</div>
+      <div style={{ fontSize: 'var(--gw-fs-14)', color: 'var(--gw-muted)', alignSelf: 'center' }}>主判 放</div>
       {cell(cells.nc, '#cf1322', <Tooltip title="主判说放、影子说密 —— 影子可能把不该拦的拦了（误报方向）"><span style={{ cursor: 'help' }}>误报嫌疑</span></Tooltip>)}
       {cell(cells.nn, '#0958d9', '一致')}
     </div>
@@ -206,7 +206,7 @@ export default function L2Page() {
   const candVer = (job?.candidate || '').match(/v(\d+)$/)?.[1] || '?';
   const canStart = job && job.state !== 'running' && job.labeled_count >= job.min_labels;
   const JobCard = () => (
-         <Card title={<>优化管道<Tip text="把人工标注喂给模型重新训练，得到一个候选版本，测一遍没变差再「晋升」给影子用。权威判密模型始终是 qwen，晋升只换影子。" /></>} style={{ marginBottom: 12 }}>
+         <Card title={<>优化管道<Tip text="把人工标注喂给模型重新训练，得到一个候选版本，测一遍没变差再「晋升」给影子用。权威判密模型默认 qwen（env 可切 laya，切后无影子可晋升）；晋升只换影子。" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
       <Space wrap size="middle" align="center">
         <Text>人工标注 <Text strong>{job?.labeled_count ?? '-'}</Text> / 门槛 {job?.min_labels ?? '-'}</Text>
         {job?.state === 'running' && (
@@ -228,7 +228,7 @@ export default function L2Page() {
                 {dg ? `，分歧回归 ${dg.matched}/${dg.total}` : ''}
                 {job.report?.prompt ? `；qwen prompt ${job.report.prompt.sha1}` : ''}</Text>
               {dg && dg.missed?.length > 0 && (
-                <div style={{ fontSize: 13, width: '100%' }}>
+                <div style={{ fontSize: 'var(--gw-fs-13)', width: '100%' }}>
                   <Text type="danger">分歧回归漏判 {dg.missed.length} 条：</Text>
                   {dg.missed.map((m, i) => (
                     <Text key={i} style={{ display: 'block' }}>
@@ -238,7 +238,7 @@ export default function L2Page() {
                 </div>
               )}
               {job.report?.regressions && (
-                <div style={{ fontSize: 13, width: '100%' }}>
+                <div style={{ fontSize: 'var(--gw-fs-13)', width: '100%' }}>
                   <Text>相对 v{job.report.regressions.against}：</Text>
                   {job.report.regressions.new.length > 0
                     ? <Text type="danger">新错 {job.report.regressions.new.length} 条：{job.report.regressions.new.join('；')}</Text>
@@ -259,13 +259,13 @@ export default function L2Page() {
                 )}
               {b.wrong?.length > 0 && (
                 <details style={{ width: '100%' }} open>
-                  <summary style={{ cursor: 'pointer', fontSize: 13 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 'var(--gw-fs-13)' }}>
                     错题 {b.wrong.length} 条（want 存疑的别点，去下面分歧表标注）
                   </summary>
-                  <Button size="small" style={{ margin: '4px 0' }}
+                  <Button size="small" style={{ margin: 'var(--gw-sp-4) 0' }}
                     onClick={() => addHard(b.wrong)}>全部按 want 入 hard</Button>
                   {b.wrong.map((w, i) => (
-                    <div key={i} style={{ fontSize: 13, marginTop: 6, borderTop: '1px solid var(--gw-border)', paddingTop: 4 }}>
+                    <div key={i} style={{ fontSize: 'var(--gw-fs-13)', marginTop: 'var(--gw-sp-6)', borderTop: '1px solid var(--gw-border)', paddingTop: 'var(--gw-sp-4)' }}>
                       <Space size={6} wrap>
                         <Text strong>{w.name}</Text>
                         <Text>want={w.want} got={w.got} p={w.p}</Text>
@@ -310,7 +310,7 @@ export default function L2Page() {
       </Space>
       {job?.state === 'running' && job.log_tail?.length > 0 && (
         <WheelGate>
-        <pre style={{ maxHeight: 320, overflow: 'auto', overscrollBehavior: 'contain', fontSize: 13, lineHeight: 1.6, marginTop: 8, marginBottom: 0 }}>
+        <pre style={{ maxHeight: 320, overflow: 'auto', overscrollBehavior: 'contain', fontSize: 'var(--gw-fs-13)', lineHeight: 1.6, marginTop: 'var(--gw-sp-8)', marginBottom: 0 }}>
           {job.log_tail.join('\n')}
         </pre>
         </WheelGate>
@@ -414,7 +414,7 @@ export default function L2Page() {
             <span>{t || <Text type="secondary">（无预览）</Text>}</span>
             {x.dup > 1 && <Tag>×{x.dup}</Tag>}
           </Space>
-          {x.filename && <div><Text type="secondary" style={{ fontSize: 12 }}>{x.filename}</Text></div>}
+          {x.filename && <div><Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{x.filename}</Text></div>}
         </div>
       ) },
     /* 标注列固定 200px（不用 %）：三按钮 48+48+44+2×4gap=148 + 单元格左右 24×2=48
@@ -427,9 +427,9 @@ export default function L2Page() {
         return (
           <div>
             {sg && (
-              <div style={{ marginBottom: 2, whiteSpace: 'nowrap' }}>
+              <div style={{ marginBottom: 'var(--gw-sp-4)', whiteSpace: 'nowrap' }}>
                 <Tooltip title={sg.reason || ''}>
-                  <Tag color={sg.label === 1 ? 'red' : 'green'} style={{ marginInlineEnd: 4 }}>
+                  <Tag color={sg.label === 1 ? 'red' : 'green'} style={{ marginInlineEnd: 'var(--gw-sp-4)' }}>
                     建议{sg.label === 1 ? '密' : '放'} {Math.round((sg.confidence || 0) * 100)}%
                   </Tag>
                 </Tooltip>
@@ -459,19 +459,19 @@ export default function L2Page() {
 
   return (
     <div>
-       <Card title={<>{`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`}<Tip term="shadow" /></>} style={{ marginBottom: 12 }}>
+       <Card title={<>{`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`}<Tip term="shadow" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
         {/* space-evenly + 无 column gap：左、中、右三段空白恒等（center+gap 做不到，中缝总比两边多一个 gap） */}
-        <div style={{ display: 'flex', rowGap: 16, flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-evenly' }}>
+        <div style={{ display: 'flex', rowGap: 'var(--gw-sp-16)', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-evenly' }}>
         <Space size="large" wrap>
           <Statistic title={<><Tooltip title="口径：主影 label 相同 / 可比条数（主判定降级不计入）；数据源审计热缓存（近 5000 条）"><span style={{ cursor: 'help' }}>主影一致率</span></Tooltip><Tip term="agree" /></>}
             value={summary?.agree_rate == null ? '-' : (summary.agree_rate * 100).toFixed(1)} suffix="%"
-            valueStyle={{ fontSize: 24 }} />
+            valueStyle={{ fontSize: 'var(--gw-fs-24)' }} />
           <Statistic title={<>{'影子样本'}<Tip text="一致条数 / 可比总条数。只有真的进了 L2 审查的请求才有影子数据。" /></>} value={summary ? `${summary.agree}/${summary.compared}` : '-'}
-            valueStyle={{ fontSize: 24 }} />
+            valueStyle={{ fontSize: 'var(--gw-fs-24)' }} />
           <Statistic title={<>{'影子覆盖率'}<Tip text="进了 L2 审查的请求里，有多少也跑了影子模型；偏低说明影子没覆盖到大部分流量。" /></>}
             value={summary?.l2_total ? (summary.shadowed / summary.l2_total * 100).toFixed(1) : '-'}
-            suffix="%" valueStyle={{ fontSize: 24 }} />
-          <Statistic title={<>{'影子失败'}<Tip text="影子模型调用失败的次数（超时、返回格式不对等）。失败不影响主判，只影响这份对比统计。" /></>} value={summary?.shadow_degraded ?? '-'} valueStyle={{ fontSize: 24 }} />
+            suffix="%" valueStyle={{ fontSize: 'var(--gw-fs-24)' }} />
+          <Statistic title={<>{'影子失败'}<Tip text="影子模型调用失败的次数（超时、返回格式不对等）。失败不影响主判，只影响这份对比统计。" /></>} value={summary?.shadow_degraded ?? '-'} valueStyle={{ fontSize: 'var(--gw-fs-24)' }} />
         </Space>
         {summary && summary.shadowed ? (
           <div style={{ minWidth: 340 }}>
@@ -485,7 +485,7 @@ export default function L2Page() {
         )}
         </div>
       </Card>
-       <Card title={<>灌数轮次<Tip term="flood_round" /></>} style={{ marginBottom: 12 }}>
+       <Card title={<>灌数轮次<Tip term="flood_round" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
         <Table size="small" sticky={wideSticky()} rowKey={(r) => r.started} dataSource={rounds} tableLayout="fixed"
           pagination={false} locale={{ emptyText: '还没跑过 scripts/gray_flood.py' }}
           /* 百分比铺满卡片（antd 表格默认 width:100%）。不设 width 会被 auto 布局
@@ -494,7 +494,7 @@ export default function L2Page() {
             { title: '时间', dataIndex: 'started', width: '22%',
               render: (v) => bj(v).slice(5, 16) },
             { title: '影子版本', dataIndex: 'laya', width: '22%',
-              render: (v) => (v ? <Text type="secondary" style={{ fontSize: 12 }}>
+              render: (v) => (v ? <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>
                 {String(v).split('/').pop().replace('laya-finetuned-confidential-', '')}</Text> : '-') },
             { title: '发送', dataIndex: 'sent', width: '9%' },
             { title: 'L2 判定', dataIndex: 'l2_total', width: '11%' },
@@ -524,18 +524,18 @@ export default function L2Page() {
       </Card>
       <JobCard />
       {pendingNew > 0 && (
-        <Alert type="info" showIcon style={{ marginBottom: 8 }}
+        <Alert type="info" showIcon style={{ marginBottom: 'var(--gw-sp-8)' }}
           message={`${pendingNew} 条新分歧`}
           action={<Button size="small" type="primary"
             onClick={() => { setPendingNew(0); loadDivs(); }}>查看</Button>} />
       )}
-      <Card title={<>Qwen 提示词自动修补<Tip term="prompt_patch" /></>} style={{ marginBottom: 12 }}
+      <Card title={<>Qwen 提示词自动修补<Tip term="prompt_patch" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}
         extra={<Button type="primary" size="small" loading={proposing} onClick={propose}>自动修补（~2min）</Button>}>
         <Alert type="info" showIcon
-          message={<span style={{ fontSize: 14 }}>语料 = 下方「分歧样本」里已标注且与 qwen 主判相反的错题（筛「主判错的（改prompt）」可只看这批）。结果已持久化到 ~/models（重启/切页不丢）；「填入编辑器」跳规则管理页的 L2 提示词编辑器，人工确认后才保存生效。</span>} />
+          message={<span style={{ fontSize: 'var(--gw-fs-14)' }}>语料 = 下方「分歧样本」里已标注且与 qwen 主判相反的错题（筛「主判错的（改prompt）」可只看这批）。结果已持久化到 ~/models（重启/切页不丢）；「填入编辑器」跳规则管理页的 L2 提示词编辑器，人工确认后才保存生效。</span>} />
         {proposal && (
           <Alert type={proposal.candidate.correct >= proposal.baseline.correct ? 'success' : 'warning'}
-            showIcon style={{ marginTop: 8 }}
+            showIcon style={{ marginTop: 'var(--gw-sp-8)' }}
             message={`候选 ${proposal.candidate.correct}/${proposal.candidate.total}（基线 ${proposal.baseline.correct}/${proposal.baseline.total}，${proposal.cases_used} 条主判错题自省）`}
             description={
               <Space direction="vertical" size={4} style={{ width: '100%' }}>

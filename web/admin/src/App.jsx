@@ -5,7 +5,7 @@ import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
   FileSearchOutlined, CloudServerOutlined,
   AuditOutlined, DashboardOutlined, SafetyCertificateOutlined, ExperimentOutlined,
-  MenuFoldOutlined, MenuUnfoldOutlined,
+  MenuFoldOutlined, MenuUnfoldOutlined, FileProtectOutlined,
 } from '@ant-design/icons';
 
 // 页面级代码分割：每个页面独立 chunk，首屏只下 shell，打开哪个页才加载哪个页。
@@ -32,7 +32,7 @@ function StatusBar() {
     const downTip = (list) => list.map(([n]) => { const e = lv[n] || {}; return `${n}${e.error ? `（${e.error}）` : ''}`; });
     const localDown = downOf(Object.entries(provs).filter(([, p]) => p.local));
     const extDown = downOf(Object.entries(provs).filter(([, p]) => !p.local));
-    const open = Object.entries(c.providers || {}).filter(([, p]) => p.state === 'open').map(([n]) => n);
+    const open = Object.entries(c.providers || {}).filter(([, p]) => p.state && p.state !== 'closed').map(([n]) => n);
     const my = (a && a.mysql) || {};
     const dropped = (my.dropped || {}).total || 0;
     const auditBad = a ? !!(a.redis && a.redis.connected === false)
@@ -59,14 +59,14 @@ function StatusBar() {
   const node = (color, critical, tip, children) => (
     <Tooltip title={tip}>
       <Tag color={color} className={critical ? 'status-critical' : undefined}
-        style={{ marginInlineEnd: 0, borderRadius: 10, padding: '0 10px', fontSize: 13 }}>{children}</Tag>
+        style={{ marginInlineEnd: 0, borderRadius: 10, padding: '0 var(--gw-sp-8)', fontSize: 'var(--gw-fs-13)' }}>{children}</Tag>
     </Tooltip>
   );
   return (
-    <div className="app-statusbar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 24px',
+    <div className="app-statusbar" style={{ display: 'flex', alignItems: 'center', gap: 'var(--gw-sp-8)', padding: 'var(--gw-sp-6) var(--gw-sp-24)',
       background: 'var(--gw-surface)', borderBottom: '1px solid var(--gw-border)', flexWrap: 'wrap' }}>
-      <span style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, flexWrap: 'wrap' }}>
-      <Text type="secondary" style={{ fontSize: 12 }}>网关运行状态</Text>
+      <span style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 'var(--gw-sp-8)', flexWrap: 'wrap' }}>
+      <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>网关运行状态</Text>
       {node(st.l2On ? 'green' : 'red', !st.l2On,
         `内容审查小模型（L2：判断内容是不是机密）｜当前用 ${st.l2Backend}｜影子 ${st.l2Shadow ? '开（并行打标，不改路由）' : '关'}｜审查小模型不可用时按配置放行或转内网`,
         `L2 审查·${st.l2Backend}${st.l2On && st.l2Shadow ? '·影子开' : ''}`)}
@@ -88,8 +88,8 @@ function StatusBar() {
             : '内网 provider 均已配置且在线',
         `内网 ${st.localName}${st.localDown.length ? ` 失联:${st.localDown.join(',')}` : st.localMissing.length ? ` 缺${st.localMissing.join(',')}` : ''}`)}
       {st.open.length
-        ? node('red', true, `熔断 open：${st.open.join(', ')}`, `熔断 ${st.open.length}（${st.open.join(', ')}）`)
-        : node('green', false, '全部熔断闭合', '熔断正常')}
+        ? node('red', true, `熔断中：${st.open.join(', ')}`, `熔断/恢复中 ${st.open.length}（${st.open.join(', ')}）`)
+        : node('green', false, '无熔断中', '无熔断')}
       {node(st.dropped > 0 ? 'orange' : st.auditBad ? 'red' : 'green',
         st.dropped > 0 || st.auditBad, `审计日志（每次调用的记录）写入情况：${st.auditTip}`,
         st.dropped > 0 ? `审计丢行 ${st.dropped}` : st.auditBad ? '审计/DB 异常' : '审计/DB 正常')}
@@ -110,6 +110,7 @@ const PAGES = {
   l2: lazy(() => import('./components/L2Page.jsx')),
   audit: lazy(() => import('./components/AuditPage.jsx')),
   password: lazy(() => import('./components/PasswordPage.jsx')),
+  cert: lazy(() => import('./components/CertGuidePage.jsx')),
 };
 
 const PAGE_TITLES = {
@@ -124,6 +125,7 @@ const PAGE_TITLES = {
   l2: 'L2 影子',
   audit: '审计日志',
   password: '管理员密码',
+  cert: '证书安装',
 };
 
 // ---------------- 懒加载失败兜底：防「偶发空白页」 ----------------
@@ -150,7 +152,7 @@ class PageBoundary extends Component {
   render() {
     if (!this.state.err) return this.props.children;
     return (
-      <div style={{ padding: 24 }}>
+      <div style={{ padding: 'var(--gw-sp-24)' }}>
         <Alert showIcon type="warning"
           message="页面加载失败：网关刚更新过，这个标签页还挂着旧版本"
           description="刷新即恢复（旧标签页里的代码指向了已被新构建删除的资源文件）。"
@@ -183,6 +185,7 @@ const MENU_ITEMS = [
   ]},
   { type: 'group', label: '系统', children: [
     { key: 'password', icon: <LockOutlined />, label: '管理员密码' },
+    { key: 'cert', icon: <FileProtectOutlined />, label: '证书安装' },
   ]},
 ];
 const PAGE_ICONS = Object.fromEntries(
@@ -250,7 +253,7 @@ export default function App() {
         trigger={null}
         onCollapse={onSiderCollapse} style={{ position: 'fixed', left: 0, top: 0, bottom: 0,
         height: '100vh', overflowY: 'auto', overflowX: 'hidden', zIndex: 11 }}>
-          <div style={{ height: 63, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px', fontWeight: 700, fontSize: 20 }}>
+          <div style={{ height: 63, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 var(--gw-sp-12)', fontWeight: 700, fontSize: 20 }}>
             {!menuCollapsed && '网关控制台'}
             <Button type="text" size="large" aria-label={collapsed ? '展开侧栏' : '收起侧栏'} icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />} onClick={() => onSiderCollapse(!collapsed)} />
           </div>
@@ -261,9 +264,9 @@ export default function App() {
             left 随侧栏宽度联动（CSS 里 180 只是兜底） */}
         <div className="app-topbar" ref={topRef} style={{ left: siderW, transition: 'left 0.2s' }}>
         <Header className="app-header" style={{ background: 'var(--gw-surface)', borderBottom: '1px solid var(--gw-border)',
-          fontSize: 18, height: 48, lineHeight: '48px', display: 'flex', alignItems: 'center', padding: '0px 24px 0px 36px' }}>
+          fontSize: 'var(--gw-fs-18)', height: 48, lineHeight: '48px', display: 'flex', alignItems: 'center', padding: '0px var(--gw-sp-24) 0px 36px' }}>
           {/* 当前页图标（派生自侧边栏菜单）在标题左侧 */}
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--gw-sp-8)' }}>
             {PAGE_ICONS[page]}{PAGE_TITLES[page]}
           </span>
           {/* 各页工具栏插槽（StatsPage 用 Portal 把控件挂到标题右边，随页卸载自动清空） */}
@@ -273,7 +276,7 @@ export default function App() {
         </Header>
         <StatusBar />
         </div>
-        <Content style={{ padding: '8px 0' }}>
+        <Content style={{ padding: 'var(--gw-sp-8) 0' }}>
           <Suspense fallback={<div style={{ padding: 64, textAlign: 'center' }}><Spin /></div>}>
             <PageBoundary key={page}>
               <div key={page} className="page-enter"><Page /></div>

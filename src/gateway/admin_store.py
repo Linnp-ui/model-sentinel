@@ -43,6 +43,11 @@ from sqlalchemy import (
     delete as sa_delete,
 )
 
+
+class AlreadyRegistered(ValueError):
+    """登记冲突（key 或名称已存在）。导入接口按类型判 duplicate，别再按文案匹配。"""
+
+
 from .stat_scope import is_abnormal, is_blocked, is_local_route, to_beijing
 
 _IP_CACHE_TTL_S = 5.0
@@ -115,6 +120,8 @@ alias_group = Table(
     metadata,
     Column("name", String(64), primary_key=True),
     Column("description", String(256), nullable=False, default=""),
+    # 复杂度路由开关：1 = 按本轮任务复杂度选头（见 intent_router.py），0 = 纯优先级链
+    Column("intent", Integer, nullable=False, default=0),
     Column("updated_at", DateTime, nullable=False),
 )
 
@@ -126,6 +133,8 @@ alias_member = Table(
     Column("provider", String(64), nullable=False),
     Column("model", String(190), nullable=False),
     Column("priority", Integer, nullable=False, default=100),  # 小=优先；最小者为默认
+    # 档位：1 轻 / 2 中（默认）/ 3 重。复杂度判定给出 L 后，链首 = 满足 tier>=L 里最省的那档
+    Column("tier", Integer, nullable=False, default=2),
     Column("enabled", Integer, nullable=False, default=1),
 )
 
@@ -421,7 +430,7 @@ class AdminStore:
 
     def set_admin_password(self, pw: str, username: str = "admin") -> None:
         if not pw or len(pw) < 8:
-            raise ValueError("password must be >= 8 chars")
+            raise ValueError("密码至少 8 位")
         h = hash_password(pw)
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
@@ -493,13 +502,13 @@ class AdminStore:
         name = (name or "").strip()
         if "*" in key:
             if not _fuzzy_parts(key)[0]:
-                raise ValueError("invalid fuzzy key: need >=3 char prefix and suffix around *")
+                raise ValueError("模糊 key 格式不对：* 前后各需至少 3 个字符")
         if not key:
-            raise ValueError("key is required")
+            raise ValueError("key 不能为空")
         if not name:
-            raise ValueError("name is required")
+            raise ValueError("名称不能为空")
         if len(name) > 128:
-            raise ValueError("name too long")
+            raise ValueError("名称过长（最多 128 字符）")
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             with self._engine.begin() as conn:
@@ -507,7 +516,12 @@ class AdminStore:
                     select(api_key_map.c.id).where(api_key_map.c.key_plain == key)
                 ).first()
                 if exists:
-                    raise ValueError("key already registered")
+                    raise AlreadyRegistered("key 已登记（重复）")
+                # 名称唯一：KEY 榜/审计按名称归因，同名两 key 会合并成不可区分的一行
+                if conn.execute(
+                    select(api_key_map.c.id).where(api_key_map.c.name == name)
+                ).first():
+                    raise AlreadyRegistered("名称已被使用")
                 rid = conn.execute(
                     insert(api_key_map).values(
                         key_plain=key, name=name, owner=owner, note=note,
@@ -517,7 +531,9 @@ class AdminStore:
         else:
             with self._mem_lock:
                 if any(v["key_plain"] == key for v in self._keys.values()):
-                    raise ValueError("key already registered")
+                    raise AlreadyRegistered("key 已登记（重复）")
+                if any(v["name"] == name for v in self._keys.values()):
+                    raise AlreadyRegistered("名称已被使用")
                 rid = self._key_seq
                 self._key_seq += 1
                 self._keys[rid] = {
@@ -557,11 +573,22 @@ class AdminStore:
         # 无需重写历史，改名后占比图自动按新名合并。
         if self._backend != "memory":
             with self._engine.begin() as conn:
-                conn.execute(sa_update(api_key_map).where(api_key_map.c.id == kid).values(**vals))
+                if "name" in vals and conn.execute(
+                    select(api_key_map.c.id).where(
+                        api_key_map.c.name == vals["name"], api_key_map.c.id != kid)
+                ).first():
+                    raise AlreadyRegistered("名称已被使用")
+                res = conn.execute(sa_update(api_key_map).where(api_key_map.c.id == kid).values(**vals))
+                # MySQL 盲 UPDATE 不报错：rowcount=0 说明 key 已被别处删掉，别回「已保存」
+                if not res.rowcount:
+                    raise KeyError(kid)
         else:
             with self._mem_lock:
                 if kid not in self._keys:
                     raise KeyError("not found")
+                if "name" in vals and any(
+                    v["name"] == vals["name"] for k, v in self._keys.items() if k != kid):
+                    raise AlreadyRegistered("名称已被使用")
                 self._keys[kid].update(vals)
         self._bump_entry_ver()
 
@@ -783,7 +810,8 @@ class AdminStore:
             if len(self._policy_versions) > 200:  # 内存后端只留最近 200 版
                 del self._policy_versions[:-200]
 
-    def list_policy_versions(self, limit: int = 50) -> list[dict]:
+    def list_policy_versions(self, limit: int = 50, full: bool = False) -> list[dict]:
+        """full=True 返回完整 yaml_text（版本对比用）；否则只给 200 字预览。"""
         limit = max(1, min(int(limit or 50), 200))
         if self._backend != "memory":
             try:
@@ -792,15 +820,17 @@ class AdminStore:
                         select(policy_versions).order_by(policy_versions.c.id.desc()).limit(limit)
                     ).mappings().all()
                     out = [dict(r) for r in rows]
-                    for r in out:
-                        r["yaml_text"] = (r["yaml_text"] or "")[:200]  # 列表只给预览
+                    if not full:
+                        for r in out:
+                            r["yaml_text"] = (r["yaml_text"] or "")[:200]  # 列表只给预览
                     return out
             except Exception as e:
                 print(f"[admin_store] policy_versions list failed, fallback memory: {e!r}")
         with self._mem_lock:
             out = [dict(r) for r in list(reversed(self._policy_versions))[:limit]]
-            for r in out:
-                r["yaml_text"] = (r["yaml_text"] or "")[:200]
+            if not full:
+                for r in out:
+                    r["yaml_text"] = (r["yaml_text"] or "")[:200]
             return out
 
     def get_policy_version(self, vid: int) -> Optional[dict]:
@@ -876,7 +906,7 @@ class AdminStore:
         with self._mem_lock:
             return next((dict(r) for r in self._prompt_versions if r["id"] == int(vid)), None)
 
-    # ---------- 对外模型别名（AB-flash / AB-pro 动态路由；纯 DB/Console 管理，无内置种子） ----------
+    # ---------- 对外模型别名（Auto-AB 等动态路由；纯 DB/Console 管理，无内置种子） ----------
 
     def _invalidate_alias_cache(self) -> None:
         self._alias_cache = None
@@ -893,6 +923,7 @@ class AdminStore:
             for g in g_rows:
                 groups.append({
                     "name": g["name"], "description": g.get("description") or "",
+                    "intent": int(g.get("intent") or 0),
                     "members": [m for m in m_rows if m["group_name"] == g["name"]],
                 })
         else:
@@ -901,33 +932,42 @@ class AdminStore:
                     g = self._aliases[name]
                     groups.append({
                         "name": g["name"], "description": g.get("description") or "",
+                        "intent": int(g.get("intent") or 0),
                         "members": [dict(m) for m in sorted(g["members"], key=lambda x: x["priority"])],
                     })
         return groups
 
     def update_alias_group(self, name: str, members: list[dict], description: str = "",
-                           new_name: str = "") -> dict:
-        """整组替换成员。members: [{provider, model, priority, enabled}]，按 priority 升序重排为 10,20,...
+                           new_name: str = "", intent: bool = False) -> dict:
+        """整组替换成员。members: [{provider, model, priority, enabled, tier}]
+
+        按 priority 升序重排为 10,20,...；tier 归一成 1/2/3（脏值 → 2）。
+        intent=True 开启复杂度路由（intent_router：判定结果决定链首）。
 
         new_name 非空且 ≠ 现名 → 整组（组行+成员）重命名；目标名与其他组撞名
         （大小写不敏感）抛 ValueError。改名后旧名立即失效（/v1/models 不再展示）。
         """
         name = (name or "").strip()
         if not name:
-            raise ValueError("group name is required")
+            raise ValueError("别名组名称不能为空")
         if not isinstance(members, list) or not members:
-            raise ValueError("members must be a non-empty list")
+            raise ValueError("别名组成员不能为空")
         norm: list[dict] = []
         for m in members:
             pr = str(m.get("provider") or "").strip()
             mo = str(m.get("model") or "").strip()
             if not pr or not mo:
-                raise ValueError("each member needs provider and model")
+                raise ValueError("每个成员都要填 provider 和 model")
             try:
                 pri = int(m.get("priority") or 0)
             except (TypeError, ValueError):
                 pri = 0
+            try:
+                tier = int(m.get("tier") or 2)
+            except (TypeError, ValueError):
+                tier = 2
             norm.append({"provider": pr, "model": mo, "priority": pri,
+                         "tier": tier if tier in (1, 2, 3) else 2,
                          "enabled": 1 if m.get("enabled", 1) in (1, True, "1", "true") else 0})
         norm.sort(key=lambda x: x["priority"])
         for i, m in enumerate(norm):
@@ -939,34 +979,36 @@ class AdminStore:
                 if new and new != name:
                     _names = [str(r[0]) for r in conn.execute(select(alias_group.c.name)).all()]
                     if any(n.lower() == new.lower() for n in _names):
-                        raise ValueError(f"alias group already exists: {new}")
+                        raise ValueError(f"别名组已存在：{new}")
                     conn.execute(sa_update(alias_group).where(alias_group.c.name == name)
                                  .values(name=new, description=description, updated_at=now))
                     conn.execute(sa_update(alias_member).where(alias_member.c.group_name == name)
                                  .values(group_name=new))
                     name = new
-                _gvals = dict(name=name, description=description, updated_at=now)
+                _gvals = dict(name=name, description=description, intent=1 if intent else 0,
+                              updated_at=now)
                 from sqlalchemy.dialects.mysql import insert as _my_insert
                 conn.execute(
                     _my_insert(alias_group).values(**_gvals)
-                    .on_duplicate_key_update(description=description, updated_at=now)
+                    .on_duplicate_key_update(description=description,
+                                             intent=1 if intent else 0, updated_at=now)
                 )
                 conn.execute(sa_delete(alias_member).where(alias_member.c.group_name == name))
                 for m in norm:
                     conn.execute(insert(alias_member).values(
                         group_name=name, provider=m["provider"], model=m["model"],
-                        priority=m["priority"], enabled=m["enabled"],
+                        priority=m["priority"], tier=m["tier"], enabled=m["enabled"],
                     ))
         else:
             with self._mem_lock:
                 if new and new != name:
                     if any(k.lower() == new.lower() for k in self._aliases):
-                        raise ValueError(f"alias group already exists: {new}")
+                        raise ValueError(f"别名组已存在：{new}")
                     if name in self._aliases:
                         self._aliases[new] = self._aliases.pop(name)
                     name = new
                 self._aliases[name] = {
-                    "name": name, "description": description,
+                    "name": name, "description": description, "intent": 1 if intent else 0,
                     "members": [dict(m, id=self._alias_seq + i) for i, m in enumerate(norm)],
                 }
                 self._alias_seq += len(norm) + 1
@@ -974,45 +1016,47 @@ class AdminStore:
         return self.get_alias_routes().get(name.lower()) or {}
 
     def delete_alias_group(self, name: str) -> dict:
-        """删除别名组及其全部成员（组名大小写不敏感）；不存在则抛 ValueError。
+        """删除别名组及其全部成员（组名大小写不敏感）；不存在则抛 KeyError。
 
         删除后 get_alias_routes() 立即不再返回该别名 —— /v1/models 不再展示，
         指向它的请求按未知模型处理（404）。
         """
         name = (name or "").strip()
         if not name:
-            raise ValueError("group name is required")
+            raise ValueError("别名组名称不能为空")
         if self._backend != "memory":
             with self._engine.begin() as conn:
                 names = [r[0] for r in conn.execute(select(alias_group.c.name)).all()]
                 real = next((r for r in names if str(r).lower() == name.lower()), None)
                 if real is None:
-                    raise ValueError("alias group not found: %s" % name)
+                    raise KeyError(name)
                 conn.execute(sa_delete(alias_member).where(alias_member.c.group_name == real))
                 conn.execute(sa_delete(alias_group).where(alias_group.c.name == real))
         else:
             with self._mem_lock:
                 real = next((k for k in self._aliases if k.lower() == name.lower()), None)
                 if real is None:
-                    raise ValueError("alias group not found: %s" % name)
+                    raise KeyError(name)
                 self._aliases.pop(real, None)
         self._invalidate_alias_cache()
         return {"group": real}
 
     def get_alias_routes(self) -> dict:
-        """运行时视图（带 5s TTL 缓存）：{别名小写: {"name", "candidates": [{provider, model}]}}"""
+        """运行时视图（带 5s TTL 缓存）：
+        {别名小写: {"name", "candidates": [{provider, model, tier}], "intent": bool}}"""
         now = time.time()
         if self._alias_cache and now - self._alias_cache[1] < _IP_CACHE_TTL_S:
             return self._alias_cache[0]
         routes: dict = {}
         for g in self.list_alias_groups():
             cands = [
-                {"provider": m["provider"], "model": m["model"]}
+                {"provider": m["provider"], "model": m["model"], "tier": int(m.get("tier") or 2)}
                 for m in sorted(g["members"], key=lambda x: x["priority"])
                 if m.get("enabled", 1)
             ]
             if cands:
-                routes[g["name"].lower()] = {"name": g["name"], "candidates": cands}
+                routes[g["name"].lower()] = {"name": g["name"], "candidates": cands,
+                                             "intent": bool(g.get("intent"))}
         self._alias_cache = (routes, now)
         return routes
 
@@ -1038,9 +1082,9 @@ class AdminStore:
         kind = (kind or "").strip().lower()
         key_value = (key_value or "").strip()
         if kind not in ("black", "white"):
-            raise ValueError("kind must be black|white")
+            raise ValueError("kind 只能是 black 或 white")
         if not (8 <= len(key_value) <= 256):
-            raise ValueError("key_value must be 8-256 chars")
+            raise ValueError("key 长度需在 8-256 字符之间")
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             with self._engine.begin() as conn:
@@ -1050,7 +1094,7 @@ class AdminStore:
                     )
                 ).first()
                 if exists:
-                    raise ValueError("rule already exists")
+                    raise ValueError("该黑/白名单规则已存在")
                 rid = conn.execute(
                     insert(key_rule).values(
                         kind=kind, key_value=key_value, note=note, source=source, created_at=now
@@ -1059,7 +1103,7 @@ class AdminStore:
         else:
             with self._mem_lock:
                 if any(v["kind"] == kind and v["key_value"] == key_value for v in self._key_rules.values()):
-                    raise ValueError("rule already exists")
+                    raise ValueError("该黑/白名单规则已存在")
                 rid = self._key_seq
                 self._key_seq += 1
                 self._key_rules[rid] = {
@@ -1166,7 +1210,7 @@ class AdminStore:
         KEY 内按 tokens 降序。未登记 KEY 归为“未登记”。ts 统一走 _ts_str 归一（见 _log_rows）。
 
         model 是**实际模型**（`provider/model`，别名按当前别名组主候选解析，
-        如 AB-flash → deepseek/deepseek-flash）；tokens==0 的组直接丢弃
+        如 Auto-AB → deepseek/deepseek-flash）；tokens==0 的组直接丢弃
         （被拦截/无用量请求不进 Token 占比）。
         """
         rows = self._log_rows(since, until)

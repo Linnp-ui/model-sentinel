@@ -3,6 +3,9 @@
 > 上级：`AGENTS.md`。2026-09-29 精简：删 v1–v9 训练迭代流水（已被 v30 定版取代，
 > 完整版在 git 历史里），压事故叙事留结论，规则一条未删。
 > 按时间倒序读也行，按主题扫也行。
+> 条目里引用的规则 priority 是**当时**的编号，现值以 `policy.yaml` 为准
+> （2026-10-26：3 block_secrets / 5 tainted_file_ref / 10 financial / 12 session /
+> 13 unparsed_binary / 20 pii_weighted / 30 ocr_empty_image / 40 drawing / 100 default_allow）。
 
 - **2026-10-12 — 宿主 TZ 切 Asia/Shanghai，时基全量锚定 UTC**：起因是"系统展示时间
   全部北京时间"。改法 = 写入侧 16 处裸 `strftime`/`now()`/`localtime` 全部显式化

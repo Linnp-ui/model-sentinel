@@ -27,12 +27,12 @@ function ProviderRegistryCard() {
     } : { api_mode: 'openai', kind: 'chat', timeout: 60, api_key: '' });
   };
 
-  // 点确定必过本地模型确认：local 模型跳过 L1/L2 直接 allow，标错即安全边界错
+  // 点确定必过本地模型确认：仅「候选全内网」的别名组跳过 L1/L2，标错即安全边界错
   const save = async () => {
     const v = await form.validateFields();
     Modal.confirm({
       title: '确认本地模型属性',
-      content: `「${v.name}」是否为本地模型（内容不出境）= ${v.local ? '是（内网）' : '否（外网）'}；本地模型跳过 L1/L2 直接放行。设错请点取消回去改开关。`,
+      content: `「${v.name}」是否为本地模型（内容不出境）= ${v.local ? '是（内网）' : '否（外网）'}；仅当它属于「候选全内网」的别名组时整组跳过 L1/L2，单独点名的内网模型仍照常审查。设错请点取消回去改开关。`,
       okText: '确认无误，保存',
       onOk: () => doSave(v),
     });
@@ -159,7 +159,7 @@ function ProviderRegistryCard() {
         <Input.Password value={keyVal} onChange={(e) => setKeyVal(e.target.value)}
           placeholder={keyModal?.row?.configured ? '留空保存 = 清除该 key' : 'key 值（至少 8 位）'}
           autoComplete="new-password" onPressEnter={saveKey} />
-        <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+        <Text type="secondary" style={{ display: 'block', marginTop: 'var(--gw-sp-8)' }}>
           即时生效（免重启）并写入 .env 持久化；保存后自动跑健康检查验证；
           值只写不读，任何端点不返回明文
         </Text>
@@ -231,8 +231,8 @@ function CircuitCard() {
   return (
     <Card title={<>熔断器<Tip term="circuit" /></>}>
       {/* 口径说明常驻小字：每格都要能回答「这一格是什么、为什么是这个值」 */}
-      <Typography.Paragraph type="secondary" style={{ fontSize: 12, lineHeight: 1.8, marginBottom: 10 }}>
-        <div>· <b>打开</b>：滑动窗口 <b>{cfg.window_seconds ?? '—'}s</b> 内失败 ≥ <b>{cfg.failure_threshold ?? '—'}</b> 次即 <b>OPEN</b>（熔断键 = provider::模型，别名组候选与点名请求共用一份状态），该组合之后直接 fail-fast 返回 503（不真实出境）；别名组则跳过该候选顺延下一候选，组内全不可用才 503。</div>
+      <Typography.Paragraph type="secondary" style={{ fontSize: 'var(--gw-fs-12)', lineHeight: 1.8, marginBottom: 'var(--gw-sp-8)' }}>
+        <div>· <b>打开</b>：滑动窗口 <b>{cfg.window_seconds ?? '—'}s</b> 内失败 ≥ <b>{cfg.failure_threshold ?? '—'}</b> 次即 <b>OPEN</b>（熔断键 = provider::模型，别名组候选与点名请求共用一份状态），该组合之后直接 fail-fast 返回 503（不真实出境）；别名组跳过该候选顺延下一候选，点名请求先在候选表内顺延，全部不可用才 503（route_local/block 不切换）。</div>
         <div>· <b>冷却与恢复</b>：OPEN 后冷却 <b>{cfg.recovery_seconds ?? '—'}s</b>（冷却剩余秒数见下表）自动转 <b>HALF_OPEN</b> 放行探针流量，成功 <b>{cfg.success_threshold ?? '—'}</b> 次回 <b>CLOSED</b>（清空失败计数）；探针再失败立刻重新 OPEN 并重新计时。</div>
       </Typography.Paragraph>
       <Table size="small" sticky={wideSticky()} rowKey="name" className="tbl-circuit" pagination={false} tableLayout="fixed" dataSource={rows}
@@ -246,7 +246,7 @@ function CircuitCard() {
           { title: '冷却剩余(s)', dataIndex: 'cooldown_remaining_s', width: '12%' },
           { title: '操作', width: '30%', render: (_, r) => (
             <Space>
-              <Popconfirm title={`手动打开 ${r.provider}${r.model ? '::' + r.model : ''} 熔断？该组合的请求将 fail-fast（不真实出境）：别名组切链内下一候选（跳过内网候选），点名请求直接 503；整组不可用即 503，不会静默转本地`}
+              <Popconfirm title={`手动打开 ${r.provider}${r.model ? '::' + r.model : ''} 熔断？该组合的请求不再直连它：别名组切链内下一候选（跳过内网候选）；点名请求先在候选表内顺延（可能落到别的 provider），全部不可用才 503；不会静默转本地`}
                 onConfirm={() => setState(r.name, 'open')}>
                 <Button type="link" size="small" danger loading={busy === r.name}>打开</Button>
               </Popconfirm>

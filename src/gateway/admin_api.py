@@ -45,6 +45,7 @@ M6（运维留痕）：
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 import re
@@ -58,7 +59,7 @@ import json
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from src.gateway.admin_store import get_admin_store, mask_key
+from src.gateway.admin_store import AlreadyRegistered, get_admin_store, mask_key
 from src.gateway.stat_scope import to_beijing
 from src.gateway import l2_overrides as _l2ov
 from src.gateway import policy_admin
@@ -67,6 +68,49 @@ router = APIRouter(prefix="/admin/api")
 
 
 # ---------------- helpers ----------------
+
+_VERR_MSG_ZH = {
+    "missing": "缺少必填项",
+    "string_too_long": "内容过长",
+    "string_too_short": "内容过短",
+    "string_pattern_mismatch": "格式不匹配",
+    "string_type": "需要文本",
+    "int_parsing": "需要整数",
+    "bool_parsing": "需要布尔值",
+    "dict_type": "需要对象",
+    "list_type": "需要列表",
+    "greater_than": "数值过小",
+    "less_than": "数值过大",
+}
+
+
+def _verrors(e: ValidationError) -> list:
+    """e.errors() 里 value_error 的 ctx 持有 ValueError 实例（非 JSON 可序列化，
+    形如 {'error': ValueError(...)}），直接当 422 detail 会让 FastAPI 序列化
+    炸成 500——递归把异常压成 str。同时把 Pydantic 自带英文 msg 换成中文。"""
+    out = []
+    for err in e.errors():
+        err.pop("input", None)  # 不回显原始值（密码/长文本），前端只用 loc/msg
+        err.pop("url", None)    # RequestValidationError.errors() 不接受 include_url 参数
+        ctx = err.get("ctx")
+        if isinstance(ctx, BaseException):
+            ctx = str(ctx)
+        elif isinstance(ctx, dict):
+            ctx = {k: (str(v) if isinstance(v, BaseException) else v) for k, v in ctx.items()}
+        if ctx is not None and not isinstance(ctx, (str, int, float, bool, list, dict)):
+            ctx = str(ctx)
+        if ctx is not err.get("ctx"):
+            err = {**err, "ctx": ctx}
+        msg = str(err.get("msg", ""))
+        if err.get("type") == "value_error":
+            msg = msg.removeprefix("Value error, ")
+        else:
+            msg = _VERR_MSG_ZH.get(err.get("type", ""), msg)
+        if msg != err.get("msg"):
+            err = {**err, "msg": msg}
+        out.append(err)
+    return out
+
 
 def store_session_secret() -> Optional[str]:
     """给 main.py 的 _admin_secret() 用：DB 凭据存在时返回派生密钥。"""
@@ -138,9 +182,9 @@ def get_meta():
 def change_password(body: PasswordChangeReq):
     st = get_admin_store()
     if not verify_admin_password(body.old_password):
-        raise HTTPException(403, "old password incorrect")
+        raise HTTPException(403, "原密码不正确")
     if body.old_password == body.new_password:
-        raise HTTPException(422, "new password must differ from old")
+        raise HTTPException(422, "新密码不能与原密码相同")
     try:
         st.set_admin_password(body.new_password)
     except ValueError as e:
@@ -221,10 +265,10 @@ def import_keys_api(body: KeysImportReq):
             added += 1
         except ValueError as e:
             msg = str(e)
-            status = "duplicate" if "already registered" in msg else "invalid"
+            status = "duplicate" if isinstance(e, AlreadyRegistered) else "invalid"
             results.append({"line": idx, "key_masked": (key if "*" in key else mask_key(key)), "status": status, "message": msg})
     if not results:
-        raise HTTPException(422, "no lines to import")
+        raise HTTPException(422, "没有可导入的行")
     return {"ok": True, "added": added, "results": results}
 
 
@@ -233,7 +277,7 @@ def update_key(kid: int, body: ApiKeyUpdateReq):
     try:
         get_admin_store().update_api_key(kid, name=body.name, owner=body.owner, note=body.note, weekly_cost_cap=body.weekly_cost_cap)
     except KeyError:
-        raise HTTPException(404, "key not found")
+        raise HTTPException(404, "key 不存在")
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"ok": True}
@@ -250,7 +294,7 @@ def delete_key(kid: int):
 @router.get("/keyrules")
 def list_keyrules(kind: Optional[str] = None):
     if kind and kind not in ("black", "white"):
-        raise HTTPException(422, "kind must be black|white")
+        raise HTTPException(422, "kind 只能是 black 或 white")
     items = get_admin_store().list_key_rules(kind)
     for it in items:
         it["key_masked"] = mask_key(it.pop("key_value", ""))
@@ -265,9 +309,9 @@ def create_keyrule(body: KeyRuleCreateReq):
         # 按登记名解析明文（管理页下拉用；明文不出后端）
         kv = {k["name"]: k["key_plain"] for k in get_admin_store().list_api_keys_raw()}.get(body.key_name.strip(), "")
         if not kv:
-            raise HTTPException(422, "key_name not registered")
+            raise HTTPException(422, "该名称未登记（请先登记 key）")
     if not (8 <= len(kv) <= 256):
-        raise HTTPException(422, "key_value must be 8-256 chars")
+        raise HTTPException(422, "key 长度需在 8-256 字符之间")
     try:
         item = get_admin_store().add_key_rule(body.kind, kv, body.note)
     except ValueError as e:
@@ -395,7 +439,7 @@ def suggestion_apply_api(req: SuggestionApplyReq):
     store = get_admin_store()
     if req.kind == "add_limit":
         if not req.limit_model or req.limit_rpm <= 0:
-            raise HTTPException(422, "limit_model and positive limit_rpm required")
+            raise HTTPException(422, "需填 limit_model 和正数 limit_rpm")
         from src.gateway import model_policy as _mp
         pol = _mp.load_model_policy()
         rows = [m.model_dump() for m in pol.model_limits]
@@ -412,21 +456,25 @@ def suggestion_apply_api(req: SuggestionApplyReq):
         return {"ok": True, "limited": {req.limit_model: req.limit_rpm}}
     if req.kind == "remove_rule":
         if not req.rule_name:
-            raise HTTPException(422, "rule_name required")
+            raise HTTPException(422, "rule_name 不能为空")
         from src.gateway import policy_admin as _pa
-        if not _pa.delete_policy(req.rule_name):
-            raise HTTPException(404, "policy rule not found")
+        try:
+            deleted = _pa.delete_policy(req.rule_name)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        if not deleted:
+            raise HTTPException(404, "规则不存在")
         return {"ok": True, "removed": req.rule_name}
     if req.kind == "reorder":
         from src.gateway import policy_admin as _pa
         if req.order:
             names = [n for n in dict.fromkeys(req.order) if n]
             if len(names) < 2:
-                raise HTTPException(422, "order needs at least 2 distinct rules")
+                raise HTTPException(422, "order 至少需要 2 条不同规则")
             cur = {p["name"]: p for p in _pa.list_policies()}
             missing = [n for n in names if n not in cur]
             if missing:
-                raise HTTPException(404, f"policy rule not found: {missing[0]}")
+                raise HTTPException(404, f"规则不存在：{missing[0]}")
             slots = sorted(cur[n]["priority"] for n in names)
             done = {}
             for n, p in zip(names, slots):
@@ -436,10 +484,10 @@ def suggestion_apply_api(req: SuggestionApplyReq):
                 done[n] = p
             return {"ok": True, "reordered": done}
         if not req.rule_a or not req.rule_b or req.rule_a == req.rule_b:
-            raise HTTPException(422, "rule_a and rule_b required (distinct)")
+            raise HTTPException(422, "需填 rule_a 和 rule_b（且不同）")
         cur = {p["name"]: p for p in _pa.list_policies()}
         if req.rule_a not in cur or req.rule_b not in cur:
-            raise HTTPException(404, "policy rule not found")
+            raise HTTPException(404, "规则不存在")
         ra, rb = dict(cur[req.rule_a]), dict(cur[req.rule_b])
         ra["priority"], rb["priority"] = rb["priority"], ra["priority"]
         _pa.upsert_policy(ra, original_name=req.rule_a)
@@ -448,19 +496,19 @@ def suggestion_apply_api(req: SuggestionApplyReq):
                                           req.rule_b: rb["priority"]}}
     if req.kind == "unwhite":
         if req.rule_id is None:
-            raise HTTPException(422, "rule_id required")
+            raise HTTPException(422, "rule_id 不能为空")
         rows = [r for r in store.list_key_rules() if r["id"] == req.rule_id]
         if not rows or rows[0]["kind"] != "white":
-            raise HTTPException(404, "white rule not found")
+            raise HTTPException(404, "白名单规则不存在")
         if rows[0].get("source") not in ("strategy", "auto"):
-            raise HTTPException(409, "manual rule: remove it manually")
+            raise HTTPException(409, "手工添加的规则请手动删除")
         store.remove_key_rule(req.rule_id)
         return {"ok": True, "removed": req.rule_id}
     kv = req.key
     if not kv and req.key_name:
         kv = {k["name"]: k["key_plain"] for k in store.list_api_keys_raw()}.get(req.key_name, "")
     if not kv:
-        raise HTTPException(422, "key or key_name not resolvable")
+        raise HTTPException(422, "key 或名称解析不到（请检查登记）")
     try:
         r = store.add_key_rule(kind=req.kind, key_value=kv,
                                note=req.note or f"key-tier:{req.kind}", source="strategy")
@@ -509,7 +557,7 @@ def save_model_policy_api(body: ModelPolicySaveReq):
             "review_model": body.review_model,
         })
     except ValidationError as e:
-        raise HTTPException(422, e.errors(include_url=False))
+        raise HTTPException(422, _verrors(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"ok": True, "policy": pol.model_dump()}
@@ -618,19 +666,21 @@ class L2TestReq(BaseModel):
     sheet_names: list = Field(default_factory=list)
 
 
-# ---------- 对外模型别名（AB-flash / AB-pro 动态路由） ----------
+# ---------- 对外模型别名（Auto-AB 等动态路由） ----------
 
 class AliasMemberReq(BaseModel):
     provider: str
     model: str
     priority: int = 100
     enabled: bool = True
+    tier: int = 2  # 1 轻 / 2 中 / 3 重（复杂度路由的档位）
 
 
 class AliasGroupSaveReq(BaseModel):
     description: str = ""
     members: list[AliasMemberReq]
     new_name: str = ""  # 非空且 ≠ URL 组名 → 整组重命名（撞名 422）
+    intent: bool = False  # 兼容字段：复杂度路由已定死常开，此值不影响行为
 
 
 @router.get("/aliases")
@@ -666,6 +716,7 @@ def build_public_models() -> list:
                 "kind": "chat",
                 "alias_group": g["name"],
                 "default": f"{default['provider']}/{default['model']}",
+                "intent": True,  # 复杂度路由定死常开（2026-10-26 起，不再按组开关）
                 "candidates": [f"{m['provider']}/{m['model']}" for m in members],
             },
         })
@@ -714,6 +765,17 @@ def build_public_models() -> list:
                 "user_defined": True,
             },
         })
+    # 对外只展示白名单里的模型（AI_GATEWAY_PUBLIC_MODELS，逗号分隔；空 = 不过滤，旧行为）。
+    # 只管「可发现性」，不管「可路由性」：没列出的名字老客户端照常能用 —— 收窄列表
+    # 不该等于打断在用的链路（未知模型名走原样交上游/内网登记模型，见 routing.resolve）。
+    _allow = {s.strip() for s in (os.getenv("AI_GATEWAY_PUBLIC_MODELS") or "").split(",") if s.strip()}
+    if _allow:
+        data = [d for d in data if d["id"] in _allow]
+        if not data:
+            # 白名单一个都没匹配到 = 名字写错/模型已改名 ⇒ /v1/models 会静默返回空列表，必须留痕
+            logging.getLogger("gateway").warning(
+                "public_models: AI_GATEWAY_PUBLIC_MODELS=%s 匹配不到任何模型，/v1/models 返回空列表",
+                ",".join(sorted(_allow)))
     return data
 
 
@@ -781,7 +843,11 @@ def update_alias_group_api(name: str, body: AliasGroupSaveReq):
     """整组保存别名成员（按 priority 升序重排为 10,20,...；最小者为默认）。
 
     body.new_name 非空且 ≠ URL 组名 → 整组重命名（目标名撞名 422），返回的
-    group 为最终名。"""
+    group 为最终名。
+
+    复杂度路由定死常开（2026-10-26 起不再提供开关）：intent 字段仅保留兼容，
+    保存值不再影响行为——选头只看启用成员档位（tier）是否有 ≥2 种。
+    """
     try:
         members = _normalize_alias_providers(body.members)
         saved = get_admin_store().update_alias_group(
@@ -789,6 +855,7 @@ def update_alias_group_api(name: str, body: AliasGroupSaveReq):
             members,
             description=body.description,
             new_name=body.new_name,
+            intent=body.intent,
         )
     except ValueError as e:
         raise HTTPException(422, str(e))
@@ -804,9 +871,10 @@ def delete_alias_group_api(name: str):
     """
     try:
         get_admin_store().delete_alias_group(name)
+    except KeyError:
+        raise HTTPException(404, f"别名组不存在：{name}")
     except ValueError as e:
-        msg = str(e)
-        raise HTTPException(404 if "not found" in msg else 422, msg)
+        raise HTTPException(422, str(e))
     return {"ok": True, "group": name}
 
 
@@ -1007,7 +1075,9 @@ def update_provider_api(request: Request, name: str, body: ProviderUpsertReq):
                         m["provider"] = target
                         changed = True
                 if changed:
-                    store.update_alias_group(g.get("name"), members, description=g.get("description") or "")
+                    store.update_alias_group(g.get("name"), members,
+                                             description=g.get("description") or "",
+                                             intent=bool(g.get("intent")))
         except Exception as e:
             raise HTTPException(422, f"别名组引用更新失败：{e}")
         # policy 规则 target（不改则规则静默指向已不存在的 provider ⇒ 行为漂移）
@@ -1177,7 +1247,7 @@ def create_policy_api(body: PolicyRuleReq, request: Request):
     try:
         rule = policy_admin.upsert_policy(body.model_dump(), operator=_operator(request))
     except ValidationError as e:
-        raise HTTPException(422, e.errors(include_url=False))
+        raise HTTPException(422, _verrors(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"ok": True, "rule": rule}
@@ -1192,7 +1262,7 @@ def update_policy_api(name: str, body: PolicyRuleReq, request: Request):
     try:
         rule = policy_admin.upsert_policy(data, original_name=name, operator=_operator(request))
     except ValidationError as e:
-        raise HTTPException(422, e.errors(include_url=False))
+        raise HTTPException(422, _verrors(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"ok": True, "rule": rule}
@@ -1201,16 +1271,33 @@ def update_policy_api(name: str, body: PolicyRuleReq, request: Request):
 @router.delete("/policies/{name}")
 def delete_policy_api(name: str, request: Request):
     from src.gateway import policy_admin
-    if not policy_admin.delete_policy(name, operator=_operator(request)):
-        raise HTTPException(404, "rule not found")
+    try:
+        deleted = policy_admin.delete_policy(name, operator=_operator(request))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if not deleted:
+        raise HTTPException(404, "规则不存在")
     return {"ok": True, "deleted": name}
 
 
 @router.get("/policy/versions")
 def policy_versions_api(limit: int = 50):
-    """policy.yaml 历史版本列表（每次写盘前快照；yaml_text 仅 200 字预览）。"""
-    items = get_admin_store().list_policy_versions(limit)
+    """policy.yaml 历史版本列表（每次写盘前快照）。
+
+    每行带 `changes` = 该快照与「下一更新状态」的内容差（最新版与现网文件比，
+    含手改漂移）；yaml_text 仍只给 200 字预览，全文走 /versions/{vid}。"""
+    from src.gateway import policy_admin
+    items = get_admin_store().list_policy_versions(limit, full=True)  # 新→旧
+    try:
+        current = policy_admin._policy_path().read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+    # 先算完所有 diff 再截断：截断会毁掉后面行要引用的相邻全文
+    for i, r in enumerate(items):
+        r["changes"] = policy_admin.diff_policy_texts(
+            r["yaml_text"], items[i - 1]["yaml_text"] if i > 0 else current)
     for r in items:
+        r["yaml_text"] = (r["yaml_text"] or "")[:200]
         r["ts"] = to_beijing(r.get("ts"))
     return {"items": items}
 
@@ -1219,7 +1306,7 @@ def policy_versions_api(limit: int = 50):
 def policy_version_api(vid: int):
     v = get_admin_store().get_policy_version(vid)
     if v is None:
-        raise HTTPException(404, "version not found")
+        raise HTTPException(404, "版本不存在")
     return v
 
 
@@ -1229,7 +1316,7 @@ def policy_version_rollback_api(vid: int, request: Request):
     from src.gateway import policy_admin
     v = get_admin_store().get_policy_version(vid)
     if v is None:
-        raise HTTPException(404, "version not found")
+        raise HTTPException(404, "版本不存在")
     op = _operator(request)
     try:
         n = policy_admin.restore_policy_yaml(v["yaml_text"], operator=op, source="rollback")
@@ -1257,8 +1344,8 @@ def match_choices_api():
             {"key": f"{ct}|{mt}", "content_type": ct, "match_type": mt, "label": label, "desc": desc}
             for ct, mt, label, desc in policy_admin.MATCH_CHOICES
         ],
-        # 自带字段的匹配类型不绑内容类型，单列出来让 UI 也能选。
-        # hour_range 不在下拉里：时段规则只能手写 when_json（引擎 time.hour 运算符保留）
+        # 自带字段的匹配类型不绑内容类型，单列出来让 UI 也能选（本地时段 hour_range
+        # 在下拉里可选，但不能进多行条件组——它自身就是 any/all 壳，build_when_group 显式拒）
          "self_field": [
             {"key": f"size|size", "content_type": "size", "match_type": "size", "label": "文件大小 ≥",
              "desc": "匹配项=字节数：文件大小达到或超过该值才算命中（例：1048576=1MB，20971520=20MB）。只对带附件的请求生效，纯文本请求 size=0 永不命中"},
@@ -1322,7 +1409,7 @@ async def l2_test_api(body: L2TestReq):
     """L2 规则测试（5.3）：待识别内容 -> 审查判定（label/confidence/reason）。"""
     from src.gateway.small_model import classify, is_degraded
     if not body.text.strip() and not body.filename:
-        raise HTTPException(422, "text or filename is required")
+        raise HTTPException(422, "text 或 filename 不能为空")
     result = await classify(body.text, body.filename, body.headers, body.sheet_names)
     # degraded=True 表示 L2 没产出可信判定（超时/坏 JSON/熔断）——
     # 此时 result["label"] 是兜底值，不代表「内容安全」，必须显式告知调用者。
@@ -1451,7 +1538,7 @@ def l2_config_put(req: L2ConfigPutReq):
         if v is None:
             continue
         if k == "AI_GATEWAY_L2_BACKEND" and str(v).strip().lower() not in ("qwen", "laya"):
-            raise HTTPException(422, "AI_GATEWAY_L2_BACKEND must be qwen|laya")
+            raise HTTPException(422, "L2 后端只能是 qwen 或 laya")
         if k == "AI_GATEWAY_L2_BACKEND":
             v = str(v).strip().lower()
         if k == "AI_GATEWAY_SUGGEST_VIOLATION_THRESHOLD":
@@ -1502,7 +1589,7 @@ def _save_prompts(system, template, operator="", source="save"):
     None=不动，""=还原默认。"""
     from src.gateway import small_model as _sm
     if system is None and template is None:
-        raise HTTPException(422, "nothing to save")
+        raise HTTPException(422, "没有可保存的内容")
     get_admin_store().save_prompt_version(
         _sm.get_system_prompt(), _sm.get_user_prompt_template(),
         operator=operator, source=source)
@@ -1548,7 +1635,7 @@ def l2_prompt_versions_api(limit: int = 50):
 def l2_prompt_version_api(vid: int):
     v = get_admin_store().get_prompt_version(vid)
     if v is None:
-        raise HTTPException(404, "version not found")
+        raise HTTPException(404, "版本不存在")
     return v
 
 
@@ -1557,7 +1644,7 @@ def l2_prompt_version_rollback_api(vid: int, request: Request):
     """回滚到指定版本（现状再快照，可再反悔；即时生效 + 落盘）。"""
     v = get_admin_store().get_prompt_version(vid)
     if v is None:
-        raise HTTPException(404, "version not found")
+        raise HTTPException(404, "版本不存在")
     return _save_prompts(v["system_prompt"] or "", v["user_template"] or "",
                          operator=_operator(request), source="rollback")
 
@@ -1868,7 +1955,7 @@ def l2_divergences_label(req: L2LabelReq):
     """标注分歧样本（v10 训练原料）。label=null 取消标注。同组（同文本同向）全组联动，
     新灌重复行自带同标，显示层继承（l2_divergences）兜底历史数据。"""
     if not req.req_id:
-        raise HTTPException(422, "req_id required")
+        raise HTTPException(422, "req_id 不能为空")
     store = get_admin_store()
     try:
         allrows = _l2_divergence_rows(720)
@@ -2390,7 +2477,7 @@ async def route_inspect_api(body: RouteInspectReq):
               "reason": decision0.get("reason") or ""}
         l1_out = {"rule": l1["name"], "action": l1["action"], "reason": l1["reason"],
                   "findings": {k: v for k, v in (findings0 or {}).items() if v}}
-        _gray0 = _m._l2_gray_trigger(findings0)
+        _gray0 = _m._l2_always() or _m._l2_gray_trigger(findings0)
         l2_out = {"triggered": bool(l2r0),
                   "trigger": "gray" if l2r0 else None,
                   "latency_ms": (l2r0 or {}).get("latency_ms"),
@@ -2400,7 +2487,7 @@ async def route_inspect_api(body: RouteInspectReq):
                   "degraded": _m.is_degraded(l2r0) if l2r0 else False}
         if not l2r0:
             l2_out["skipped"] = ("L1 未放行" if l1["action"] != "allow"
-                                 else "未进灰区（L2 只看 risk 灰区[20,60)，不计字数）")
+                                 else "未进灰区（L2 只看 risk ≥ 灰区下限，无上界，不计字数）")
         decision = decision0
         _fn = " ".join((f.filename or "").strip() for f in files if (f.filename or "").strip())
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel or "text",
@@ -2446,7 +2533,7 @@ async def route_inspect_api(body: RouteInspectReq):
                 decision = d
         elif l1.get("action") == "allow":
             # 全是仅文件名：按合并文本走文本门（文件名关键词可进灰区；不计字数）
-            _gray = _m._l2_gray_trigger(findings)
+            _gray = _m._l2_always() or _m._l2_gray_trigger(findings)
             if _gray:
                 t0 = _t.monotonic()
                 res = await _m.small_classify(text, filename="", headers=[], sheet_names=[])
@@ -2463,7 +2550,7 @@ async def route_inspect_api(body: RouteInspectReq):
                 if d is not None:
                     decision = d
             else:
-                l2_out["skipped"] = "未进灰区（L2 只看 risk 灰区，不计字数）"
+                l2_out["skipped"] = "未进灰区（L2 只看 risk ≥ 灰区下限，无上界，不计字数）"
         else:
             l2_out["skipped"] = "L1 未放行"
         return _route_inspect_finish(decision, l1_out, l2_out, files_out, channel,
@@ -2489,10 +2576,24 @@ async def route_inspect_api(body: RouteInspectReq):
 
     decision = l1
     l2_out: dict = {"triggered": False}
-    _gray = _m._l2_gray_trigger(findings)
+    _gray = _m._l2_always() or _m._l2_gray_trigger(findings)
     if l1.get("action") == "allow" and _gray:
         t0 = _t.monotonic()
-        res = await _m.small_classify(text, filename="", headers=[], sheet_names=[])
+        # 与线上 chat 同一口径：按 scope 配置取块（long_text 会展开成多段），
+        # 否则干跑只审 text 单块，长文覆盖率被低估。
+        _blocks = _m._select_l2_scopes("chat", [{"role": "user", "content": text}], text)
+        if not _blocks:
+            _blocks = [("last_user", text)]
+        if len(_blocks) == 1:
+            res = await _m.small_classify(_blocks[0][1], filename="", headers=[], sheet_names=[])
+        else:
+            res = await _m.classify_chunks([t for _, t in _blocks],
+                                           filename="", headers=[], sheet_names=[],
+                                           scopes=[s for s, _ in _blocks])
+        if isinstance(res, dict):
+            res["scope"] = (res.get("scope") or _blocks[0][0]) if _blocks else None
+            res["scopes_run"] = [s for s, _ in _blocks]
+            res.setdefault("degraded_scopes", [])
         l2_out = {
             "triggered": True,
             "trigger": "gray",
@@ -2501,13 +2602,16 @@ async def route_inspect_api(body: RouteInspectReq):
             "confidence": (res or {}).get("confidence"),
             "reason": (res or {}).get("reason"),
             "degraded": _m.is_degraded(res),
+            "scope": (res or {}).get("scope"),
+            "scopes_run": (res or {}).get("scopes_run"),
+            "degraded_scopes": (res or {}).get("degraded_scopes"),
         }
         d = _m._l2_decision(res)
         if d is not None:
             decision = d
     else:
         l2_out["skipped"] = ("L1 未放行" if l1.get("action") != "allow"
-                             else "未进灰区（L2 只看 risk 灰区，不计字数）")
+                             else "未进灰区（L2 只看 risk ≥ 灰区下限，无上界，不计字数）")
 
     return _route_inspect_finish(decision, l1_out, l2_out, [], "text",
                                  body.model, _rt, provider_keys,
