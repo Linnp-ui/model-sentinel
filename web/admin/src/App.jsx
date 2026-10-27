@@ -14,9 +14,13 @@ import {
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
 
+// 瞬时失败后自动清除「同步失败」红标的等待时间（ms）。
+const SYNC_ERROR_AUTO_CLEAR_MS = 15000;
+
 // ---------------- 全局状态条：外网 key / 内网 / L2 / 熔断 / 审计，SSE 推送 ----------------
 function StatusBar() {
   const [st, setSt] = useState(null);
+  const [syncErr, setSyncErr] = useState(null);
   const apply = useCallback((raw) => {
     const h = raw.health, c = raw.circuit, l2 = raw.l2 || {}, a = raw.audit;
     if (!h || !c) return;
@@ -54,6 +58,20 @@ function StatusBar() {
     };
     return () => es.close();
   }, [apply]);
+  useEffect(() => {
+    let timer = null;
+    const handler = (e) => {
+      const d = e.detail || {};
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (d.ok) setSyncErr(null);
+      else {
+        setSyncErr(d.text || `HTTP ${d.status || ''}`);
+        timer = setTimeout(() => setSyncErr(null), SYNC_ERROR_AUTO_CLEAR_MS);
+      }
+    };
+    window.addEventListener('gw:sync', handler);
+    return () => { if (timer) clearTimeout(timer); window.removeEventListener('gw:sync', handler); };
+  }, []);
   if (!st) return null;
   // 单行状态：L2 / 外网 / 内网 / 熔断 / 审计 并排，无流程图；节点色=状态，tooltip=详情
   const node = (color, critical, tip, children) => (
@@ -93,6 +111,7 @@ function StatusBar() {
       {node(st.dropped > 0 ? 'orange' : st.auditBad ? 'red' : 'green',
         st.dropped > 0 || st.auditBad, `审计日志（每次调用的记录）写入情况：${st.auditTip}`,
         st.dropped > 0 ? `审计丢行 ${st.dropped}` : st.auditBad ? '审计/DB 异常' : '审计/DB 正常')}
+      {syncErr ? node('red', true, `控制台同步失败：${syncErr}`, '同步失败') : null}
       </span>
     </div>
   );

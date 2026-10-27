@@ -68,7 +68,7 @@ export function SystemBuiltinMark() {
   return (
     <Tooltip title={SYSTEM_RULE_HINT}>
       <InfoCircleOutlined aria-label="系统内置判定" data-testid="system-builtin-mark"
-        style={{ color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)', marginInlineStart: 'var(--gw-sp-4)' }} />
+        style={{ color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)', marginInlineStart: 'var(--gw-sp-4)', verticalAlign: 'baseline' }} />
     </Tooltip>
   );
 }

@@ -214,6 +214,24 @@ async def _l2_overrides_startup():
     from src.gateway.l2_overrides import apply_overrides
     apply_overrides()
 
+@app.on_event("startup")
+async def _startup_validate():
+    # 生产强校验：仅在启用 admin 密码（生产形态）时强制；dev/测试无密码则跳过，避免破坏 conftest 隔离。
+    if not _admin_password():
+        return
+    errs = []
+    if not (os.getenv("ADMIN_DB_URL") or os.getenv("DATABASE_URL")):
+        errs.append("ADMIN_DB_URL/DATABASE_URL 未配置：审计/明细将落内存后端，重启即丢")
+    if not (os.getenv("AUDIT_MYSQL_URL") or os.getenv("AUDIT_DATABASE_URL")):
+        errs.append("AUDIT_MYSQL_URL/AUDIT_DATABASE_URL 未配置：审计落内存后端")
+    if (os.getenv("AI_GATEWAY_L2_FAIL_MODE", "") or "").strip().lower() == "open":
+        errs.append("AI_GATEWAY_L2_FAIL_MODE=open：L2 不可用时放行，可能泄密，生产应为 route_local")
+    dev_key = (os.getenv("AI_GATEWAY_DEV_API_KEY", "") or "").strip()
+    if dev_key == "pk_live_dev_changeme" or not dev_key:
+        errs.append("AI_GATEWAY_DEV_API_KEY 未设置或仍为默认弱值")
+    if errs:
+        raise RuntimeError("生产启动校验失败：\n- " + "\n- ".join(errs))
+
 
 @app.on_event("startup")
 async def _log_retention_startup():
@@ -2153,6 +2171,17 @@ def _infer_status(entry: dict) -> int:
     return 0
 
 
+def _entry_status(e) -> int:
+    """审计行状态码：优先后端显式留痕（status_code/upstream_error），否则按 action/rule 反推。"""
+    for _k in ("status_code", "status", "upstream_error"):
+        _v = e.get(_k)
+        if isinstance(_v, int) and _v > 0:
+            return _v
+        if isinstance(_v, str) and _v.strip().isdigit():
+            return int(_v)
+    return _infer_status(e)
+
+
 def _entry_blocked(entry: dict) -> bool:
     """审计条目是否算「拦截」——口径唯一实现在 stat_scope.is_blocked()。
 
@@ -2237,67 +2266,8 @@ def _parse_sse_usage_event(ev: bytes, out: dict, client_wants_usage: bool) -> by
 # ---------------------------------------------------------------- 端点
 
 
-@app.get("/")
-
-async def index():
-    # 演示页已删（验证功能并入管理台「路由检查」页）；根路径 302 到管理台
-    return RedirectResponse("/admin")
-
-
-@app.get("/favicon.ico")
-@app.get("/favicon.png")
-async def favicon():
-    """Browser tab icon (Image 1)."""
-    p = os.path.join(os.path.dirname(__file__), "../../static/favicon.png")
-    if os.path.exists(p):
-        return FileResponse(p, media_type="image/png")
-    return Response(status_code=404)
-
-
-@app.get("/ca.crt")
-async def ca_cert():
-    """内网 CA 根证书下载：浏览器/客户端装入信任库后，网关证书不再"不安全"。"""
-    p = os.path.join(os.path.expanduser("~"), ".config", "gateway", "tls", "ca.crt")
-    if os.path.exists(p):
-        return FileResponse(p, media_type="application/x-x509-ca-cert",
-                            filename="gateway-internal-ca.crt")
-    return Response(status_code=404)
-
-
-@app.get("/ca.crl")
-async def ca_crl():
-    """内网 CA 的吊销列表（CRL）：证书 crlDistributionPoints 指向此路径，供
-    Windows/schannel 等做吊销检查（无 CDP 时报 CRYPT_E_NO_REVOCATION_CHECK）。
-    证书在 ~/.config/gateway/tls/（仓库外），空 CRL 由 deploy 流程生成。"""
-    p = os.path.join(os.path.expanduser("~"), ".config", "gateway", "tls", "ca.crl")
-    if os.path.exists(p):
-        return FileResponse(p, media_type="application/pkix-crl")
-    return Response(status_code=404)
-
-
-@app.get("/health")
-
-async def health():
-    return _health_payload()
-
-
-def _health_payload() -> dict:
-    """状态条 SSE（admin_api.status_stream）复用同一份逻辑，故拆成同步函数。"""
-    cfg = load_routing()
-    from .provider_probe import get_liveness
-    return {
-
-        "status": "ok",
-        "policy_count": len(load_policy()),
-        "providers": {n: {"local": p.local, "kind": p.kind, "configured": p.configured} for n, p in cfg.providers.items()},
-        # 主动探测缓存（provider_probe 后台每 30s 打一轮 /models）：up/latency/error。
-        # 只读缓存不主动打网络，/health 保持快。模型挂了这里 ok=false → 状态条亮红。
-        "provider_liveness": get_liveness(),
-        "default_external": cfg.default_external,
-        "default_local": cfg.default_local,
-        "on_block": cfg.on_block,
-
-    }
+# 静态/下载路由已迁移到 static_router（见 src/gateway/static_router.py）
+# /health 已迁移到 health_router（见 src/gateway/health_router.py）
 
 
 @app.get("/v1/models")
@@ -3628,7 +3598,7 @@ def _audit_shadow_mismatch(e) -> bool:
 
 
 def _audit_filter_rows(rows, *, ip="", token="", action="", provider="", rule="", type_="",
-                       q="", shadow="", since_dt=None, until_dt=None):
+                       q="", shadow="", since_dt=None, until_dt=None, status=""):
     """审计行统一筛选（列表接口与 CSV 导出共用，避免两处口径漂移）。
 
     ⚠️ 筛选项是**叠加**（AND）关系：时间窗必须作用在已按 action/rule 等筛过的集合上。
@@ -3681,109 +3651,23 @@ def _audit_filter_rows(rows, *, ip="", token="", action="", provider="", rule=""
             out = [e for e in out if _audit_row_match_q(e, ql)]
     if (shadow or "").strip() == "mismatch":
         out = [e for e in out if _audit_shadow_mismatch(e)]
+    # 状态码：支持精确值（403/429/502/503…）与类（2xx/3xx/4xx/5xx）；类不匹配
+    # upstream_error 留痕的失败行不会漏（按 _entry_status 统一解析）。
+    _st = (status or "").strip().lower()
+    if _st:
+        if _st.endswith("xx"):
+            _lo = int(_st[0]) * 100
+            out = [e for e in out if _lo <= _entry_status(e) <= _lo + 99]
+        else:
+            try:
+                _st = int(_st)
+                out = [e for e in out if _entry_status(e) == _st]
+            except ValueError:
+                pass
     return out
 
 
-@app.get("/admin/audit/entries", dependencies=[Depends(admin_page_auth)])
-
-async def audit_entries_api(request: Request, ip: Optional[str] = None, token: Optional[str] = None, action: Optional[str] = None, page: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None, provider: Optional[str] = None, rule: Optional[str] = None, q: Optional[str] = None, sort: Optional[str] = None, shadow: Optional[str] = None):
-    # Filtering: ip (client_ip) and action
-    store = get_audit_store()
-
-    # 固定每页 50 条；接受 str/int/None
-    limit = 50
-    try:
-
-        page = int(page)
-
-    except Exception:
-
-        page = 1
-
-    page = max(1, page)
-
-    # 为分页需要足够数据，固定拉取 5000 条（覆盖 100页*50），足够仪表盘使用且不影响性能
-    fetch_n = 5000
-
-    # 仪表盘筛选：始终基于 Redis 热缓存 tail（oldest-first），内存过滤后分页，保持与表格一致
-    all_entries = store.tail(fetch_n)
-    _enrich_audit_key_name(all_entries)
-    # 时间范围：since/until 支持 1h/24h/7d/30d 或 YYYY-MM-DD 或 ISO
-    # 朴素日期串按用户口径（北京）解释，内部换算 UTC 与存储比较
-    since_dt = _parse_window_ts(since, naive_as_utc=False)
-    until_dt = _parse_window_ts(until, is_until=True, naive_as_utc=False)
-    # 统一筛选（与 CSV 导出同一套口径）：各条件叠加 AND
-    entries = _audit_filter_rows(all_entries, ip=ip, token=token, action=action,
-                                 provider=provider, rule=rule, q=q, shadow=shadow,
-                                 since_dt=since_dt, until_dt=until_dt)
-
-    # 排序：默认严格 time_desc（最新在前），支持 time_asc / provider / rule / type
-    def _t_key(x):
-        return str(x.get("time") or x.get("ts") or "").replace("T", " ")[:19]
-    _sort = (sort or "").strip()
-    if _sort == "provider":
-        entries = sorted(entries, key=lambda x: (x.get("provider") or "", _t_key(x)), reverse=True)
-    elif _sort == "rule":
-        entries = sorted(entries, key=lambda x: (x.get("rule") or "", _t_key(x)), reverse=True)
-    elif _sort == "type":
-        entries = sorted(entries, key=lambda x: (x.get("type") or "", _t_key(x)), reverse=True)
-    elif _sort == "time_asc":
-        entries = sorted(entries, key=_t_key)
-    else:
-        entries = sorted(entries, key=_t_key, reverse=True)
-
-    # KPI 统计基于筛选后全量（分页前）
-    total_filtered = len(entries)
-    total_pages = max(1, (total_filtered + limit - 1) // limit)
-    if page > total_pages:
-
-        page = total_pages
-
-    # 分页切片（排序已在上方显式完成，默认 time_desc 时 page=1 即最新一页、页内最新在前）
-    start = (page-1)*limit
-    end = start+limit
-    page_entries = entries[start:end]
-
-
-    # --- stats for header KPI ---  # 基于筛选后全量（分页前）
-    total = total_filtered
-    c_allow = sum(1 for e in entries if e.get("action")=="allow")
-    c_route = sum(1 for e in entries if is_local_route(e.get("action")))
-    c_block = sum(1 for e in entries if _entry_blocked(e))
-    c_other = total - c_allow - c_route - c_block
-
-    # KPI 真值：筛选可用 SQL 表达（时间/动作/规则）时走审计库聚合（90 天留存），
-    # 否则回退热窗口径。列表始终受 Redis 热窗 ≤5000 条限制（audit_store.MAX_ENTRIES），
-    # 两口径并存，kpi.source 让前端标注来源；顶层 total/c_* 仍是窗口口径（分页用）。
-    kpi = {"total": total, "c_allow": c_allow, "c_route": c_route,
-           "c_block": c_block, "c_other": c_other, "source": "window"}
-    _un_sqlable = any((x or "").strip() for x in (ip, token, provider, q, shadow))
-    if not _un_sqlable:
-        _c = store.count_mysql(since=since_dt, until=until_dt,
-                               action=(action or "").strip() or None,
-                               rule=(rule or "").strip() or None)
-        if _c:
-            kpi = {"total": _c["total"], "c_allow": _c["c_allow"], "c_route": _c["c_route"],
-                   "c_block": _c["c_block"],
-                   "c_other": _c["total"] - _c["c_allow"] - _c["c_route"] - _c["c_block"],
-                   "source": "mysql"}
-    def _plain(v):
-        if v is None or isinstance(v, (str, int, float, bool)):
-            return v
-        return str(v)
-
-    _keys = ("time", "type", "rule", "action", "provider", "local", "model",
-             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2")
-    return JSONResponse({
-        "total": total, "page": page, "pages": total_pages, "limit": limit,
-        "c_allow": c_allow, "c_route": c_route, "c_block": c_block,
-        "c_other": c_other,
-        # 头部 KPI 口径（source=mysql 审计库真值 / window 热窗 ≤5000）；顶层 total/c_* 保持窗口口径供分页
-        "kpi": kpi,
-        # l2 保持对象原样（主判定 + 影子 shadow_*），前端展开行渲染；_plain 会把 dict 压成 str，不用它
-        "entries": [{k: (to_beijing(e.get(k)) if k == "time" else (e.get(k) if k == "l2" else _plain(e.get(k)))) for k in _keys} for e in page_entries],
-    })
-
+# 审计列表路由已迁移到 audit_router（见 src/gateway/audit_router.py）
 
 @app.get("/admin", dependencies=[Depends(admin_page_auth)])
 async def admin_legacy_redirect():
@@ -3791,155 +3675,7 @@ async def admin_legacy_redirect():
     return RedirectResponse("/admin/app", status_code=302)
 
 
-@app.get("/admin/csv")
-
-async def export_csv(
-    _ip: str = Depends(admin_auth),
-    since: Optional[str] = None,       # ISO 8601 or "YYYY-MM-DD" or "1h"/"24h"/"7d"
-    until: Optional[str] = None,       # ISO 8601 or "YYYY-MM-DD"; default = now
-    action: Optional[str] = None,      # allow | route_local | block
-    rule: Optional[str] = None,
-    type: Optional[str] = None,        # chat | file | messages | responses | embedding
-    ip: Optional[str] = None,          # client_ip filter
-    token: Optional[str] = None,       # caller key (masked) filter
-    q: Optional[str] = None,           # keyword filter
-    shadow: Optional[str] = None,      # mismatch = 只留主影判定不一致
-    source: Optional[str] = "auto",    # auto | redis | mysql  (auto = mysql if since/until given)
-    limit: int = 5000,
-
-):
-
-    """Export audit log as CSV.
-
-
-
-    - No since/until: pulls hot cache (Redis, fast, last 5000).
-
-    - With since/until: queries MySQL for time-range + filters (90-day window).
-
-    - Time shortcuts: "1h", "24h", "7d", "30d" relative to now.
-
-    筛选条件与列表接口同一套口径（_audit_filter_rows）：动作/规则/时间窗等叠加 AND。
-
-    """
-    import csv, io
-    store = get_audit_store()
-    cols = ["time", "type", "rule", "action", "provider", "local", "model", "requested_model",
-            "downgraded_from", "filename", "text_preview", "id", "client_ip", "token_masked", "key_name"]
-
-    def _csv_safe(v):  # 防 Excel 公式注入：=,+,-,@ 开头加单引号前缀
-        if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
-            return "'" + v
-        return v
-
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=cols)
-    w.writeheader()
-    if since or until:
-        since_dt = _parse_window_ts(since, naive_as_utc=False)
-        until_dt = _parse_window_ts(until, default=datetime.utcnow(), is_until=True, naive_as_utc=False)
-        # action/rule/type 走 SQL；其余（ip/q/token/shadow）内存筛
-        rows = store.query_mysql(since=since_dt, until=until_dt, action=action, rule=rule, type_=type, limit=limit)
-        _enrich_audit_key_name(rows)
-        rows = _audit_filter_rows(rows, ip=ip, token=token, q=q, shadow=shadow)
-        for r in rows:
-
-            if "error" in r:
-
-                continue
-
-            _row = {
-
-                "time": to_beijing(r.get("ts", "")),
-                "type": r.get("type", ""),
-                "rule": r.get("rule", ""),
-                "action": r.get("action", ""),
-                "provider": r.get("provider", "") or "",
-                "local": "1" if r.get("local_flag") else "0",
-                "model": r.get("model", "") or "",
-                "requested_model": r.get("requested_model", "") or "",
-                "downgraded_from": r.get("downgraded_from", "") or "",
-                "filename": r.get("filename", "") or "",
-                "text_preview": (r.get("text_preview", "") or "")[:200],
-                "id": r.get("req_id", ""),
-                "client_ip": r.get("client_ip", "") or "",
-                "token_masked": r.get("token_masked", "") or "",
-                "key_name": r.get("key_name") or r.get("token_masked") or "",
-
-            }
-            w.writerow({k: _csv_safe(v) for k, v in _row.items()})
-
-    else:
-        # Redis 热缓存路径：显式按时间升序导出，保证确定性（MySQL 分支已 ORDER BY ts）
-        rows_hot = sorted(store.all(), key=lambda x: str(x.get("time") or x.get("ts") or "").replace("T", " ")[:19])
-        _enrich_audit_key_name(rows_hot)
-        # 筛选与列表接口同口径（早前热窗路径完全不过滤 → 导出 5000 行全量）
-        rows_hot = _audit_filter_rows(rows_hot, ip=ip, token=token, action=action,
-                                      rule=rule, type_=type, q=q, shadow=shadow)
-        for e in rows_hot:
-            if not e.get("key_name"):
-                e["key_name"] = e.get("token_masked") or ""
-            w.writerow({k: (_csv_safe(to_beijing(e.get(k, ""))) if k == "time" else (_csv_safe(e.get(k, "")) if k != "local" else (1 if e.get(k) else 0))) for k in cols})
-
-
-    return HTMLResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=gateway_audit.csv"})
-
-
-@app.get("/admin/metrics")
-
-async def metrics_endpoint(_ip: str = Depends(admin_auth)):
-    return Response(content=get_metrics().render(), media_type=f"text/plain; version={GATEWAY_VERSION}")
-
-
-@app.get("/admin/metrics/timeseries", dependencies=[Depends(admin_page_auth)])
-async def metrics_timeseries(recent: int = 0):
-    """recent>0 只回环尾最近 N 个 tick（总览页 KPI 用，免 30s 轮询拉 24h 全环 ~3.4MB）；
-    缺省 0 = 全环（统计页运行指标段消费）。"""
-    from .metrics_ring import get_ring
-    ring = get_ring()
-    panel = get_metrics().export_panel()
-    try:
-        from .circuit_breaker import get_breaker
-        panel["circuit_providers"] = {p: s.get("state")
-                                      for p, s in get_breaker().snapshot().items()}
-    except Exception:
-        panel["circuit_providers"] = {}
-    try:
-        _ast = get_audit_store()
-        panel["audit"] = {"backend": _ast.backend(), "mysql": _ast.mysql_status()}
-    except Exception:
-        panel["audit"] = {"backend": "unknown", "mysql": "unknown"}
-    panel["boot_ts"] = round(get_metrics()._start, 1)
-    # 环尾可能是重启断点（只有 t/gap，无 l2_up），往前找最后一个真实 tick
-    _last = next((p for p in reversed(ring.points) if "l2_up" in p), None)
-    panel["l2_up"] = _last["l2_up"] if _last else None
-    panel["ring"] = ring.status()
-    ticks = list(ring.points)
-    if recent > 0:
-        ticks = ticks[-recent:]
-    return JSONResponse({"interval_s": ring.tick_s, "ticks": ticks, "panel": panel})
-
-
-@app.get("/admin/audit/status")
-
-async def audit_status(_ip: str = Depends(admin_auth)):
-    """Show audit backend status (Redis hot cache + MySQL long-term)."""
-    store = get_audit_store()
-    # 密码脱敏：redis url 与 backend 串里都带明文密码，不进管理 API 响应
-    _redact = lambda u: re.sub(r"://[^@/]*@", "://***@", str(u or ""))
-    return {
-
-        "backend": _redact(store.backend()),
-        "redis": {
-
-            "connected": store._r is not None,
-            "url": _redact(store._r_url),
-
-        },
-        "mysql": store.mysql_status(),
-
-    }
-
+# csv/audit/status 路由已迁移到 audit_router（见 src/gateway/audit_router.py）
 
 def _parse_window_ts(v, now=None, is_until=False, default=None, naive_as_utc=True):
     """时间窗参数 -> UTC 时基朴素 datetime（唯一实现）。
@@ -3963,7 +3699,7 @@ def _parse_window_ts(v, now=None, is_until=False, default=None, naive_as_utc=Tru
     if isinstance(v, datetime):
         return _aware(v) if v.tzinfo is not None else _naive(v)
     v = str(v).strip()
-    now = now or datetime.utcnow()
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     if v.endswith("h") or v.endswith("d"):
         try:
             n_ = int(v[:-1])
@@ -4009,6 +3745,14 @@ def _verify_admin_pw(pw: str) -> bool:
 
 
 app.include_router(_admin_api.router, dependencies=[Depends(admin_auth)])
+from . import health_router as _health_router
+app.include_router(_health_router.router)
+from . import static_router as _static_router
+app.include_router(_static_router.router)
+from . import metrics_router as _metrics_router
+app.include_router(_metrics_router.router)
+from . import audit_router as _audit_router
+app.include_router(_audit_router.router)
 
 
 class _AdminStaticFiles(StaticFiles):

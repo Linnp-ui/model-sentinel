@@ -9,7 +9,7 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 from urllib.parse import urlsplit
 
@@ -221,7 +221,7 @@ class _MySQLWriter:
                 else:
                     ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
             else:
-                ts = datetime.utcnow()
+                ts = datetime.now(timezone.utc).replace(tzinfo=None)
             _risk = entry.get("risk_score")
             if _risk is not None:
                 _risk = int(_risk)

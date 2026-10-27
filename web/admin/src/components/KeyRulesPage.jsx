@@ -204,7 +204,7 @@ function SuggestThresholdsModal({ open, onClose, onSaved, focusType }) {
         </div>
       }>
         <span style={{ cursor: 'help', fontSize: 'var(--gw-fs-12)', color: 'rgba(0,0,0,0.45)', whiteSpace: 'nowrap' }}>
-          口径说明 <QuestionCircleOutlined />
+          口径说明 <QuestionCircleOutlined style={{ verticalAlign: 'baseline' }} />
         </span>
       </Popover>
     </Space>} open={open} onCancel={onClose} width={800} destroyOnClose

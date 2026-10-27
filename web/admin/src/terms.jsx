@@ -25,7 +25,6 @@ export const G = {
   embedding: '向量模型：把文字转成一串数字（用来「找相似、检索资料」），不生成回答。',
   alias_group: '对外模型别名组：给客户端用的模型名，背后挂一串上游候选，主的挂了自动换下一个。客户端只认这个别名。',
   candidate: '外部候选：别名组里的一个「上游服务 + 模型」组合，按顺序试。',
-  failback: '外网候选自动切换：主候选失败时自动改用下一个外网候选（内网候选不参与这条切换链）。',
   internal_model: '内部模型：公司内网可用的模型清单（别名组和审查模型都从这儿选）。',
 
   // —— 稳定性 ——
@@ -71,6 +70,6 @@ export const G = {
 export const Tip = ({ term, text, style }) => (
   <Tooltip title={text || G[term] || ''} overlayStyle={{ maxWidth: 380 }}>
     <QuestionCircleOutlined role="img" aria-label="术语说明"
-      style={{ color: 'var(--gw-faint)', fontSize: 'var(--gw-fs-12)', marginInlineStart: 'var(--gw-sp-4)', verticalAlign: 'middle', cursor: 'help', ...style }} />
+      style={{ color: 'var(--gw-faint)', fontSize: 'var(--gw-fs-12)', marginInlineStart: 'var(--gw-sp-4)', verticalAlign: 'baseline', cursor: 'help', ...style }} />
   </Tooltip>
 );

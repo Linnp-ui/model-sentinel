@@ -49,7 +49,8 @@
   失败看 `detail.type`（`key_blocked` / `rate_limited` / `quota_exceeded` / `model_not_chat` …），
   401 区分「缺 API key」与「key 未登记/无效」，黑名单 403 同时带 `detail` 与 `error`（SDK 兼容）
 - **L2 双后端 + 影子双跑**：`AI_GATEWAY_L2_BACKEND=qwen|laya`；影子期主后端权威、
-  laya 同流量并行打标，数据达标后一键切换；L2 提示词可管理台热改
+  laya 同流量并行打标，数据达标后一键切换；L2 system prompt 可在模型配置页热改
+  （user 模板固定内置；规则页有 L2 提示词历史版本卡：查看/回滚）
 - **L2 一键重训管道**：审计人工标注 ≥10 条 → `POST /admin/api/l2/retrain`
   （数据集构建 → GPU 微调 → 候选服务跑 battery/标注回归/历史分歧回归）→ 人工 promote
   切换影子权重；管理台 L2 页含影子趋势/分歧标注/导出；`scripts/l2_check.py` 一条命令体检候选版本
@@ -62,7 +63,7 @@
   外发域名/路径白名单（`AI_GATEWAY_STRICT_EGRESS`）、24h 指标环 + Prometheus `/admin/metrics`
 - **管理台**（`/admin`，内置前端）：key 登记/启停、规则 CRUD、provider 注册、对外模型别名组、
   外网候选（价格/上下文/rank + 失败自动切换）、内部模型登记（含健康检查）、模型限流、
-  L2 配置/提示词、审计查询/CSV 导出、route-inspect 全链路干跑、熔断手动开关
+  L2 配置/提示词（历史版本回滚）、审计查询（状态码筛选）/CSV 导出、route-inspect 全链路干跑、熔断手动开关
 - **文档**：`docs/user-manual.md`（用户接入）/ `docs/admin-manual.md`（管理台操作）
 
 ## 快速开始
@@ -125,7 +126,8 @@ conftest 保证**零真实出境**：`OLLAMA_MOCK=true` + `SMALL_MODEL_ENABLED=f
 ## 目录
 
 ```
-src/gateway/       网关主服务（main/policy/routing/inspection/file_inspector/small_model/admin_api/...）
+src/gateway/       网关主服务（main 核心请求管道 + health/static/metrics/audit_router 拆分路由 /
+                    policy/routing/inspection/file_inspector/small_model/admin_api/...）
   llms/            provider 线协议适配层（OpenAI-compat / Anthropic / Responses 桥）
 tests/             pytest 套件（零出境隔离，fixtures/ 含图纸 PDF 与安全测试集 jsonl）
 static/            管理台前端构建产物（/admin 直服，须与 web/admin 同提交）
@@ -162,5 +164,8 @@ docker-compose.yml / Dockerfile
 - 生产建议：`AI_GATEWAY_UPSTREAM_KEY_MODE=gateway_only`（外发凭据只走网关侧）、
   `AI_GATEWAY_STRICT_EGRESS=true`（兜底路径白名单外 403）、`AI_GATEWAY_ADMIN_IP_ALLOWLIST` 收紧
 - 审计写前自动脱敏密钥（AKIA/PEM/GitHub PAT/sk-ant-/JWT/Bearer）；PII 留原文供追责
+- **生产启动强校验**（2026-10-27 起，仅启用 admin 密码时）：明细/审计库 URL 未配置、
+  `AI_GATEWAY_L2_FAIL_MODE=open`（L2 挂了放行会泄密）、dev key 仍是默认弱值 ⇒ 启动即失败，
+  把「配错静默落内存 / 静默泄密」挡在门外；dev/测试无 admin 密码则跳过
 - 客户端接入只需改 `base_url` + `api_key`，SDK 代码不动；Claude Code / Codex CLI 接入见
   `agents/policy-routing.md`

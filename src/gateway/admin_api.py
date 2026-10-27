@@ -20,7 +20,6 @@
 M2：
   GET    /admin/api/model-policy             1.1/1.2/1.3 模型策略（含 env 只读的审查模型信息）
   PUT    /admin/api/model-policy             整体保存（Pydantic 校验，失败 422 不落盘）
-  POST   /admin/api/model-policy/fallback  运行时 fallback 开关（即时生效，重启后恢复 env）
   GET    /admin/api/policies                 5.1 L1 规则列表
   POST   /admin/api/policies                 新增规则
   PUT    /admin/api/policies/{name}          更新规则（可重命名：body 里带 new_name）
@@ -538,10 +537,6 @@ def get_model_policy():
     pol = mp.load_model_policy()
     return {
         "policy": pol.model_dump(),
-        "env_flag": {
-            "AI_GATEWAY_MODEL_FALLBACK": os.getenv(
-                "AI_GATEWAY_MODEL_FALLBACK", "true"),
-        },
     }
 
 
@@ -561,18 +556,6 @@ def save_model_policy_api(body: ModelPolicySaveReq):
     except ValueError as e:
         raise HTTPException(422, str(e))
     return {"ok": True, "policy": pol.model_dump()}
-
-
-class FallbackReq(BaseModel):
-    enabled: bool
-
-
-@router.post("/model-policy/fallback")
-def set_fallback_api(body: FallbackReq):
-    """运行时开关 AI_GATEWAY_MODEL_FALLBACK：写 os.environ 即时生效（routing 每请求 os.getenv），重启后恢复 env 配置。"""
-    os.environ["AI_GATEWAY_MODEL_FALLBACK"] = "true" if body.enabled else "false"
-    return {"ok": True, "enabled": body.enabled,
-            "effective": os.getenv("AI_GATEWAY_MODEL_FALLBACK", "true")}
 
 
 @router.get("/model-policy/spend")
@@ -1813,7 +1796,7 @@ def _cutoff(hours: int, since: str = ""):
             return _dt.datetime.strptime(str(since).strip()[:19], "%Y-%m-%d %H:%M:%S")
         except Exception:
             pass
-    return _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - _dt.timedelta(hours=hours)
 
 
 def _l2_window_rows(hours: int, since: str = ""):
@@ -2046,7 +2029,7 @@ def events_api(hours: int = 24):
         hours = max(1, min(int(hours), 720))
     except (TypeError, ValueError):
         hours = 24
-    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    since = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - _dt.timedelta(hours=hours)
     rows = get_audit_store().query_mysql(since=since, limit=5000) or []
     start = since.replace(minute=0, second=0, microsecond=0)
     by_hour: dict[str, dict] = {}
@@ -2106,7 +2089,7 @@ def rule_hits_api(hours: int = 168):
         hours = max(1, min(int(hours), 720))
     except (TypeError, ValueError):
         hours = 168
-    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    since = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - _dt.timedelta(hours=hours)
     rows = get_audit_store().query_mysql(since=since, limit=5000) or []
     agg: dict[str, dict] = {}
     total = 0
@@ -2747,7 +2730,7 @@ def _status_snapshot() -> dict:
     """状态条要的四份原始数据，逐个复用现成端点逻辑（不复制计算）。"""
     from src.gateway import small_model as _sm
     from src.gateway.audit_store import get_audit_store
-    from src.gateway.main import _health_payload
+    from src.gateway.health_router import _health_payload
 
     _redact = lambda u: re.sub(r"://[^@/]*@", "://***@", str(u or ""))
     store = get_audit_store()

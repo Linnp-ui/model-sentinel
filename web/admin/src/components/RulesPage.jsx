@@ -1,13 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, Slider, Checkbox, Tooltip, Radio, Switch } from 'antd';
-import { RobotOutlined, DeleteOutlined } from '@ant-design/icons';
+import { RobotOutlined, DeleteOutlined, RightOutlined } from '@ant-design/icons';
 import { api, errText, usePoll } from '../api.js';
+import { L2PromptsSection } from './ModelPolicyPage.jsx';
 import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
 import { ACTION_INFO, RuleZh } from '../ruleNames.jsx';
-import { L2PromptsSection } from './ModelPolicyPage.jsx';
 // ---------------- 5.1/5.2/5.3 规则管理 ----------------
 // ---------------- L2 拦截配置（scope 两档 + 判密阈值；持久化 model_policy.yaml，热重载生效） ----------------
 // 判定档 = L2 小模型的「视野」：每一档各取一段文本、各自判一次密；
@@ -56,7 +56,7 @@ const SCOPE_TIPS = {
 const L2_CROSS_LINK = (
   <Tooltip title="端点 / 模型 / 超时 / 影子 / 灰区下限在「模型配置」页的审查模型卡">
     <Button type="link" size="small" style={{ padding: 0 }}
-      onClick={() => { window.location.hash = '/modelpolicy'; }}>审查模型 →</Button>
+      onClick={() => { window.location.hash = '/modelpolicy'; }}>审查模型 <RightOutlined /></Button>
   </Tooltip>
 );
 
@@ -167,6 +167,7 @@ export default function RulesPage() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsFailed, setModelsFailed] = useState(false);
   const [versions, setVersions] = useState([]);
+  const [promptVersions, setPromptVersions] = useState([]);
   const [choices, setChoices] = useState(null);
   // 条件组构造器：多行（字段+匹配方式+匹配项）+ any/all 组合；单行时等价老单条件
   const [rows, setRows] = useState([]);
@@ -188,6 +189,7 @@ export default function RulesPage() {
       title: [...new Set(cts.map((x) => x.desc).filter(Boolean))].join('；') };
   });
   const [verView, setVerView] = useState(null);
+  const [promptVerView, setPromptVerView] = useState(null);
   // 构造器可选项来自后端 policy_admin.MATCH_CHOICES（唯一真源），不在前端抄一份
   const loadChoices = useCallback(async () => {
     try {
@@ -304,15 +306,19 @@ export default function RulesPage() {
   const loadVersions = useCallback(async () => {
     try { setVersions((await api('/policy/versions?limit=50')).items || []); } catch { setVersions([]); }
   }, []);
+  const loadPromptVersions = useCallback(async () => {
+    try { setPromptVersions((await api('/l2-prompt-versions?limit=50')).items || []); } catch { setPromptVersions([]); }
+  }, []);
   // silent=true：30s 轮询用（不点 loading 不闪 Spin、后台失败不弹错）
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try { setItems((await api('/policies')).items); } catch (e) { if (!silent) message.error(errText(e)); }
     finally { if (!silent) setLoading(false); }
     loadVersions();
-  }, [loadVersions]);
+    loadPromptVersions();
+  }, [loadVersions, loadPromptVersions]);
   useEffect(() => { load(); }, [load]);
-  usePoll(() => load(true)); // 替代原刷新按钮（规则+历史版本一起刷）
+  usePoll(() => load(true), 60000); // 规则/版本变化低频，60s 轮询即可
 
   const viewVersion = async (vid) => {
     try { setVerView((await api(`/policy/versions/${vid}`)).yaml_text); } catch (e) { message.error(errText(e)); }
@@ -320,6 +326,16 @@ export default function RulesPage() {
   const rollback = async (vid) => {
     try {
       await api(`/policy/versions/${vid}/rollback`, { method: 'POST' });
+      message.success('已回滚并即时生效（现状已留版本，可再反悔）');
+      load();
+    } catch (e) { message.error(errText(e)); }
+  };
+  const viewPromptVersion = async (vid) => {
+    try { setPromptVerView((await api(`/l2-prompt-versions/${vid}`)).system_prompt || ''); } catch (e) { message.error(errText(e)); }
+  };
+  const rollbackPromptVersion = async (vid) => {
+    try {
+      await api(`/l2-prompt-versions/${vid}/rollback`, { method: 'POST' });
       message.success('已回滚并即时生效（现状已留版本，可再反悔）');
       load();
     } catch (e) { message.error(errText(e)); }
@@ -570,9 +586,38 @@ export default function RulesPage() {
         )}
       </Card>
 
+      <Card title="L2 提示词历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
+        {promptVersions.length ? (
+          <Table rowKey="id" size="small" scroll={{ y: 400 }} pagination={false} tableLayout="fixed" dataSource={promptVersions} columns={[
+            { title: '时间', dataIndex: 'ts', width: '16%' },
+            { title: 'system prompt 预览', width: '70%', ellipsis: true,
+              render: (_, r) => {
+                const text = r.system_preview || r.system_prompt || '（空，使用默认）';
+                return <span title={text}>{text}</span>;
+              } },
+            { title: '操作', width: '14%', render: (_, r) => (
+              <Space size={4}>
+                <Button size="small" type="link" onClick={() => viewPromptVersion(r.id)}>查看</Button>
+                <Popconfirm title={`回滚到该版本？现状也会存一版，可再反悔。`}
+                  onConfirm={() => rollbackPromptVersion(r.id)}>
+                  <Button size="small" type="link" danger>回滚</Button>
+                </Popconfirm>
+              </Space>
+            ) },
+          ]} />
+        ) : (
+          <Alert type="info" showIcon message="暂无历史版本（第一次保存 L2 提示词时自动生成）" />
+        )}
+      </Card>
+
       <Modal title="版本内容" open={verView != null} onCancel={() => setVerView(null)}
         footer={null} width={720}>
         <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-12)' }}>{verView || ''}</pre>
+      </Modal>
+
+      <Modal title="L2 提示词版本内容" open={promptVerView != null} onCancel={() => setPromptVerView(null)}
+        footer={null} width={720}>
+        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-12)' }}>{promptVerView || ''}</pre>
       </Modal>
 
       <Modal title={editing ? `编辑规则：${editing}` : '新增规则'} open={modalOpen}

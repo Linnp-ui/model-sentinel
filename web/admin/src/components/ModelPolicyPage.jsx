@@ -1,12 +1,12 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Row, Col, Tooltip } from 'antd';
+import { RightOutlined } from '@ant-design/icons';
+import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Tooltip } from 'antd';
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
 import ExternalCandidateModal, { ExternalCandidateFormItems } from './ExternalCandidateBits.jsx';
-import WheelGate from './WheelGate.jsx';
 
 // model_policy 无局部保存接口，整文档按段保存：GET 现值 → 换目标段 → PUT 全文。
 // 候选/内部模型/限流三卡 + 别名弹窗内"新增候选"共用，防漏带其他段（曾漏 model_limits）。
@@ -65,7 +65,7 @@ function AliasGroupsCard() {
     loadExt(silent);
   }, [loadExt]);
   useEffect(() => { load(); }, [load]);
-  usePoll(() => load(true)); // 替代原刷新按钮（别名+外部候选一起刷）
+  usePoll(() => load(true), 60000); // 别名/候选变化低频
 
   const save = async () => {
     const gname = (editing.name || '').trim();
@@ -272,8 +272,6 @@ function ExternalCandidatesCard() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [modal, setModal] = useState(null);
-  const [envFlag, setEnvFlag] = useState(null);
-  const [fbSaving, setFbSaving] = useState(false);
   // "provider/model" -> {cost, tokens, rate_per_1m}：近 7d 实际花费（计费口径）
   const [spend, setSpend] = useState(null);
 
@@ -282,22 +280,12 @@ function ExternalCandidatesCard() {
     try {
       const d = await api('/model-policy');
       setRows(d.policy.external_candidates || []);
-      setEnvFlag(d.env_flag || {});
       const sp = await api('/model-policy/spend').catch(() => null);
       setSpend((sp && sp.models) || {});
     } catch (e) { message.error(errText(e)); }
     setLoading(false);
   }, []);
 
-  const setFallback = async (on) => {
-    setFbSaving(true);
-    try {
-      const r = await api('/model-policy/fallback', { method: 'POST', body: JSON.stringify({ enabled: on }) });
-      message.success(r.enabled ? '自动切换已开启' : '自动切换已关闭（重启后恢复 env 配置）');
-      load();
-    } catch (e) { message.error(errText(e)); }
-    setFbSaving(false);
-  };
   useEffect(() => { load(); }, [load]);
 
   const saveAll = async (next) => {
@@ -342,12 +330,6 @@ function ExternalCandidatesCard() {
     <Card title={<>外部候选<Tip term="candidate" /></>}
       extra={<Button type="primary"
         onClick={() => setModal({ mode: 'new' })}>新增候选</Button>}>
-      <Space align="center" wrap style={{ display: 'flex', marginBottom: 'var(--gw-sp-12)' }}>
-        <Text style={{ marginLeft: 'var(--gw-sp-8)' }}>外网候选自动切换（fallback）：主候选失败/溢出时自动换到下一个外网候选</Text><Tip term="failback" />
-        <Switch size="small" aria-label="外网候选自动切换" loading={fbSaving}
-          checked={!['0', 'false', 'no', 'off'].includes(String(envFlag?.AI_GATEWAY_MODEL_FALLBACK ?? 'true').toLowerCase())}
-          onChange={setFallback} />
-      </Space>
       <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" sticky={wideSticky()} pagination={false}
         tableLayout="fixed"
         loading={loading} dataSource={rows}
@@ -568,91 +550,6 @@ function L2RuntimeSection() {
   );
 }
 
-// L2 提示词（system + user 模板）在线编辑：热生效 + 重启后仍生效（落盘 l2_overrides.yaml）。
-// 占位符：{filename} {sheet_names} {headers} {preview}。空串=还原默认。
-// 唯一使用方是 RulesPage（L2 拦截配置卡），故 export。
-export function L2PromptsSection() {
-  const [data, setData] = useState(null);
-  const [draft, setDraft] = useState({ system: '', template: '' });
-  const [open, setOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const dirty = !!data && (draft.system !== data.system_prompt || draft.template !== data.user_prompt_template);
-  const dirtyRef = useRef(false);
-  dirtyRef.current = dirty;
-
-  const load = useCallback(async () => {
-    try {
-      const d = await api('/l2-prompts');
-      setData(d);
-      // 从 L2 影子页「自动修补」带过来的候选 system prompt：预填并直接开编辑器（人工确认后保存）
-      const pend = sessionStorage.getItem('gw-l2-propose-prompt');
-      if (pend != null) {
-        sessionStorage.removeItem('gw-l2-propose-prompt');
-        setDraft({ system: pend, template: d.user_prompt_template });
-        setOpen(true);
-      } else {
-        setDraft({ system: d.system_prompt, template: d.user_prompt_template });
-      }
-    } catch (e) { message.error(errText(e)); }
-  }, []);
-  useEffect(() => { load(); }, [load]);
-  // 30s 轮询（替代原刷新按钮）：有未保存编辑时跳过，轮询不得冲掉草稿
-  usePoll(() => { if (!dirtyRef.current) load(); });
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const r = await api('/l2-prompts', { method: 'PUT', body: JSON.stringify({
-        AI_GATEWAY_L2_SYSTEM_PROMPT: draft.system,
-        AI_GATEWAY_L2_USER_PROMPT_TEMPLATE: draft.template,
-      })});
-      message.success('已保存，下次 L2 判定即时生效');
-      setData(r);
-      setDraft({ system: r.system_prompt, template: r.user_prompt_template });
-    } catch (e) { message.error(errText(e)); }
-    setSaving(false);
-  };
-  const reset = async (which) => {
-    const d = data?.defaults || {};
-    const next = { ...draft, [which === 'system' ? 'system' : 'template']: which === 'system' ? d.system_prompt : d.user_prompt_template };
-    setDraft(next);
-  };
-  if (!data) return <Card loading />;
-  const placeholders = data.placeholders || [];
-  return (
-    <div data-testid="l2prompts-section">
-      <Space align="center" style={{ marginBottom: 'var(--gw-sp-4)' }}>
-        <Text strong>L2 提示词</Text>
-        <Button type="link" onClick={() => setOpen(true)}>查看/编辑</Button>
-        <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{dirty ? '（有未保存改动）' : '30s 自动刷新（编辑中暂停）'}</Text>
-      </Space>
-      <WheelGate>
-      <Row gutter={8}>
-        <Col span={12}><Text strong style={{ display: 'block', marginBottom: 'var(--gw-sp-12)' }}>SYSTEM</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.system_prompt.slice(0, 200)}{data.system_prompt.length > 200 ? '…' : ''}</Typography.Paragraph></Col>
-        <Col span={12}><Text strong style={{ display: 'block', marginBottom: 'var(--gw-sp-12)' }}>USER 模板</Text><Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.user_prompt_template}</Typography.Paragraph></Col>
-      </Row>
-      </WheelGate>
-      <Modal title="编辑 L2 提示词" open={open} onCancel={() => setOpen(false)} destroyOnClose
-             okText="保存" cancelText="取消" confirmLoading={saving} width={760}
-             onOk={async () => { await save(); setOpen(false); }}>
-        <Space direction="vertical" style={{ width: '100%' }} size="small">
-          <Text>system prompt（角色/判定口径）</Text>
-          <Input.TextArea rows={10} value={draft.system} onChange={(e) => setDraft({ ...draft, system: e.target.value })} />
-          <Space>
-            <Button danger onClick={() => reset('system')}>还原默认</Button>
-            <Text type="secondary">字数：{draft.system.length}/8000</Text>
-          </Space>
-          <Text>user prompt 模板（占位符：{placeholders.join(' / ')}）</Text>
-          <Input.TextArea rows={6} value={draft.template} onChange={(e) => setDraft({ ...draft, template: e.target.value })} />
-          <Space>
-            <Button danger onClick={() => reset('template')}>还原默认</Button>
-            <Text type="secondary">字数：{draft.template.length}/2000</Text>
-          </Space>
-        </Space>
-      </Modal>
-    </div>
-  );
-}
 
 
 // 内部模型（route_local/block 降级目标）：登记可增删改，保存走 PUT /model-policy（热重载），
@@ -897,7 +794,7 @@ export default function ModelPolicyPage() {
           // L2 配置劈两页（本页=端点/模型/超时/影子/灰区下限，规则管理页=判定档/判密阈值/提示词），互链别让用户猜
           <Tooltip title="L2 判定档 / 判密阈值 / 提示词在「规则管理」页的 L2 拦截配置卡">
             <Button type="link" size="small" style={{ padding: 0 }}
-              onClick={() => { window.location.hash = '/rules'; }}>L2 拦截配置 →</Button>
+              onClick={() => { window.location.hash = '/rules'; }} >L2 拦截配置 <RightOutlined /></Button>
           </Tooltip>
         }>
         <L2RuntimeSection />
@@ -907,3 +804,70 @@ export default function ModelPolicyPage() {
 }
 
 
+
+// L2 system prompt 在线编辑：热生效 + 重启后仍生效（落盘 l2_overrides.yaml）。
+// user prompt 模板不再控制台编辑，固定使用内置默认（{filename} {sheet_names} {headers} {preview}）。
+// 唯一使用方是 RulesPage（L2 拦截配置卡），故 export。
+export function L2PromptsSection() {
+  const [data, setData] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const dirty = !!data && draft !== data.system_prompt;
+
+  const load = useCallback(async () => {
+    try {
+      const d = await api('/l2-prompts');
+      setData(d);
+      const pend = sessionStorage.getItem('gw-l2-propose-prompt');
+      if (pend != null) {
+        sessionStorage.removeItem('gw-l2-propose-prompt');
+        setDraft(pend);
+        setOpen(true);
+      } else {
+        setDraft(d.system_prompt);
+      }
+    } catch (e) { message.error(errText(e)); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const r = await api('/l2-prompts', { method: 'PUT', body: JSON.stringify({
+        AI_GATEWAY_L2_SYSTEM_PROMPT: draft,
+      })});
+      message.success('已保存，下次 L2 判定即时生效');
+      setData(r);
+      setDraft(r.system_prompt);
+    } catch (e) { message.error(errText(e)); }
+    setSaving(false);
+  };
+  const reset = () => {
+    const d = data?.defaults || {};
+    setDraft(d.system_prompt || '');
+  };
+  if (!data) return <Card loading />;
+  return (
+    <div data-testid="l2prompts-section">
+      <Space align="center" style={{ marginBottom: 'var(--gw-sp-4)' }}>
+        <Text strong>L2 提示词（system）</Text>
+        <Button type="link" onClick={() => setOpen(true)}>查看/编辑</Button>
+        <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>{dirty ? '（有未保存改动）' : ''}</Text>
+      </Space>
+      <Typography.Paragraph style={{ maxHeight: 200, overflow: 'auto', marginBottom: 0, whiteSpace: 'pre-wrap' }}>{data.system_prompt.slice(0, 200)}{data.system_prompt.length > 200 ? '…' : ''}</Typography.Paragraph>
+      <Modal title="编辑 L2 system prompt" open={open} onCancel={() => setOpen(false)} destroyOnClose
+             okText="保存" cancelText="取消" confirmLoading={saving} width={760}
+             onOk={async () => { await save(); setOpen(false); }}>
+        <Space direction="vertical" style={{ width: '100%' }} size="small">
+          <Text>system prompt（角色/判定口径）</Text>
+          <Input.TextArea rows={12} value={draft} onChange={(e) => setDraft(e.target.value)} />
+          <Space>
+            <Button danger onClick={reset}>还原默认</Button>
+            <Text type="secondary">字数：{draft.length}/8000</Text>
+          </Space>
+        </Space>
+      </Modal>
+    </div>
+  );
+}

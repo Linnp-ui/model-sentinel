@@ -259,9 +259,9 @@ code { font-size: var(--gw-fs-12) !important; }
 /* 「非密」标注按钮：绿色（默认红→绿，覆盖 default 按钮红色口径）。
    放在 default 描边规则之后，且带 .ant-btn-color-default 限定，保证优先级高于
    上面那条 default 描边口径（:not() 会加权，不限定会被它压掉）。 */
-.ant-btn.btn-green.ant-btn-color-default { color: #237804 !important; }
-.ant-btn.btn-green.ant-btn-color-default:hover { color: #389e0d !important; }
-.ant-btn.btn-green.ant-btn-color-default:active { color: #135200 !important; }
+.ant-btn.btn-green.ant-btn-color-default { color: #000000 !important; }
+.ant-btn.btn-green.ant-btn-color-default:hover { color: #000000 !important; }
+.ant-btn.btn-green.ant-btn-color-default:active { color: #000000 !important; }
 /* 选中态（type=primary）时 antd 给蓝底白字 → 覆盖成浅绿底深绿字。白字在浅绿底上
    只有 1.9:1 不可读，故字色用深绿 #135200（绿-9） */
 .ant-btn.ant-btn-primary.ant-btn-color-primary.ant-btn-variant-solid.btn-green {

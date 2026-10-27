@@ -295,7 +295,7 @@ def _qwen_wrong_cases(hours: int = 168, max_cases: int = PROPOSE_MAX_CASES) -> l
     import datetime as _dt
     from src.gateway.admin_store import get_admin_store
     from src.gateway.audit_store import get_audit_store
-    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    since = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - _dt.timedelta(hours=hours)
     rows = get_audit_store().query_mysql(since=since, limit=5000) or []
     labels = get_admin_store().get_l2_labels([r.get("req_id") for r in rows if r.get("req_id")])
     out, seen = [], set()

@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
-import { SearchOutlined, DownloadOutlined, CopyOutlined, DownOutlined } from '@ant-design/icons';
-import { api, errText, fetchJson, copyText, usePoll, RANGES } from '../api.js';
+import { SearchOutlined, DownloadOutlined, DownOutlined } from '@ant-design/icons';
+import { api, errText, fetchJson, usePoll, RANGES } from '../api.js';
 import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
 
@@ -70,7 +70,8 @@ export default function AuditPage() {
   const [f, setF] = useState(() => {
     const p = new URLSearchParams(window.location.hash.split('?')[1] || '');
     return { action: p.get('action') || '', since: p.get('since') || '',
-             rule: p.get('rule') || '', q: p.get('q') || '', shadow: p.get('shadow') || '' };
+             rule: p.get('rule') || '', q: p.get('q') || '', shadow: p.get('shadow') || '',
+             status: p.get('status') || '' };
   });
   const [pageNo, setPageNo] = useState(1);
   const writeUrl = (next) => {
@@ -100,7 +101,7 @@ export default function AuditPage() {
     finally { if (!silent) setLoading(false); }
   }, [pageNo]);
 
-  useEffect(() => { load(); }, [load, f.since, f.action, f.rule, f.shadow]);
+  useEffect(() => { load(); }, [load, f.since, f.action, f.rule, f.shadow, f.status]);
   usePoll(() => load(pageNo, true)); // 替代原刷新按钮
 
   // 规则名清单拉取：失败时静默回退到内置映射（RULE_FILTER_NAMES），不影响筛选可用性
@@ -157,12 +158,8 @@ export default function AuditPage() {
     { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
     { title: <>{'用户query'}<Tip term="query" /></>, dataIndex: 'text_preview', width: '25%',
       render: (v) => (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--gw-sp-4)', maxWidth: '100%' }}>
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: 1 }}
-            title={v}>{v || '—'}</span>
-          {v && <Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制用户query"
-            onClick={() => copyText(v)} />}
-        </span>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block', maxWidth: '100%' }}
+          title={v}>{v || '—'}</span>
       ) },
   ];
 
@@ -182,6 +179,18 @@ export default function AuditPage() {
           <Select style={{ width: 150 }} value={f.shadow}
             options={[{ value: '', label: '影子：全部' }, { value: 'mismatch', label: '主影不一致' }]}
             onChange={(v) => { const next = { ...f, shadow: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
+          <Select style={{ width: 130 }} value={f.status || ''} allowClear placeholder="状态码"
+            options={[
+              { value: '', label: '状态码：全部' },
+              { value: '2xx', label: '2xx 成功' },
+              { value: '4xx', label: '4xx 客户端' },
+              { value: '5xx', label: '5xx 错误' },
+              { value: '403', label: '403 拒绝' },
+              { value: '429', label: '429 限流' },
+              { value: '502', label: '502 上游' },
+              { value: '503', label: '503 不可用' },
+            ]}
+            onChange={(v) => { const next = { ...f, status: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
           <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/调用方/模型/L2/影子…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
           <Button type="primary" icon={<SearchOutlined />} onClick={search}>查询</Button>
            <Button type="primary" icon={<DownloadOutlined />} onClick={exportCsv}>导出 CSV</Button>

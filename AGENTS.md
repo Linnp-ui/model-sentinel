@@ -189,7 +189,8 @@ L2 判密 → `l2_confidential` route_local；L2 不可用 → `l2_unavailable` 
 
 | 文件 | 关键职责 |
 |---|---|
-| `src/gateway/main.py` | FastAPI 入口；所有路由 + 鉴权（强制 401，见上节）+ 审计 + L1/L2 调度 + 流式降级 + 推理透传；响应码捕获中间件（写 ContextVar → `gateway_requests_v2_total{status_code}`）。`/v1/*` 端点一律 `Depends(_bind_identity_ctx)`（async 上下文），**不要**用裸 `Depends(auth)`，否则准入身份丢失、全量 503 |
+| `src/gateway/main.py` | FastAPI 入口；**核心请求管道**（chat/embeddings/messages/responses/files）+ 启动钩子 + 鉴权（强制 401，见上节）+ 审计 + L1/L2 调度 + 流式降级 + 推理透传；响应码捕获中间件（写 ContextVar → `gateway_requests_v2_total{status_code}`）。`/v1/*` 端点一律 `Depends(_bind_identity_ctx)`（async 上下文），**不要**用裸 `Depends(auth)`，否则准入身份丢失、全量 503 |
+| `src/gateway/*_router.py` | 拆分路由（2026-10-27 起）：`health_router`（/health）/ `static_router`（静态/下载）/ `metrics_router`（/admin/metrics）/ `audit_router`（审计列表/CSV/状态码筛选）。**新功能/新端点直接写进对应 router 模块，禁止再往 main.py 堆路由**；纯函数/helper 迁 util 模块 |
 | `src/gateway/identity.py` | 客户端身份模型（纯本地，不发起网络调用）：`Identity` 只来自登记表；限流绑定键 `key-<12位id>-conf` / `fp-<sha256前16>-anon`，**字符集只含 `[A-Za-z0-9-]`**（冒号不可用）。`_bind_identity_ctx` 把身份写进 ContextVar |
 | `src/gateway/policy.py` | YAML 策略引擎；**Pydantic 强校验**（`Policy` / `PolicyDoc`），错 action / 越界 priority / 缺 name 启动即抛 `ValidationError`；`decide()` 返回的 Policy 支持 `r["action"]` 字典式访问（routing.py 旧调用 0 改动） |
 | `src/gateway/redaction.py` | 审计密钥脱敏：`log_entry()` 写 audit 前 in-place 替换 `text_preview` / `l2.explanation` / `reason` 等，覆盖 AKIA / PEM / ghp_/gho_/ghr_/ghs_/ghu_ / sk-ant- / sk-(proj-) / AIza / xox[abposr]- / JWT / Authorization Bearer。**PII 不脱敏**（身份证/手机/银行卡 走 route_local，audit 留原文方便追责） |
