@@ -270,8 +270,10 @@ def diff_policy_texts(old_text: str, new_text: str) -> list:
             continue
         if p.get("priority") != q.get("priority"):
             changes.append(f"「{name}」优先级 {p.get('priority')}→{q.get('priority')}")
+        _IGNORE_DIFF_KEYS = {"name", "priority", "priority_locked", "locked",
+                             "locked_priority", "pinned", "fixed_priority"}
         others = [k for k in set(p) | set(q)
-                  if k not in ("name", "priority") and p.get(k) != q.get(k)]
+                  if k not in _IGNORE_DIFF_KEYS and p.get(k) != q.get(k)]
         if others:
             changes.append(f"「{name}」改: " + "、".join(_FIELD_ZH.get(k, k) for k in sorted(others)))
     return changes
@@ -290,7 +292,16 @@ def upsert_policy(rule: Dict[str, Any], original_name: Optional[str] = None,
         if p.get("name") == name and name != (original_name or ""):
             raise ValueError(f"规则名已存在：{name}")
     if original_name:
-        policies = [p for p in policies if p.get("name") != original_name]
+        pass
+    # 优先级锁定：已锁定规则的 priority 不允许被静默改写；除非本次显式解锁（priority_locked=false）
+    target_name = original_name or name
+    existing = next((p for p in policies if p.get("name") == target_name), None)
+    locked_fields = ("priority_locked", "locked", "locked_priority", "pinned", "fixed_priority")
+    was_locked = bool(existing and any(existing.get(k) for k in locked_fields))
+    new_locked = any(rule.get(k) for k in locked_fields)
+    if was_locked and new_locked and existing.get("priority") != rule.get("priority"):
+        raise ValueError("该规则优先级已锁定，修改 priority 请先取消锁定")
+    policies = [p for p in policies if p.get("name") != original_name]
     policies = [p for p in policies if p.get("name") != name] + [rule]
     policies.sort(key=lambda x: int(x.get("priority", 100)))
     _write_doc({"policies": policies}, operator=operator)

@@ -8,7 +8,6 @@ import { Tip } from './terms.jsx';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './components/DailyHeatmap.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
-import { RightOutlined } from '@ant-design/icons';
 import { SuggestionCard } from './components/KeyRulesPage.jsx';
 
 // ---------------- 降级事件流：流式降级 / 本地路由 / L2 不可用（数据源 audit_logs） ----------------
@@ -67,7 +66,7 @@ function EventStreamCard({ events, go }) {
           </Space>
           {/* 跳转入口与「Provider 健康检查」卡的「Provider 管理 →」同款：link 按钮放 extra */}
           <Tooltip title="跳审计页：降级事件明细（本地路由 / 流式降级 / L2 不可用，同一时间窗）">
-            <Button type="link" size="small" style={{ padding: 0 }} onClick={nav}>审计明细 <RightOutlined /></Button>
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={nav}>审计明细 →</Button>
           </Tooltip>
         </Space>
       }>
@@ -105,7 +104,7 @@ function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {
       onKeyDown={go ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); nav(); } } : undefined}
       style={{ borderLeft: `3px solid ${bar ?? color ?? '#e2e4ea'}`, cursor: go ? 'pointer' : 'default' }}
       styles={{ body: { height: 96, padding: 'var(--gw-sp-12) var(--gw-sp-16)', display: 'flex', flexDirection: 'column' } }}>
-      <T type="secondary" style={{ fontSize: 'var(--gw-fs-14)', height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <RightOutlined style={{ marginLeft: 'var(--gw-sp-4)', color: 'var(--gw-primary)' }} />}</T>
+      <T type="secondary" style={{ fontSize: 'var(--gw-fs-14)', height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 'var(--gw-sp-4)', fontSize: 20, lineHeight: 1, color: 'var(--gw-primary)' }}>→</span>}</T>
       {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看 */}
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--gw-sp-6)' }}>
         <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
@@ -124,7 +123,7 @@ function ChartPanel({ title, go, children, fill }) {
       // fill：卡片体变成纵向 flex，内容（热力图）才能拉满卡高
       styles={fill ? { body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } } : undefined}
       extra={go ? (
-      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 <RightOutlined /></Button>) : null}>
+      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>) : null}>
       {children}
     </Card>
   );

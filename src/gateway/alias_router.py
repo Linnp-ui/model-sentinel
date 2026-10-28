@@ -20,9 +20,22 @@ from .circuit_breaker import get_breaker, key_for
 # 请求级别名上下文（同 task 内可读；FastAPI 每请求独立 task，互不泄漏）
 _alias_ctx: "ContextVar[Optional[dict]]" = ContextVar("alias_ctx", default=None)
 
+# 请求级「本请求带内联图片」标记：main._inline_media_scan 写入、选头时读取。
+# 纯文本候选看不见图（deepseek-v4-pro 实测：200 + reasoning 自述「图片不支持」，
+# 静默降级比 400 更隐蔽）⇒ 带图请求在选头前硬过滤候选集，全滤光则 400 明示。
+_needs_image: ContextVar[bool] = ContextVar("gw_needs_image", default=False)
+
 
 def ctx_start(name: str) -> None:
     _alias_ctx.set({"name": name, "failover": []})
+
+
+def ctx_set_needs_image(v: bool = True) -> None:
+    _needs_image.set(bool(v))
+
+
+def ctx_needs_image() -> bool:
+    return _needs_image.get()
 
 
 def ctx_record_failover(from_ref: str) -> None:
@@ -75,6 +88,18 @@ def alias_candidates(group: Dict[str, Any], skip: int = 0) -> List[Dict[str, Any
             continue
         out.append({"provider": c["provider"], "model": c["model"], "idx": i,
                     "tier": c.get("tier") or 2})
+    if _needs_image.get() and out:
+        # 模态硬过滤：带图请求不落到未声明 image 输入的候选（含未声明=仅 text）。
+        # 熔断已滤空（out 为空）不在此抛：交给调用方既有 503 语义（circuit open）。
+        from .model_policy import model_inputs
+        kept = [c for c in out if "image" in model_inputs(c["provider"], c["model"])]
+        if not kept:
+            from .routing import RoutingError
+            raise RoutingError(
+                f"请求含图片，但模型组 {group.get('name')} 的可用候选均不支持图片输入"
+                f"（model_policy.yaml 候选可声明 input: [text, image]）",
+                400, type_="model_no_image", provider=group.get("name") or "")
+        out = kept
     from .intent_router import ctx_level, select
     return select(out, ctx_level())
 

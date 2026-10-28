@@ -14,6 +14,7 @@ model_policy:
     note: deepseek 官方（价格单位 ¥/1M tokens）
     enabled: true
     rank: 1
+    input: [text, image]  # 2026-10-27 实测：图片内嵌读出图中文字
   - provider: deepseek
     model: deepseek-v4-pro
     price_per_1m_in: 9.0
@@ -23,12 +24,14 @@ model_policy:
     note: （价格单位 ¥/1M tokens）
     enabled: true
     rank: 2
+    input: [text]  # 2026-10-27 实测：200 但 reasoning 自述「图片不支持无法查看」，静默降级
   internal_models:
   - provider: vllm_local
     model: qwen2.5:7b
     note: 主力本地模型（内容不出境降级目标）
     enabled: true
     url: http://10.0.0.10:8000/v1
+    input: [text, image]  # 2026-10-27 实测：VL，识别图中文字正确
   - provider: vllm_l2
     model: Qwen3-4B-Instruct-2507
     note: L2 审查 qwen（8002，可路由）

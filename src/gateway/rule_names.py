@@ -14,6 +14,7 @@ RULE_ZH = {
     "block": "阻断",
     "l2_confidential": "L2 判密",
     "l2_unavailable": "L2 不可用",
+    "l2_injection": "L2 提示注入",
     "first_chunk_fallback": "首块转内网",
     "prompt_too_long_fallback": "长提示转内网",
     "key_blacklist": "密钥黑名单",
@@ -36,7 +37,7 @@ RULE_ZH = {
 
 # 系统内置判定（网关自己的 fail-safe / 降级 / L2 结论），不是 policy 里可配置的规则
 SYSTEM_RULES = frozenset({
-    "l2_confidential", "l2_unavailable",
+    "l2_confidential", "l2_unavailable", "l2_injection",
     "encoded_keyword", "review_text_overflow",
     "first_chunk_fallback", "prompt_too_long_fallback",
 })

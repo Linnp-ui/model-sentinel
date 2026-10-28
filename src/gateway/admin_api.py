@@ -467,11 +467,16 @@ def suggestion_apply_api(req: SuggestionApplyReq):
     if req.kind == "reorder":
         from src.gateway import policy_admin as _pa
         if req.order:
-            names = [n for n in dict.fromkeys(req.order) if n]
-            if len(names) < 2:
-                raise HTTPException(422, "order 至少需要 2 条不同规则")
             cur = {p["name"]: p for p in _pa.list_policies()}
-            missing = [n for n in names if n not in cur]
+            names = [n for n in dict.fromkeys(req.order) if n and n in cur]
+            # 优先级被锁定的规则不参与重排：从名单中剔除，避免覆盖其 priority
+            locked = [n for n in names if cur[n].get("priority_locked") or cur[n].get("locked")
+                      or cur[n].get("locked_priority") or cur[n].get("pinned")
+                      or cur[n].get("fixed_priority")]
+            names = [n for n in names if n not in locked]
+            if len(names) < 2:
+                raise HTTPException(422, "可重排规则不足 2 条（锁定规则不可重排）")
+            missing = [n for n in req.order if n and n not in cur]
             if missing:
                 raise HTTPException(404, f"规则不存在：{missing[0]}")
             slots = sorted(cur[n]["priority"] for n in names)
@@ -481,7 +486,7 @@ def suggestion_apply_api(req: SuggestionApplyReq):
                 row["priority"] = p
                 _pa.upsert_policy(row, original_name=n)
                 done[n] = p
-            return {"ok": True, "reordered": done}
+            return {"ok": True, "reordered": done, "skipped_locked": locked}
         if not req.rule_a or not req.rule_b or req.rule_a == req.rule_b:
             raise HTTPException(422, "需填 rule_a 和 rule_b（且不同）")
         cur = {p["name"]: p for p in _pa.list_policies()}

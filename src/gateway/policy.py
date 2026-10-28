@@ -20,7 +20,7 @@ import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 # 2026-10-19 红队：text 的 contains_any/matches_regex 只跑原文，零宽化「财\u200b务报表」
 # 「aws_\u200bsecret」/「sk-12…\u200b…f」全 miss。归一化（NFKC+零宽剥离）与 PII 层同一真源，
@@ -69,6 +69,24 @@ class Policy(_DictLike):
     description: str = ""
     when: Union[str, Dict[str, Any]] = "always"
     target: Optional[PolicyTarget] = None
+    # 优先级锁定：被锁定的规则不参与调节策略建议的「优先级重排」（规则 4），
+    # 其 priority 不会被 suggestion/apply 覆盖。别名字段同步，任一为 true 即锁定。
+    priority_locked: bool = False
+    locked: bool = False
+    locked_priority: bool = False
+    pinned: bool = False
+    fixed_priority: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_priority_locked(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        keys = ("priority_locked", "locked", "locked_priority", "pinned", "fixed_priority")
+        val = any(bool(data.get(k)) for k in keys)
+        for k in keys:
+            data[k] = val
+        return data
 
     @field_validator("when")
     @classmethod

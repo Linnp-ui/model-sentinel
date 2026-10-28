@@ -23,6 +23,16 @@ os.environ.setdefault("AI_GATEWAY_ADMIN_IP_ALLOWLIST", "127.0.0.1,::1,testclient
 #    store 单例初始化晚于此），空值让 admin_store/audit_store 各自落 memory 后端。
 for _v in ("ADMIN_DB_URL", "DATABASE_URL", "AUDIT_MYSQL_URL", "AUDIT_DATABASE_URL", "REDIS_URL"):
     os.environ[_v] = ""
+# 5. l2 持久化覆盖指向空临时文件——生产 l2_overrides.yaml 是共用真文件
+#    （SMALL_MODEL_ENABLED: true 等），app startup 时 apply_overrides() 会把它回灌
+#    进 env，盖掉上面 setdefault 的测试值 ⇒ 测试期间 intent/L2 真打内网 8002
+#    （非确定性选头 + 真实流量出测试域）。2026-10-27 由 test_modality 选头断言
+#    暴露（真判 level 改写候选顺序）。指向空文件而非 no-op：保留 apply 机制
+#    （test_l2_retrain_ensure_overrides 会自己 setenv 换回自己的临时文件）。
+import tempfile as _tempfile
+_ov_empty = _tempfile.mktemp(prefix="gw-test-l2ov-", suffix=".yaml")
+open(_ov_empty, "w").close()
+os.environ["AI_GATEWAY_L2_OVERRIDES_PATH"] = _ov_empty
 # 规则5 first-seen 落盘隔离：全 session 共用内存 store，suggestions 会写 marks 文件，
 # 指到系统临时目录，别污染工作区 var/（生产网关读同一文件）。
 import tempfile
@@ -38,6 +48,9 @@ import pytest  # noqa: E402
 def _mock_external(monkeypatch):
     import src.gateway.routing as _rt
     monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: True)
+
+
+
 
 
 @pytest.fixture(scope="session", autouse=True)

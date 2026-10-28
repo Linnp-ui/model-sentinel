@@ -54,6 +54,9 @@ class ExternalCandidate(BaseModel):
     note: str = ""
     enabled: bool = True
     rank: int = 100
+    # 输入模态声明：模型真实能吃的输入类型。缺省/未声明 = 仅 text（保守：
+    # 带图请求的自动选模/故障切换不会落到它；客户端显式点名仍放行——点名是用户自选）
+    input: List[str] = Field(default_factory=lambda: ["text"])
 
 
 class InternalModel(BaseModel):
@@ -64,6 +67,7 @@ class InternalModel(BaseModel):
     note: str = ""
     enabled: bool = True
     url: str = ""
+    input: List[str] = Field(default_factory=lambda: ["text"])  # 同 ExternalCandidate.input
 
 
 class ModelLimit(BaseModel):
@@ -185,6 +189,24 @@ def external_candidates() -> List[Dict[str, Any]]:
     cands = [c.model_dump() for c in pol.external_candidates if c.enabled]
     cands.sort(key=lambda c: (c.get("rank", 100), c.get("price_per_1m_in", 0.0)))
     return cands
+
+
+def model_inputs(provider: str, model: str) -> List[str]:
+    """该 (provider, model) 声明的输入模态；未声明回落 ["text"]（保守）。
+
+    消费方：alias_router.alias_candidates / routing._mp_next 的模态硬过滤。
+    """
+    try:
+        pol = load_model_policy()
+    except Exception:
+        return ["text"]
+    for c in pol.external_candidates:
+        if c.provider == provider and c.model == model:
+            return list(c.input or ["text"])
+    for c in pol.internal_models:
+        if c.provider == provider and c.model == model:
+            return list(c.input or ["text"])
+    return ["text"]
 
 
 def classify_failure(status_code: int, message: str) -> str:

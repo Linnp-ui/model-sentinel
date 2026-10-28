@@ -95,7 +95,7 @@ from .routing import (
 
 )
 
-from .small_model import classify as small_classify, classify_chunks, is_confidential, is_degraded
+from .small_model import classify as small_classify, classify_chunks, is_confidential, is_injection, is_degraded
 
 from .user_models import UserModel, get_store, validate
 
@@ -362,9 +362,13 @@ async def _bind_identity_ctx(identity: Identity = Depends(auth)) -> Identity:
             from .admin_store import get_admin_store
             from .stats_service import key_weekly_cost
             _store = get_admin_store()
-            _cap = _store.get_key_weekly_cap(kid)
+            # 同步 MySQL 必须挪出事件循环：单行查询本身毫秒级，但本池
+            # （pool_size=2+max_overflow=2）与 admin 端点共享，MySQL 抖动/池耗尽时
+            # connect() 最长等 30s —— 在循环上跑 = 整个网关（含 /health）无响应
+            # （2026-10-27 用户报「网关有时候会无响应」，见 tests/test_loop_responsive.py）。
+            _cap = await run_in_threadpool(_store.get_key_weekly_cap, kid)
             if _cap > 0:
-                _spend = key_weekly_cost(_store, kid)
+                _spend = await run_in_threadpool(key_weekly_cost, _store, kid)
                 if _spend >= _cap:
                     get_metrics().inc_rate_limited("cost", "weekly_cost_cap")
                     raise HTTPException(
@@ -1401,15 +1405,20 @@ async def _inline_media_scan(kind: str, payload) -> tuple[str, bool]:
 
     kind: chat | anthropic | responses。解码+检查在线程池跑，不阻塞事件循环；
     任一块不可读(解码失败/超 cap/抽空文本)即 fail-closed，由 policy p12 接住。
+    带内联图片时置 alias_router 的 needs_image 标记：选头/故障切换硬过滤
+    纯文本候选（实测 deepseek-v4-pro 200 但看不见图，静默降级比 400 更隐蔽）。
     """
     if kind == "chat":
-        blobs, bad = collect_inline_blobs_chat(payload)
+        blobs, bad, has_image = collect_inline_blobs_chat(payload)
     elif kind == "anthropic":
-        blobs, bad = collect_inline_blobs_anthropic(payload)
+        blobs, bad, has_image = collect_inline_blobs_anthropic(payload)
     elif kind == "responses":
-        blobs, bad = collect_inline_blobs_responses(payload)
+        blobs, bad, has_image = collect_inline_blobs_responses(payload)
     else:
         return "", False
+    if has_image:
+        from .alias_router import ctx_set_needs_image
+        ctx_set_needs_image(True)
     if not blobs:
         return "", bad
     results = await asyncio.gather(*[run_in_threadpool(inspect_inline_bytes, x) for x in blobs])
@@ -1601,14 +1610,15 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
         text_findings.update(extra_findings)
     _note_risk(text_findings)
     session_id = (extract_session_id(request.headers) if request is not None else None) or session_hint
-    session_conf = _is_session_confidential(session_id)
+    # session store 同步 Redis：挪出事件循环（2026-10-27，见 test_loop_responsive）
+    session_conf = await run_in_threadpool(_is_session_confidential, session_id)
     # 文件名污染（客户端无感会话替代）：正文提及同 key 下曾判机密的文件名即命中。
     # key 取身份绑定键（与限流同口径）；干跑/无身份时 key 为空即跳过。
     _taint_name = ""
     _men = _mentioned_data_filename(text)
     if _men and request is not None:
         _kid = _identity_bind_key(request)
-        if _kid and get_session_store().is_tainted_file(_kid, _men):
+        if _kid and await run_in_threadpool(get_session_store().is_tainted_file, _kid, _men):
             _taint_name = _men
     ctx = {
 
@@ -1734,7 +1744,7 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
         else:
             try:
                 # 会话级档位粘性：窗口内只升不降（换模型=废掉上一模型的 prompt cache）
-                _intent_ctx_set(_intent_sticky(session_id, await _intent_task))
+                _intent_ctx_set(await _intent_sticky(session_id, await _intent_task))
             except Exception:
                 _intent_ctx_set(None)
     return decision, text_findings, l2_result
@@ -1773,6 +1783,11 @@ def _l2_decision(l2_result: dict | None) -> dict | None:
     if is_confidential(l2_result):
         return _route_local_decision("l2_confidential", l2_result.get("reason"),
                                      confidence=l2_result.get("confidence"))
+    if is_injection(l2_result):
+        # 提示注入命中（is_injection）：同 fail-closed 口径转内网 —— 注入指令即高风险，
+        # 即使载荷源自 benign 话术也可能携带机密数据
+        return _route_local_decision("l2_injection", l2_result.get("reason") or "prompt injection detected",
+                                     confidence=l2_result.get("injection_confidence") or 0.0)
     if is_degraded(l2_result):
         if (os.getenv("AI_GATEWAY_L2_FAIL_MODE", "local") or "local").strip().lower() == "open":
             return None
@@ -1868,7 +1883,7 @@ def _gateway_meta(
         "alias": ((_alias_ctx_now() or {}).get("name")) or "",
         "alias_failover": ((_alias_ctx_now() or {}).get("failover")) or [],
         "intent": _intent_meta(),
-        "layer": "L2" if l2_result and decision.get("name") == "l2_confidential" else "L1",
+        "layer": "L2" if l2_result and decision.get("name") in ("l2_confidential", "l2_unavailable", "l2_injection") else "L1",
         "downgraded_from": downgraded,
         "override_denied": notes.get("override_denied"),
         "findings": None,
@@ -1935,7 +1950,7 @@ def _looks_like_context_overflow(msg: str) -> bool:
     return any(k in low for k in _CTX_OVERFLOW_MARKERS)
 
 
-def _upstream_error_detail_response(exc, msg: str, ctx_overflow: bool, prov, decision, request,
+async def _upstream_error_detail_response(exc, msg: str, ctx_overflow: bool, prov, decision, request,
                                     *, type_: str) -> HTTPException:
     """把上游错误如实转成 HTTPException（并落审计）。
 
@@ -1944,7 +1959,7 @@ def _upstream_error_detail_response(exc, msg: str, ctx_overflow: bool, prov, dec
       其他（超时/5xx） -> 原状态码 upstream_error（带真实 message）
     """
     try:
-        log_upstream_failure(request, type_=type_, status=getattr(exc, "status_code", 0),
+        await log_upstream_failure(request, type_=type_, status=getattr(exc, "status_code", 0),
                              action=(decision or {}).get("action"),
                              rule=(decision or {}).get("name"),
                              provider=(getattr(prov, "name", "") or ""),
@@ -1960,7 +1975,7 @@ def _upstream_error_detail_response(exc, msg: str, ctx_overflow: bool, prov, dec
                                  "message": str(msg)[:300]})
 
 
-def log_upstream_failure(request, *, type_: str, status, action=None, rule=None,
+async def log_upstream_failure(request, *, type_: str, status, action=None, rule=None,
                          provider=None, local=False, model="", count=True, **extra):
     """上游转发/路由失败也要记账（否则控制台错误率恒 0%）。
 
@@ -1991,7 +2006,8 @@ def log_upstream_failure(request, *, type_: str, status, action=None, rule=None,
     }
     entry.update({k: v for k, v in extra.items() if v is not None})
     try:
-        log_entry(entry, count=count)
+        # log_entry 同步打 Redis：挪出事件循环（2026-10-27，见 test_loop_responsive）
+        await run_in_threadpool(log_entry, entry, count=count)
     except Exception:
         # 记账失败绝不能吃掉真实的上游错误响应
         pass
@@ -2115,7 +2131,7 @@ def log_entry(entry: dict, *, count: bool = True):
                 get_metrics().observe_l2(label, float(l2_lat))
 
 
-def log_stream_error(request, *, type_: str, status, action=None, rule=None,
+async def log_stream_error(request, *, type_: str, status, action=None, rule=None,
                      provider=None, model="", kind="upstream", **extra):
     """T43：流式路径在**首行已落库之后**失败时补写的第二条留痕。
 
@@ -2142,7 +2158,7 @@ def log_stream_error(request, *, type_: str, status, action=None, rule=None,
     except Exception:
         pass
     try:
-        log_upstream_failure(request, type_=type_, status=status, action=action, rule=rule,
+        await log_upstream_failure(request, type_=type_, status=status, action=action, rule=rule,
                              provider=provider, local=bool(getattr(provider, "local", False)),
                              model=model, count=False, stream_error=True,
                              stream_error_kind=kind, **extra)
@@ -2311,7 +2327,7 @@ async def register_model(req: RegisterReq, request: Request, identity: Identity 
 
     )
     get_store().register(m)
-    log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "model_register", "name": req.name, "owner": owner,
+    await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "model_register", "name": req.name, "owner": owner,
 
                "base_url": req.base_url, "api_mode": req.api_mode,
                "session_id": session_id,})
@@ -2339,7 +2355,7 @@ async def unregister_model(name: str, request: Request, identity: Identity = Dep
                                          "message": "只能注销本人注册的模型"})
 
     store.delete(name)
-    log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "model_unregister", "name": name, "owner": m.owner, "caller": caller})
+    await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "model_unregister", "name": name, "owner": m.owner, "caller": caller})
     return {"object": "model", "id": name, "deleted": True}
 
 
@@ -2381,10 +2397,10 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
     _mark_pre_upstream(request)
     _mentioned = _mentioned_data_filename(text)
     _session_name = "chat-inline-image" if (inline_text or inline_bad) else ("chat-mentioned-file:" + _mentioned if _mentioned else "")
-    _mark_hit_context(session_id, _identity_bind_key(request), _session_name, _mentioned, decision)
+    await run_in_threadpool(_mark_hit_context, session_id, _identity_bind_key(request), _session_name, _mentioned, decision)
     if decision.get("action") == "block":
 
-        log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), "type": "chat", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview, "l2": l2_result,
+        await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), "type": "chat", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview, "l2": l2_result,
         "session_id": session_id,})
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"), "message": "内容被安全策略拦截，未转发外网"})
 
@@ -2446,7 +2462,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                                     sent = True
                                     yield chunk
 
-                                log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
+                                await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
 
                                     "type": "chat", "action": "route_local", "rule": "first_chunk_fallback",
                                     "provider": lp.name, "local": True, "model": lp.default_model,
@@ -2456,7 +2472,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
 
                             except Exception:
 
-                                log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
+                                await log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
                                      action=decision.get("action"), rule=decision.get("name"),
                                      provider=prov, model=model, kind="first_chunk_fallback_failed",
                                      session_id=session_id, text_preview=audit_preview)
@@ -2485,7 +2501,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                                           "gateway": {"provider": local_prov.name, "downgraded_from": "prompt_too_long"}}
 
                                 yield f"data: {json.dumps(notice, ensure_ascii=False)}\n\n".encode("utf-8")
-                                log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
+                                await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
                                     "type": "chat", "action": "route_local", "rule": "prompt_too_long_fallback",
                                     "provider": local_prov.name, "local": True, "model": local_prov.default_model,
@@ -2502,7 +2518,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                         except Exception as e2:
 
                             # fallback failed
-                            log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
+                            await log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
                                  action=decision.get("action"), rule=decision.get("name"),
                                  provider=prov, model=model, kind="upstream_fallback_failed",
                                  session_id=session_id, text_preview=audit_preview)
@@ -2512,7 +2528,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                             return
 
                     # non-fallback error
-                    log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
+                    await log_stream_error(request, type_="chat", status=getattr(exc, "status_code", 0) or 502,
                          action=decision.get("action"), rule=decision.get("name"),
                          provider=prov, model=model, kind="upstream",
                          session_id=session_id, text_preview=audit_preview)
@@ -2523,7 +2539,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                 except Exception as exc:
 
                     # 兜底：任何异常都不允许逃出生成器，否则客户端看到的是被掐断的流
-                    log_stream_error(request, type_="chat", status=502,
+                    await log_stream_error(request, type_="chat", status=502,
                          action=decision.get("action"), rule=decision.get("name"),
                          provider=prov, model=model, kind="internal",
                          session_id=session_id, text_preview=audit_preview)
@@ -2532,11 +2548,11 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                     yield b"data: [DONE]\n\n"
 
 
-            log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
+            await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
                 "type": "chat", "action": decision.get("action"), "rule": decision.get("name"),
                 "provider": prov.name, "local": prov.local, "model": model,
-                "text_preview": audit_preview, "layer": "L2" if decision.get("name") == "l2_confidential" else "L1",
+                "text_preview": audit_preview, "layer": "L2" if l2_result and decision.get("name") in ("l2_confidential", "l2_unavailable", "l2_injection") else "L1",
                 "downgraded_from": downgraded, "stream": True,
                 "session_id": session_id,})
 
@@ -2575,7 +2591,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
 
                     else:
 
-                        raise _upstream_error_detail_response(exc, msg, _ctx_overflow, prov, decision, request, type_="chat")
+                        raise await _upstream_error_detail_response(exc, msg, _ctx_overflow, prov, decision, request, type_="chat")
 
                 except HTTPException:
 
@@ -2583,7 +2599,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
 
                 except Exception as e2:
 
-                    log_upstream_failure(request, type_="chat", status=exc.status_code,
+                    await log_upstream_failure(request, type_="chat", status=exc.status_code,
 
                                           action=decision.get("action"), rule=decision.get("name"),
                                           provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
@@ -2592,7 +2608,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
 
             else:
 
-                log_upstream_failure(request, type_="chat", status=exc.status_code,
+                await log_upstream_failure(request, type_="chat", status=exc.status_code,
 
                                       action=decision.get("action"), rule=decision.get("name"),
                                       provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
@@ -2624,7 +2640,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
                 gw["local"] = _acur["local"]
 
         result["gateway"] = gw
-        log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
+        await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
             "type": "chat", "action": decision.get("action"), "rule": decision.get("name"),
             "provider": gw["provider"], "local": gw["local"], "model": gw["model"],
@@ -2640,7 +2656,7 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
 
     except RoutingError as exc:
 
-        log_upstream_failure(request, type_="chat", status=exc.status_code,
+        await log_upstream_failure(request, type_="chat", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
                               provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
@@ -2670,7 +2686,7 @@ async def embeddings(request: Request, identity: Identity = Depends(_rate_limit_
     _mark_pre_upstream(request)
     if decision.get("action") == "block":
 
-        log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
+        await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""),
                    "type": "embedding", "action": "block", "rule": decision.get("name"),
                    "text_preview": text[:200], "l2": l2_result, "session_id": session_id})
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name")})
@@ -2687,7 +2703,7 @@ async def embeddings(request: Request, identity: Identity = Depends(_rate_limit_
 
     except RoutingError as exc:
 
-        log_upstream_failure(request, type_="embedding", status=exc.status_code,
+        await log_upstream_failure(request, type_="embedding", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
                               provider=prov, model=model, text_preview=text[:200])
@@ -2696,7 +2712,7 @@ async def embeddings(request: Request, identity: Identity = Depends(_rate_limit_
 
 
     result["gateway"] = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
-    log_entry({"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
+    await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": str(req.model or ""), 
 
         "type": "embedding", "action": decision.get("action"), "rule": decision.get("name"),
         "provider": prov.name, "local": prov.local, "model": model, "text_preview": text[:200],
@@ -2733,11 +2749,11 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
     _mark_gw_action(request, decision)
     _mark_pre_upstream(request)
     _mentioned = _mentioned_data_filename(text)
-    _mark_session_hit(session_id, decision, "messages-inline-image" if (inline_text or inline_bad) else ("messages-mentioned-file:" + _mentioned if _mentioned else ""))
-    _mark_taint_hit(_identity_bind_key(request), _mentioned, decision)
+    await run_in_threadpool(_mark_session_hit, session_id, decision, "messages-inline-image" if (inline_text or inline_bad) else ("messages-mentioned-file:" + _mentioned if _mentioned else ""))
+    await run_in_threadpool(_mark_taint_hit, _identity_bind_key(request), _mentioned, decision)
     if decision.get("action") == "block":
 
-        log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "messages", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
+        await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "messages", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
         "session_id": session_id,})
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"),
 
@@ -2760,7 +2776,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
         except RoutingError as exc:
 
-            log_upstream_failure(request, type_="messages", status=exc.status_code,
+            await log_upstream_failure(request, type_="messages", status=exc.status_code,
 
                                   action=decision.get("action"), rule=decision.get("name"),
                                   provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
@@ -2791,7 +2807,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                                 sent = True
                                 yield chunk
 
-                            log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
+                            await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
 
                                 "type": "messages", "action": "route_local", "rule": "first_chunk_fallback",
 
@@ -2803,11 +2819,11 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
                         except Exception:
 
-                            log_stream_error(request, type_="messages", status=getattr(exc, "status_code", 0) or 502,
+                            await log_stream_error(request, type_="messages", status=getattr(exc, "status_code", 0) or 502,
                                  action=decision.get("action"), rule=decision.get("name"),
                                  provider=prov, model=model, kind="first_chunk_fallback_failed",
                                  session_id=session_id, text_preview=audit_preview)
-                log_stream_error(request, type_="messages", status=getattr(exc, "status_code", 0) or 502,
+                await log_stream_error(request, type_="messages", status=getattr(exc, "status_code", 0) or 502,
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="upstream",
                      session_id=session_id, text_preview=audit_preview)
@@ -2816,7 +2832,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
             except Exception as exc:
 
-                log_stream_error(request, type_="messages", status=502,
+                await log_stream_error(request, type_="messages", status=502,
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="internal",
                      session_id=session_id, text_preview=audit_preview)
@@ -2824,7 +2840,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
                 "session_id": session_id,}, "error")
 
 
-        log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
+        await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
             "type": "messages", "action": decision.get("action"), "rule": decision.get("name"),
             "provider": prov.name, "local": prov.local, "model": model,
@@ -2849,7 +2865,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
     except RoutingError as exc:
 
-        log_upstream_failure(request, type_="messages", status=exc.status_code,
+        await log_upstream_failure(request, type_="messages", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
                               provider=prov, model=model, text_preview=audit_preview, session_id=session_id)
@@ -2861,7 +2877,7 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
 
 
     result["gateway"] = _meta(prov, model, notes)
-    log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
+    await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
         "type": "messages", "action": decision.get("action"), "rule": decision.get("name"),
         "provider": result["gateway"]["provider"], "local": result["gateway"]["local"], "model": model,
@@ -2893,7 +2909,9 @@ def _codex_session_id(body):
     """codex 等 responses 客户端不发会话头：用对话首条 user 消息做指纹当 session key。
 
     实测（2026-09-20 dump）：codex 每轮全量重发 input、无 previous_response_id，
-    首条 user 消息（environment_context+首问）在对话内不变。
+    首条 user 消息（environment_context+首问）在对话内不变；指纹只取用户真问题，
+    剥掉 environment_context / system-reminder 等易变样板（工作目录、git 状态等），
+    避免这些波动导致同一对话被判定成不同会话、会话粘性失效。
     """
     try:
         inp = body.get("input") if isinstance(body, dict) else None
@@ -2910,6 +2928,11 @@ def _codex_session_id(body):
                                    if isinstance(b, dict) and b.get("type") == "input_text")
             else:
                 continue
+            # 指纹只取用户真问题：剥掉 environment_context / system-reminder 等
+            # 易变样板（工作目录、git 状态、平台信息），避免这些波动导致同一对话
+            # 被判成不同会话、会话粘性失效。L1/L2 审查仍用全文，不受此影响。
+            first = re.sub(r"<environment_context\b.*?</environment_context>", " ", first, flags=re.S)
+            first = re.sub(r"<system-reminder\b.*?</system-reminder>", " ", first, flags=re.S)
             if first.strip():
                 return "codex-" + hashlib.sha256(first.encode("utf-8", "replace")).hexdigest()[:16]
     except Exception:
@@ -2942,16 +2965,15 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     _mark_pre_upstream(request)
     if responses_should_mark(decision.get("name"), decision.get("action"), file_ctx):
         _mark_file = file_ctx.get("filename") or "responses-inline"
-        _mark_hit_context(
+        await run_in_threadpool(_mark_hit_context,
             session_id,
             _identity_bind_key(request),
             _mark_file,
             file_ctx.get("filename") or _mark_file,
-            decision,
-        )
+            decision)
     if decision.get("action") == "block":
 
-        log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "responses", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
+        await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "responses", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
         "session_id": session_id,})
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"),
 
@@ -2966,7 +2988,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
 
     except RoutingError as exc:
 
-        log_upstream_failure(request, type_="responses", status=exc.status_code,
+        await log_upstream_failure(request, type_="responses", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
                               provider=prov, model=model, session_id=session_id)
@@ -2999,7 +3021,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                                 sent = True
                                 yield chunk
 
-                            log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
+                            await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""),
 
                                 "type": "responses", "action": "route_local", "rule": "first_chunk_fallback",
 
@@ -3011,12 +3033,12 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
 
                         except Exception:
 
-                            log_stream_error(request, type_="responses", status=getattr(exc, "status_code", 0) or 502,
+                            await log_stream_error(request, type_="responses", status=getattr(exc, "status_code", 0) or 502,
                                  action=decision.get("action"), rule=decision.get("name"),
                                  provider=prov, model=model, kind="first_chunk_fallback_failed",
                                  session_id=session_id, text_preview=audit_preview)
                 # 降级不可用/也失败：显式发 response.failed 事件收尾，Codex 前端可见，不再静默断流
-                log_stream_error(request, type_="responses", status=getattr(exc, "status_code", 0) or 502,
+                await log_stream_error(request, type_="responses", status=getattr(exc, "status_code", 0) or 502,
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="upstream",
                      session_id=session_id, text_preview=audit_preview)
@@ -3024,14 +3046,14 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
 
             except Exception as exc:
 
-                log_stream_error(request, type_="responses", status=502,
+                await log_stream_error(request, type_="responses", status=502,
                      action=decision.get("action"), rule=decision.get("name"),
                      provider=prov, model=model, kind="internal",
                      session_id=session_id, text_preview=audit_preview)
                 yield _sse({"type": "response.failed", "response": {"error": {"message": f"gateway stream error: {exc}"}}, "session_id": session_id,}, "error")
 
 
-        log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
+        await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
             "type": "responses", "action": decision.get("action"), "rule": decision.get("name"),
             "provider": prov.name, "local": prov.local, "model": model,
@@ -3054,7 +3076,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
 
     except RoutingError as exc:
 
-        log_upstream_failure(request, type_="responses", status=exc.status_code,
+        await log_upstream_failure(request, type_="responses", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
                               provider=prov, model=model, session_id=session_id)
@@ -3068,7 +3090,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     gw = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
     gw["findings"] = text_findings
     result["gateway"] = gw
-    log_entry({"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
+    await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), 
 
         "type": "responses", "action": decision.get("action"), "rule": decision.get("name"),
         "provider": gw["provider"], "local": gw["local"], "model": model,
@@ -3158,7 +3180,7 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
     text_findings = inspect_text(text)
     _note_risk(text_findings)
     session_id = extract_session_id(request.headers)
-    session_conf = _is_session_confidential(session_id)
+    session_conf = await run_in_threadpool(_is_session_confidential, session_id)
     ctx = {
 
         "text": text + " " + filename,
@@ -3228,7 +3250,7 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
 
     except RoutingError as exc:
 
-        log_upstream_failure(request, type_="file", status=exc.status_code,
+        await log_upstream_failure(request, type_="file", status=exc.status_code,
 
                               action=decision.get("action"), rule=decision.get("name"),
                               provider=prov, model=model, filename=filename, ext=file_info.get("ext"), session_id=session_id)
@@ -3236,19 +3258,19 @@ async def files_check(request: Request, file: UploadFile = File(...), identity: 
         raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "message": str(exc)})
 
 
-    log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", 
+    await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": "", 
 
         "type": "file", "filename": filename, "ext": file_info.get("ext"),
         "action": decision.get("action"), "rule": decision.get("name"),
         "provider": prov.name, "local": prov.local, "model": model,
         "override_denied": notes.get("override_denied") if notes else None,
         "findings": file_info.get("findings"), "l2": l2_result,
-        "layer": "L2" if l2_result and decision.get("name") in ("l2_confidential", "l2_unavailable") else "L1",
+        "layer": "L2" if l2_result and decision.get("name") in ("l2_confidential", "l2_unavailable", "l2_injection") else "L1",
         "downgraded_from": downgraded,
         "session_id": session_id,
 
     })
-    _mark_hit_context(session_id, _identity_bind_key(request), filename, filename, decision)
+    await run_in_threadpool(_mark_hit_context, session_id, _identity_bind_key(request), filename, filename, decision)
 
 
     if decision.get("action") == "block":
@@ -3331,7 +3353,7 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
         "file": {"ext": "", "filename": "", "headers": [], "sheet_names": [], "text": ""},
         "findings": findings,
         "session_id": session_id,
-        "session": {"confidential": _is_session_confidential(session_id)},
+        "session": {"confidential": await run_in_threadpool(_is_session_confidential, session_id)},
 
     })
     if decision.get("action") != "allow":
@@ -3347,7 +3369,7 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
     # 所以审查不通过只能拒绝，绝不静默发给外网。
     if decision.get("action") != "allow":
 
-        log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "egress_blocked", "path": path, "action": decision.get("action"),
+        await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "egress_blocked", "path": path, "action": decision.get("action"),
 
                    "rule": decision.get("name"), "text_preview": text[:200]})
 
@@ -3403,7 +3425,7 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
         "session_id": session_id,})
 
 
-    log_entry({"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "egress", "path": path, "provider": prov.name, "local": prov.local,
+    await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": "", "type": "egress", "path": path, "provider": prov.name, "local": prov.local,
 
                "rule": decision.get("name"), "text_preview": text[:200]})
 
@@ -3855,7 +3877,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
         verdict = None
 
     if verdict == "black":
-        log_entry({
+        await run_in_threadpool(log_entry, {
             "client_ip": _resolve_client_ip(request),
             "requested_model": "",
             "type": "ip_blocked",

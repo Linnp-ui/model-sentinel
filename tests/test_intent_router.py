@@ -230,7 +230,7 @@ def test_sticky_raises_downgraded_turn(monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_INTENT_STICKY_MIN", "30")
     st = _FakeStickyStore(prev=(3, 123))
     _patch_store(monkeypatch, st)
-    out = ir.apply_sticky("pytest-ir-sess-0001", {"level": 1, "ms": 40, "cached": False})
+    out = asyncio.run(ir.apply_sticky("pytest-ir-sess-0001", {"level": 1, "ms": 40, "cached": False}))
     assert out["level"] == 3 and out["sticky"] is True
     # 时间戳随使用刷新（活跃会话档位不释放）
     assert st.marked == [("pytest-ir-sess-0001", 3)]
@@ -241,7 +241,7 @@ def test_sticky_applies_on_classifier_failure(monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_INTENT_STICKY_MIN", "30")
     st = _FakeStickyStore(prev=(2, 123))
     _patch_store(monkeypatch, st)
-    out = ir.apply_sticky("pytest-ir-sess-0002", None)
+    out = asyncio.run(ir.apply_sticky("pytest-ir-sess-0002", None))
     assert out["level"] == 2 and out["sticky"] is True and out["cached"] is True
     assert st.marked == [("pytest-ir-sess-0002", 2)]
 
@@ -251,7 +251,7 @@ def test_sticky_keeps_own_higher_level(monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_INTENT_STICKY_MIN", "30")
     st = _FakeStickyStore(prev=(2, 123))
     _patch_store(monkeypatch, st)
-    out = ir.apply_sticky("pytest-ir-sess-0003", {"level": 3, "ms": 50, "cached": False})
+    out = asyncio.run(ir.apply_sticky("pytest-ir-sess-0003", {"level": 3, "ms": 50, "cached": False}))
     assert out["level"] == 3 and out.get("sticky") is not True
     assert st.marked == [("pytest-ir-sess-0003", 3)]
 
@@ -261,7 +261,7 @@ def test_sticky_off_is_noop(monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_INTENT_STICKY_MIN", "0")
     st = _FakeStickyStore(prev=(3, 123))
     _patch_store(monkeypatch, st)
-    out = ir.apply_sticky("pytest-ir-sess-0004", {"level": 1, "ms": 40, "cached": False})
+    out = asyncio.run(ir.apply_sticky("pytest-ir-sess-0004", {"level": 1, "ms": 40, "cached": False}))
     assert out == {"level": 1, "ms": 40, "cached": False}
     assert st.marked == []
 
@@ -271,7 +271,7 @@ def test_sticky_no_session_no_sticky(monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_INTENT_STICKY_MIN", "30")
     st = _FakeStickyStore(prev=(3, 123))
     _patch_store(monkeypatch, st)
-    out = ir.apply_sticky(None, {"level": 1, "ms": 40, "cached": False})
+    out = asyncio.run(ir.apply_sticky(None, {"level": 1, "ms": 40, "cached": False}))
     assert out["level"] == 1 and out.get("sticky") is not True
     assert st.marked == []
 

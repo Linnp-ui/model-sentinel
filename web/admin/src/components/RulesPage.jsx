@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Alert, Card, Slider, Checkbox, Tooltip, Radio, Switch } from 'antd';
-import { RobotOutlined, DeleteOutlined, RightOutlined } from '@ant-design/icons';
+import { RobotOutlined, DeleteOutlined, LockOutlined } from '@ant-design/icons';
 import { api, errText, usePoll } from '../api.js';
 import { L2PromptsSection } from './ModelPolicyPage.jsx';
 import { wideSticky } from '../utils.js';
@@ -56,7 +56,7 @@ const SCOPE_TIPS = {
 const L2_CROSS_LINK = (
   <Tooltip title="端点 / 模型 / 超时 / 影子 / 灰区下限在「模型配置」页的审查模型卡">
     <Button type="link" size="small" style={{ padding: 0 }}
-      onClick={() => { window.location.hash = '/modelpolicy'; }}>审查模型 <RightOutlined /></Button>
+      onClick={() => { window.location.hash = '/modelpolicy'; }}>审查模型 →</Button>
   </Tooltip>
 );
 
@@ -363,7 +363,7 @@ export default function RulesPage() {
     if (rec) {
       form.setFieldsValue({
         name: rec.name, priority: rec.priority, action: rec.action,
-        description: rec.description, when_json: JSON.stringify(rec.when, null, 2),
+        priority_locked: !!rec.priority_locked, description: rec.description, when_json: JSON.stringify(rec.when, null, 2),
         target_provider: rec.target?.provider || '', target_model: rec.target?.model || '',
         ai_description: '',
       });
@@ -388,7 +388,7 @@ export default function RulesPage() {
     } else {
       setUnparsed(false);
       form.setFieldsValue({
-        name: '', priority: 100, action: 'allow', description: '',
+        name: '', priority: 100, action: 'allow', priority_locked: false, description: '',
         when_json: '{"text contains_any": ["关键词1", "关键词2"]}',
         target_provider: '', target_model: '',
         ai_description: '',
@@ -457,8 +457,9 @@ export default function RulesPage() {
       const v = await form.validateFields();
       let when;
       try { when = JSON.parse(v.when_json); } catch { message.error('when JSON 不合法'); return; }
-      const body = {
-        name: v.name, priority: v.priority, action: v.action, description: v.description, when,
+       const body = {
+        name: v.name, priority: v.priority, action: v.action,
+        priority_locked: !!v.priority_locked, description: v.description, when,
       };
       if (editing && v.name !== editing) body.new_name = v.name;
       if (v.target_provider) body.target = { provider: v.target_provider, model: v.target_model || '' };
@@ -504,7 +505,10 @@ export default function RulesPage() {
   const cols = [
     /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。原 scroll.x=1070 定宽
        在窄屏撑出横向滚动；fixed 布局下 % 才是真·定比（auto 布局 % 只是建议值） */
-    { title: <>{'优先级'}<Tip term="rule_priority" /></>, dataIndex: 'priority', width: '10%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort },
+    { title: <>{'优先级'}<Tip term="rule_priority" /></>, dataIndex: 'priority', width: '10%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort,
+      render: (v, rec) => (rec.priority_locked
+        ? <span><LockOutlined style={{ marginRight: 4, color: '#faad14' }} />{v}</span>
+        : v) },
     { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, align: 'center', className: 'cell-center',
       render: (v) => <Text code title={v}><RuleZh name={v} /></Text> },
     { title: <>{'动作'}<Tip term="action" /></>, dataIndex: 'action', width: '12%',
@@ -627,8 +631,11 @@ export default function RulesPage() {
             <Form.Item name="name" label="规则名" rules={[{ required: true }]}>
               <Input id="rule-name" />
             </Form.Item>
-            <Form.Item name="priority" label={<>{'优先级（小者先）'}<Tip term="rule_priority" /></>}>
+             <Form.Item name="priority" label={<>{'优先级（小者先）'}<Tip term="rule_priority" /></>}>
               <InputNumber min={0} max={1000} />
+            </Form.Item>
+            <Form.Item name="priority_locked" label="锁定优先级" valuePropName="checked">
+              <Switch />
             </Form.Item>
             <Form.Item name="action" label={<>{'动作'}<Tip term="action" /></>} rules={[{ required: true }]}>
               <Select style={{ width: 140 }} options={[

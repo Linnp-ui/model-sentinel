@@ -1,5 +1,4 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { RightOutlined } from '@ant-design/icons';
 import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Tooltip } from 'antd';
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
@@ -794,7 +793,7 @@ export default function ModelPolicyPage() {
           // L2 配置劈两页（本页=端点/模型/超时/影子/灰区下限，规则管理页=判定档/判密阈值/提示词），互链别让用户猜
           <Tooltip title="L2 判定档 / 判密阈值 / 提示词在「规则管理」页的 L2 拦截配置卡">
             <Button type="link" size="small" style={{ padding: 0 }}
-              onClick={() => { window.location.hash = '/rules'; }} >L2 拦截配置 <RightOutlined /></Button>
+              onClick={() => { window.location.hash = '/rules'; }} >L2 拦截配置 →</Button>
           </Tooltip>
         }>
         <L2RuntimeSection />

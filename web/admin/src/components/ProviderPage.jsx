@@ -1,5 +1,4 @@
 import { useEffect, useState, useCallback } from 'react';
-import { RightOutlined } from '@ant-design/icons';
 import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Row, Col } from 'antd';
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
@@ -188,7 +187,7 @@ export function ProviderHealthCard({ compact = false }) {
   return (
     <Card title="Provider 健康检查"
       extra={<Space>
-        {compact && <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/provider'; }}>Provider 管理 <RightOutlined /></Button>}
+        {compact && <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/provider'; }}>Provider 管理 →</Button>}
         <Button size="small" loading={checking} onClick={() => check('')}>全部检查</Button>
       </Space>}>
       <Table size="small" sticky={wideSticky()} rowKey="name" pagination={false} tableLayout="fixed" dataSource={rows || []}

@@ -78,9 +78,11 @@ def _mentioned_filenames(text: str) -> list:
     return out
 
 
+_CAD_EXTS = (".dwg", ".dxf", ".rvt", ".skp")
+
 def _suffix_ext(name: str) -> str:
     low = name.lower()
-    for e in (".csv", ".txt", ".tsv", ".xlsx", ".xls", ".pdf"):
+    for e in (".csv", ".txt", ".tsv", ".xlsx", ".xls", ".pdf") + _CAD_EXTS:
         if low.endswith(e):
             return e.lstrip(".")
     return ""
@@ -99,7 +101,7 @@ def extract_responses_filectx(body: Any, text: str = "") -> dict:
             filenames.append(name)
             if not ext:
                 low = name.lower()
-                for e in (".csv", ".txt", ".tsv", ".xlsx", ".xls", ".pdf"):
+                for e in (".csv", ".txt", ".tsv", ".xlsx", ".xls", ".pdf") + _CAD_EXTS:
                     if low.endswith(e):
                         ext = e.lstrip(".")
                         break

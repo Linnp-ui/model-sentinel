@@ -773,8 +773,12 @@ def _content_parts(content: Any) -> list:
     return []
 
 
-def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool]:
-    """chat messages (pydantic 或 dict) → ([bytes], overflow_or_bad)。"""
+def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool, bool]:
+    """chat messages (pydantic 或 dict) → ([bytes], overflow_or_bad, has_image)。
+
+    has_image = 存在内联图片块（含解码失败的）：供路由层模态过滤
+    （带图请求不选纯文本候选，见 alias_router.alias_candidates）。
+    """
     blobs: list = []
     bad = False
     total = 0
@@ -803,14 +807,19 @@ def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool]:
                     bad = True  # 音频不转写：有数据即 fail-closed
     if total > _INLINE_MEDIA_MAX_ITEMS:
         bad = True  # 超 cap 的部分没检查 → fail-closed
-    return blobs, bad
+    return blobs, bad, total > 0  # chat 只收图片块：total 即图片数
 
 
-def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool]:
-    """Anthropic messages body → ([bytes], overflow_or_bad)。"""
+def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool, bool]:
+    """Anthropic messages body → ([bytes], overflow_or_bad, has_image)。
+
+    has_image 只数 image/input_image 块；document（PDF）暂不计入模态
+    （模型对文件块的支持未实测，不声明不硬滤）。
+    """
     blobs: list = []
     bad = False
     total = 0
+    n_img = 0
     msgs = (body.get('messages', []) or []) if isinstance(body, dict) else []
     for m in msgs:
         c = m.get('content') if isinstance(m, dict) else None
@@ -822,6 +831,8 @@ def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool]:
                 continue
             if src.get('type') == 'base64' and isinstance(src.get('data'), str):
                 total += 1
+                if b.get('type') in ('image', 'input_image'):
+                    n_img += 1
                 raw = decode_inline_b64(src.get('data'))
                 if raw is None:
                     bad = True
@@ -831,17 +842,22 @@ def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool]:
                 bad = True  # 未知 source 类型 → fail-closed
     if total > _INLINE_MEDIA_MAX_ITEMS:
         bad = True
-    return blobs, bad
+    return blobs, bad, n_img > 0
 
 
-def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool]:
-    """OpenAI Responses body → ([bytes], overflow_or_bad)。"""
+def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool, bool]:
+    """OpenAI Responses body → ([bytes], overflow_or_bad, has_image)。
+
+    has_image 只数 input_image/image/image_url 块；input_file（codex 附件）
+    不计入模态（文件块支持未实测，不声明不硬滤）。
+    """
     blobs: list = []
     bad = False
     total = 0
+    n_img = 0
 
     def _block(b: Any) -> None:
-        nonlocal total, bad
+        nonlocal total, bad, n_img
         if not isinstance(b, dict):
             return
         t = b.get('type', '')
@@ -849,6 +865,7 @@ def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool]:
             v = b.get('image_url', '')
             if isinstance(v, str) and v.startswith('data:'):
                 total += 1
+                n_img += 1
                 raw = decode_inline_data_url(v)
                 if raw is None:
                     bad = True
@@ -882,4 +899,4 @@ def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool]:
                 _block(item)
     if total > _INLINE_MEDIA_MAX_ITEMS:
         bad = True
-    return blobs, bad
+    return blobs, bad, n_img > 0

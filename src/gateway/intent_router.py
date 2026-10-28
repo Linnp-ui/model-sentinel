@@ -89,7 +89,7 @@ def _sticky_window() -> int:
         return 30 * 60
 
 
-def apply_sticky(session_id, info):
+async def apply_sticky(session_id, info):
     """会话级档位粘性（借鉴 magpie 的 Stays）：跨 user turn 只升不降。
 
     换模型 = 废掉上一模型的 vendor prompt cache（下轮全量重付）+ 质量断崖
@@ -99,10 +99,14 @@ def apply_sticky(session_id, info):
 
     info = _decide 的返回（{"level","ms","cached"} 或 None）；返回写 ctx 的最终 dict。
     测试可 monkeypatch get_session_store 注入假 store。
+
+    async（2026-10-27）：session store 同步 Redis 挪出事件循环
+    （main._review_text 调用点 await）。
     """
+    from starlette.concurrency import run_in_threadpool
     from .session_store import get_session_store
     window = _sticky_window()
-    prev = get_session_store().get_sticky_tier(session_id, window) if window else None
+    prev = await run_in_threadpool(get_session_store().get_sticky_tier, session_id, window) if window else None
     level = (info or {}).get("level")
     eff = level
     sticky = False
@@ -111,7 +115,7 @@ def apply_sticky(session_id, info):
         sticky = info is None or prev[0] >= level
     if eff in (2, 3):
         # 档 1 不记（等于没约束）；时间戳随每次使用刷新 = 活跃会话档位不释放
-        get_session_store().mark_sticky_tier(session_id, eff)
+        await run_in_threadpool(get_session_store().mark_sticky_tier, session_id, eff)
     if info is None:
         return {"level": eff, "ms": 0, "cached": True, "sticky": True} if (eff and sticky) else None
     out = dict(info)

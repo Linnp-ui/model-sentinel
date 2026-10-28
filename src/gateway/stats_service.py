@@ -648,6 +648,11 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
         for p in load_policy():
             if p.name == "默认放行":
                 continue
+            # 优先级被锁定的规则不参与自动重排建议（其 priority 保持原值）
+            if getattr(p, "priority_locked", False) or getattr(p, "locked", False) \
+               or getattr(p, "locked_priority", False) or getattr(p, "pinned", False) \
+               or getattr(p, "fixed_priority", False):
+                continue
             c = hits.get(p.name, 0)
             if c >= reorder_min:
                 groups.setdefault(p.action, []).append((p.name, c, p.priority))

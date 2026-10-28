@@ -77,7 +77,8 @@ policies:
 - name: session_route_local
   priority: 12
   action: route_local
-  description: 会话级路由本地：会话内出现机密判定（机密文件 / 纯文本 L1 命中 / L2 判密）后，同会话 chat/messages/responses 请求自动走本地模型；TTL 随 AI_GATEWAY_SESSION_TTL（默认 30 分钟，生产 .env 为 7 天），可用性兜底转本地不标记
+  description: 会话级路由本地：会话内出现机密判定（机密文件 / 纯文本 L1 命中 / L2 判密）后，同会话 chat/messages/responses
+    请求自动走本地模型；TTL 随 AI_GATEWAY_SESSION_TTL（默认 30 分钟，生产 .env 为 7 天），可用性兜底转本地不标记
   when:
     any:
     - session.confidential == true: true
@@ -109,8 +110,8 @@ policies:
 - name: ocr_empty_image_route_local
   priority: 30
   action: route_local
-  description: 'P0-3 fix: image branch + OCR returned empty (engine missing / corrupted
-    / unsupported format) -> fail-CLOSED route_local instead of fail-open allow'
+  description: 图片走了 OCR 但没识别出任何文字（OCR 引擎缺失 / 文件损坏 / 不支持的格式）
+    ⇒ fail-closed 转内网，不 fail-open 放行（P0-3）
   when:
     any:
     - findings.ocr_empty_and_image == true: true
@@ -120,9 +121,15 @@ policies:
 - name: drawing_local_only
   priority: 40
   action: route_local
-  description: 设计图纸：含机密/保密水印才走内网（按你选择）
+  description: 设计图纸：CAD 文件（dwg/dxf/rvt/skp）无条件转内网；其他文件含机密/保密水印或图纸领域关键词转内网。 纯文本只提词不带内容仍放行（security_testset
+    drawing_*_pass 钉死口径）
   when:
     any:
+    - file.ext in:
+      - dwg
+      - dxf
+      - rvt
+      - skp
     - file.text contains_any:
       - 机密
       - 保密
@@ -130,6 +137,14 @@ policies:
       - 不得外传
       - confidential
       - secret
+      - 图纸
+      - 施工图
+      - 结构图
+      - 竣工图
+      - 图号
+      - blueprint
+      - CAD
+      - BIM
     - file.watermark contains_any:
       - 机密
       - 保密
@@ -140,9 +155,34 @@ policies:
       - 保密
       - confidential
       - secret
+      - 图纸
+      - 施工图
+      - 结构图
+      - 竣工图
+      - 图号
+      - blueprint
+      - CAD
+      - BIM
   target:
     provider: vllm_local
     model: qwen2.5:7b
+  match:
+    combiner: any
+    rows:
+    - content_type: ext
+      match_type: in
+      match_value: dwg, dxf, rvt, skp
+    - content_type: file
+      match_type: contains
+      match_value: 机密, 保密, 内部资料, 不得外传, confidential, secret, 图纸, 施工图, 结构图, 竣工图, 图号,
+        blueprint, CAD, BIM
+    - content_type: watermark
+      match_type: contains
+      match_value: 机密, 保密, confidential, secret
+    - content_type: filename
+      match_type: contains
+      match_value: 机密, 保密, confidential, secret, 图纸, 施工图, 结构图, 竣工图, 图号, blueprint,
+        CAD, BIM
 - name: default_allow
   priority: 100
   description: 默认外网（provider 留空 = 用 routing.yaml 的 default_external）

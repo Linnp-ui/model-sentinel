@@ -703,6 +703,19 @@ def test_classify_chunks_carries_shadow():
     assert out["shadow_label"] == "CONFIDENTIAL" and out["shadow_conf"] == 0.99
     assert out["shadow_probabilities"] == {"CONFIDENTIAL": 0.99, "NORMAL": 0.01}
 
+def test_classify_chunks_carries_injection():
+    # 多任务聚合：注入命中时 out 必须带 injection 字段（_l2_decision 据此转内网）
+    import asyncio
+    from unittest.mock import patch
+    from src.gateway import small_model as _sm
+
+    async def fake_classify(text, filename="", headers=None, sheet_names=None):
+        return {"label": "NORMAL", "confidence": 0.9, "reason": "q", "latency_ms": 10, "injection": True, "injection_confidence": 0.8}
+
+    with patch.object(_sm, "classify", side_effect=fake_classify):
+        out = asyncio.run(_sm.classify_chunks(["a"], scopes=["last_user"]))
+    assert out["injection"] is True
+
 def test_l2_cache_key_uses_full_text():
     # 旧键取 text[:800]：两段前 800 字相同、结论不同的文本会互相命中缓存
     # （实测第二段机密文本直接返回 NORMAL cached=True）⇒ 键必须覆盖全文

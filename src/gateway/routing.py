@@ -716,8 +716,12 @@ def _mp_next(tried: list, reason: str, cur_ctx: int, cfg, rc, kind: str = "chat"
     ``rc`` = 客户端自带凭据（每请求解析一次）；候选的可转发性按**该候选自己的**
     provider 判（凭据池 per-provider，用当前 prov 的 key 去筛候选会误杀有凭据的候选）。
     """
-    from .model_policy import pick_fallback_candidates
+    from .model_policy import model_inputs, pick_fallback_candidates
+    from .alias_router import ctx_needs_image
     for cand in pick_fallback_candidates(tried, reason, cur_ctx):
+        # 带图请求不切到未声明 image 输入的候选（静默降级比 fail-loud 更隐蔽）
+        if ctx_needs_image() and "image" not in model_inputs(cand["provider"], cand["model"]):
+            continue
         pcfg = cfg.get(cand["provider"]) or find_provider(cand["provider"])
         if pcfg is None or pcfg.local or pcfg.kind != kind:
             continue
