@@ -91,7 +91,7 @@ const { Text: T } = Typography;
 // ---------------- 总览（默认落地页）：一个页面看到尽量多信息 ----------------
 // KPI 5 卡 + QPS/延迟分位两大图 + 降级事件流 + 建议/Provider 健康全在页上；
 // 与统计页 MetricsSection 的重复是有意保留（落地页密度优先，详情点「详情 →」跳统计页）
-// KEY 规则 → 调节策略建议（SuggestionCard 同卡）；熔断/外网key 由全局 StatusBar 灯覆盖，不重复做卡
+// KEY 规则 → 策略调节建议（SuggestionCard 同卡）；熔断/外网key 由全局 StatusBar 灯覆盖，不重复做卡
 
 // KPI tile：固定 104px 等高（不带 Card head，避免 56px head 撑出参差）
 function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {

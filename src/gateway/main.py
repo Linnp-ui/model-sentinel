@@ -4,7 +4,7 @@ Gateway 主入口 — 公司内网大模型请求的统一出口。
 请求链路（/v1/*，客户端用 OpenAI 兼容协议接入）:
     auth 鉴权（key 必带且须在管理台登记，否则 401）
       -> L1 规则（policy.yaml，_review_text / _review_file_ctx）
-      -> L2 小模型判密（仅灰区 risk_score ∈ [20,60) 触发，门逻辑见 AGENTS.md「L1/L2 门」）
+      -> L2 小模型判密（仅灰区 risk_score >= 20 触发，无上界，门逻辑见 AGENTS.md「L1/L2 门」）
       -> 通过: 转发外网 provider（routing.yaml 声明）
       -> 不通过: 自动降级内网模型（内容不出境，调用方无感知）
 
@@ -127,6 +127,12 @@ from .identity import (
 _CURRENT_CLIENT_KEY: ContextVar[str] = ContextVar("gw_client_key", default="")
 # 审计归因：当前请求文本的风险分（_review_text / 各 inspect_text 调用点写入，log_entry 自动补 risk_score）。
 _CURRENT_RISK: ContextVar = ContextVar("gw_risk_score", default=None)
+# 审计归因：当前请求文本的 L1 命中构成（与风险分同点写入，log_entry 自动补 findings；
+# 文件行显式传入的 findings 优先，不覆盖）。
+_CURRENT_FINDINGS: ContextVar = ContextVar("gw_findings", default=None)
+# 审计归因：内联附件预检结果（文件 flags/sheet_names 等），log_entry 自动补
+# file_findings 独立键——与文本 findings 拆开，展开区两段同显（2026-10-29）。
+_CURRENT_FILE_FINDINGS: ContextVar = ContextVar("gw_file_findings", default=None)
 _CURRENT_PII_SUMMARY: ContextVar = ContextVar("gw_pii_summary", default=None)
 
 
@@ -842,6 +848,36 @@ def _slim_client_envelope(s: str) -> str:
     return re.sub(r"</?session\b[^>]*>", " ", s).strip()
 
 
+def _chat_session_id(messages):
+    """chat 客户端（workbuddy 等）不发 X-Session-ID：首条 user 消息指纹当会话 key。
+
+    与 _codex_session_id（responses 侧）同原理：多轮客户端每轮全量重发 messages，
+    首条 user 消息在对话内不变。指纹前先 _slim_client_envelope 剥客户端样板
+    （OS 版本/工作目录/当前时间是易变字段）。单轮无状态客户端指纹每轮都变
+    = 无粘性收益，不比无会话头更差。
+    """
+    try:
+        if not isinstance(messages, list):
+            return None
+        for m in messages:
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                first = c
+            elif isinstance(c, list):
+                first = "\n".join(str(b.get("text") or "") for b in c
+                                   if isinstance(b, dict) and b.get("type") == "text")
+            else:
+                continue
+            first = _slim_client_envelope(first)
+            if first.strip():
+                return "chat-" + hashlib.sha256(first.encode("utf-8", "replace")).hexdigest()[:16]
+    except Exception:
+        pass
+    return None
+
+
 _CODEX_TITLE_HEAD = "You are a helpful assistant. You will be presented with a user prompt"
 _CODEX_TITLE_NOISE = ("You are a helpful assistant.", "The tasks typically have to do with")
 
@@ -1400,37 +1436,102 @@ class RegisterReq(BaseModel):
 # ---------------------------------------------------------------- 公共逻辑
 
 
-async def _inline_media_scan(kind: str, payload) -> tuple[str, bool]:
-    """内联 base64 图片/文档 → (并入 policy 的文本, 是否有不可读块)。
+async def _inline_media_scan(kind: str, payload) -> tuple[str, bool, dict, bool]:
+    """内联/远端 图片/文档 → (并入 policy 的文本, 是否有不可读块, 文件预检 findings, 是否有远端 URL 附件)。
 
     kind: chat | anthropic | responses。解码+检查在线程池跑，不阻塞事件循环；
-    任一块不可读(解码失败/超 cap/抽空文本)即 fail-closed，由 policy p12 接住。
+    任一块不可读(解码失败/超 cap/抽空文本)即 fail-closed，由 policy 接住。
+    remote=True（远端 http(s) URL 附件，字节不过网关）⇒ 调用方置 remote_attachment
+    让 policy「远端附件转内网」fail-closed。
     带内联图片时置 alias_router 的 needs_image 标记：选头/故障切换硬过滤
     纯文本候选（实测 deepseek-v4-pro 200 但看不见图，静默降级比 400 更隐蔽）。
     """
     if kind == "chat":
-        blobs, bad, has_image = collect_inline_blobs_chat(payload)
+        blobs, bad, has_image, remote = collect_inline_blobs_chat(payload)
     elif kind == "anthropic":
-        blobs, bad, has_image = collect_inline_blobs_anthropic(payload)
+        blobs, bad, has_image, remote = collect_inline_blobs_anthropic(payload)
     elif kind == "responses":
-        blobs, bad, has_image = collect_inline_blobs_responses(payload)
+        blobs, bad, has_image, remote = collect_inline_blobs_responses(payload)
     else:
-        return "", False
+        return "", False, {}, False
     if has_image:
         from .alias_router import ctx_set_needs_image
         ctx_set_needs_image(True)
     if not blobs:
-        return "", bad
+        # 无内联字节可检；远端 URL 附件在此显式标记，展开区显示 fail-closed 原因
+        return "", bad, ({"remote_attachment": True} if remote else {}), remote
     results = await asyncio.gather(*[run_in_threadpool(inspect_inline_bytes, x) for x in blobs])
     parts = []
     unreadable = bad
+    file_findings = {}
     for i, r in enumerate(results):
         ct = (r.get("text") or "").strip()
         if ct:
             parts.append(f"[INLINE_MEDIA {i + 1}]\n{ct}\n[/INLINE_MEDIA]")
         if r.get("unreadable"):
             unreadable = True
-    return ("\n".join(parts), unreadable)
+        ff = dict(r.get("findings") or {})
+        # 表名/表头随预检结果入审计（展开区文件段显示，多 blob 时 _merge_file_findings 去重合并）
+        for k in ("sheet_names", "headers"):
+            if r.get(k):
+                ff[k] = list(r[k])
+        if ff:
+            file_findings = _merge_file_findings(file_findings, ff)
+    if remote:
+        file_findings = {**file_findings, "remote_attachment": True}
+    return ("\n".join(parts), unreadable, file_findings, remote)
+
+
+def _merge_file_findings(a: dict, b: dict) -> dict:
+    """合并多个内联 blob 的 file findings 进一个摘要 dict。
+
+    镜像 /v1/files/check 单文件的 findings 形态，供审计展开区 (FindingsDetail)
+    以「文件预检结果」呈现。列表型(key) 合并去重；数值累加；布尔 OR；字串取首。
+    """
+    out = dict(a)
+    for k, v in b.items():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            cur = out.get(k)
+            base = list(cur) if isinstance(cur, list) else []
+            for item in v:
+                if item not in base:
+                    base.append(item)
+            out[k] = base
+        elif isinstance(v, bool):
+            out[k] = bool(out.get(k)) or v
+        elif isinstance(v, (int, float)):
+            ov = out.get(k)
+            out[k] = (ov if isinstance(ov, (int, float)) and not isinstance(ov, bool) else 0) + v
+        elif isinstance(v, str):
+            if not out.get(k):
+                out[k] = v
+        else:
+            out[k] = v
+    return out
+
+
+# 审计 file_findings 里单个列表值的封顶项数（千表/万列工作簿的 sheet_names/headers
+# 会撑大 Redis 审计 JSON；截断后补「…共N项」标记，展开区看到的总数不丢）。
+_FILE_FINDINGS_LIST_CAP = 100
+
+
+def _note_file_findings(file_findings: dict) -> None:
+    """把内联附件预检 findings 暂存进请求上下文，log_entry 落审计 file_findings 独立键。
+
+    与文本 findings（_CURRENT_FINDINGS）彻底分开：FindingsDetail 双段同显
+    （L1 命中构成 + 文件预检结果），PII 命中不再挤掉文件视图
+    （2026-10-29 前的「无命中才写」变通因此作废）。
+    """
+    if not file_findings:
+        return
+    capped = {}
+    for k, v in file_findings.items():
+        if isinstance(v, list) and len(v) > _FILE_FINDINGS_LIST_CAP:
+            v = v[:_FILE_FINDINGS_LIST_CAP] + [f"…共{len(v)}项"]
+        capped[k] = v
+    _CURRENT_FILE_FINDINGS.set(capped)
 
 
 def wl_l2_sample() -> float:
@@ -1482,6 +1583,8 @@ def _review_file_ctx(file_ctx: Optional[dict]) -> dict:
     for _k in ("headers", "sheet_names"):
         if file_ctx.get(_k):
             base[_k] = list(file_ctx[_k])
+    if isinstance(file_ctx.get("text"), str) and file_ctx["text"].strip():
+        base["text"] = file_ctx["text"][:60000]
     return base
 
 def _all_local_alias(model: str) -> bool:
@@ -1927,6 +2030,10 @@ def _note_risk(tf):
             _CURRENT_PII_SUMMARY.set(_pii_audit_summary(tf))
         except Exception:
             pass
+        # 命中构成同点暂存（浅拷贝：_review_text 稍后会往原 dict 挂 l2 键）；
+        # 无命中的零分行不落，省每行 ~200B 空 JSON。
+        if tf and (tf.get("risk_score") or tf.get("keyword_hits") or tf.get("findings")):
+            _CURRENT_FINDINGS.set(dict(tf))
     except (TypeError, ValueError):
         pass
 
@@ -2060,6 +2167,14 @@ def log_entry(entry: dict, *, count: bool = True):
         _rs = _CURRENT_RISK.get()
         if _rs is not None:
             entry["risk_score"] = _rs
+    if entry.get("findings") is None:
+        _ff = _CURRENT_FINDINGS.get()
+        if _ff is not None:
+            entry["findings"] = _ff
+    if entry.get("file_findings") is None:
+        _fff = _CURRENT_FILE_FINDINGS.get()
+        if _fff:
+            entry["file_findings"] = _fff
     if entry.get("pii_summary") is None:
         try:
             _ps = _CURRENT_PII_SUMMARY.get()
@@ -2374,7 +2489,8 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
         req = await run_in_threadpool(ChatReq.model_validate, payload)
     except ValidationError as e:
         raise HTTPException(422, detail=e.errors()[:10])
-    session_id = extract_session_id(request.headers)
+    # workbuddy 约 6 成会话不发 X-Session-ID：回落首条消息指纹（见 _chat_session_id）
+    session_id = extract_session_id(request.headers) or _chat_session_id(req.messages)
     _bundle = _extract_chat_bundle(req.messages)
     text = _bundle["text"]
     # F3: tools 定义（description/parameters）并入审查文本——曾是密文免审通道
@@ -2382,13 +2498,21 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
     if _tt:
         text = text + "\n" + _tt
     audit_preview = _bundle["audit_preview"]
-    inline_text, inline_bad = await _inline_media_scan("chat", req.messages)
+    inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("chat", req.messages)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("chat", req.messages, text)
+    _media_extra = {}
+    if inline_bad:
+        _media_extra["ocr_empty_and_image"] = True
+    if inline_remote:
+        _media_extra["remote_attachment"] = True
     decision, text_findings, l2_result = await _review_text(
-        text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-        l2_chunks=l2_blocks, model=str(req.model or ""))
+        text, request, _media_extra or None,
+        l2_chunks=l2_blocks, file_ctx={"text": inline_text} if inline_text else None,
+        model=str(req.model or ""), session_hint=session_id)
+    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
+    _note_file_findings(inline_findings)
 
 
     # block -> 默认自动降级到本地模型（routing.on_block=reject 时才 403）
@@ -2736,13 +2860,21 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
     body = await _json_body(request)
     text = anthropic_text(body)
     audit_preview = _audit_preview_anthropic(body, text)
-    inline_text, inline_bad = await _inline_media_scan("anthropic", body)
+    inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("anthropic", body)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("anthropic", body, text)
+    _media_extra = {}
+    if inline_bad:
+        _media_extra["ocr_empty_and_image"] = True
+    if inline_remote:
+        _media_extra["remote_attachment"] = True
     decision, text_findings, l2_result = await _review_text(
-        text, request, {"ocr_empty_and_image": True} if inline_bad else None,
-        l2_chunks=l2_blocks, model=str((body or {}).get("model") or ""))
+        text, request, _media_extra or None,
+        l2_chunks=l2_blocks, file_ctx={"text": inline_text} if inline_text else None,
+        model=str((body or {}).get("model") or ""))
+    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
+    _note_file_findings(inline_findings)
 
 
     decision, downgraded = _block_to_fallback(decision)
@@ -2949,15 +3081,24 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     session_id = extract_session_id(request.headers) or _codex_session_id(body)
     text = responses_text(body)
     audit_preview = _audit_preview_responses(body, text)
-    inline_text, inline_bad = await _inline_media_scan("responses", body)
+    inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("responses", body)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("responses", body, text)
     file_ctx = extract_responses_filectx(body, text)
+    if inline_text:
+        file_ctx["text"] = inline_text
+    _media_extra = {}
+    if inline_bad:
+        _media_extra["ocr_empty_and_image"] = True
+    if inline_remote:
+        _media_extra["remote_attachment"] = True
     decision, text_findings, l2_result = await _review_text(
-        text, request, {"ocr_empty_and_image": True} if inline_bad else None,
+        text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""),
         session_hint=session_id)
+    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
+    _note_file_findings(inline_findings)
 
 
     decision, downgraded = _block_to_fallback(decision)
@@ -3593,7 +3734,7 @@ def _audit_row_match_q(e, ql) -> bool:
         if _is_local == q_route:
             return True
     for k in ("text_preview", "filename", "requested_model", "model", "provider",
-              "rule", "client_ip", "type", "token_masked", "key_name"):
+              "rule", "client_ip", "type", "token_masked", "key_name", "session_id"):
         v = e.get(k)
         if v and ql in str(v).lower():
             return True

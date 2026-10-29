@@ -18,6 +18,10 @@ const normL2 = (l2) => {
 const L2Detail = ({ rec }) => {
   const l2 = normL2(rec.l2);
   if (!l2) return <Text type="secondary">无 L2 判定（L1 直判，未进语义审查）</Text>;
+  // 主影一致 = 正常态（无信息量，占可比行 80%+）：不展示主影判定结果。
+  // 不一致 / 无影子 / 影子失败 / 主判定降级仍展示——那才是需要看的。
+  // 口径与后端 _audit_shadow_agree 相同（degraded 主判的兜底 label 不可比）。
+  if (l2.label && l2.shadow_label && !l2.degraded && l2.label === l2.shadow_label) return null;
   const hasShadow = l2.shadow_label || l2.shadow_conf !== undefined || l2.shadow_degraded;
   return (
     /* 展开行是单 td 横跨整表且被 theme 强制居中：限宽 + 块居中，
@@ -27,25 +31,83 @@ const L2Detail = ({ rec }) => {
       <Space wrap>
         <Text strong>主判定：</Text>
         <Tag color={l2.label === 'CONFIDENTIAL' ? 'red' : 'green'}>{l2.label || '?'}</Tag>
-        <Text type="secondary">conf={l2.confidence ?? '?'}</Text>
+        <Text type="secondary">置信度：{l2.confidence ?? '?'}</Text>
         <Text type="secondary">{l2.reason || ''}</Text>
         {l2.latency_ms !== undefined && <Text type="secondary">{l2.latency_ms}ms</Text>}
         {l2.cached && <Tag>缓存</Tag>}
-        {l2.degraded && <Tag color="orange">降级:{l2.degraded_reason || ''}{(l2.degraded_scopes || []).length ? `（块: ${l2.degraded_scopes.join('、')}）` : ''}</Tag>}
+        {l2.degraded && <Tag color="orange">降级：{l2.degraded_reason || ''}{(l2.degraded_scopes || []).length ? `（块：${l2.degraded_scopes.join('、')}）` : ''}</Tag>}
       </Space>
       <Space wrap>
         <Text strong>影子(laya)：</Text>
         {!hasShadow && <Text type="secondary">无影子数据（影子未开 / backend=laya / 未进 L2）</Text>}
-        {l2.shadow_degraded && <Tag color="orange">影子失败:{String(l2.shadow_degraded).slice(0, 80)}</Tag>}
+        {l2.shadow_degraded && <Tag color="orange">影子失败：{String(l2.shadow_degraded).slice(0, 80)}</Tag>}
         {l2.shadow_label && (
           <>
             <Tag color={l2.shadow_label === 'CONFIDENTIAL' ? 'red' : 'green'}>{l2.shadow_label}</Tag>
-            <Text type="secondary">conf={l2.shadow_conf ?? '?'}</Text>
+            <Text type="secondary">置信度：{l2.shadow_conf ?? '?'}</Text>
             <Text type="secondary">{l2.shadow_reason || ''}</Text>
             {String(l2.label || '') !== String(l2.shadow_label || '') && <Tag color="purple">与主判定不一致</Tag>}
           </>
         )}
       </Space>
+    </Space>
+  );
+};
+
+// 命中构成：文本段=L1 风险分拆解 + 关键词命中 + 逐条 PII 命中（数据源=落库 findings JSON）；
+// 文件段=file_inspector 扁平标志/计数/sheet_names（数据源=落库 file_findings JSON）。
+// 2026-10-29 起两段同显：PII 命中不再挤掉文件视图。兼容老行——没有 file_findings
+// 键时，文件形态 findings（无 PII 命中的旧审计行）仍从 f 读。
+const FindingsDetail = ({ f, file }) => {
+  const fd = f || {};
+  const isText = fd.risk_score != null || Array.isArray(fd.keyword_hits) || Array.isArray(fd.findings);
+  const ff = (file && typeof file === 'object') ? file : (!isText ? fd : null);
+  const SKIP = new Set(['sample_preview', 'markdown_preview', 'chunks', 'tables', 'text']);
+  const pairs = ff ? Object.entries(ff).filter(([k, v]) => !SKIP.has(k) && (typeof v === 'boolean' || typeof v === 'number')) : [];
+  const lists = ff ? Object.entries(ff).filter(([k, v]) => !SKIP.has(k) && Array.isArray(v) && v.length > 0) : [];
+  const hasFile = pairs.length > 0 || lists.length > 0;
+  if (!isText && !hasFile) return null;
+  const hits = Array.isArray(fd.findings) ? fd.findings : [];
+  const encoded = new Set(fd.encoded_keyword_hits || []);
+  const byType = Object.entries(fd.by_type || {});
+  return (
+    <Space direction="vertical" size={2} style={{ fontSize: 'var(--gw-fs-12)' }}>
+      {isText && (<>
+        <Space wrap>
+          <Text strong>L1 风险分构成：</Text>
+          <Text>总分：{fd.risk_score ?? '—'}</Text>
+          <Text type="secondary">PII 加权：{fd.weighted_pii_score ?? 0}</Text>
+          <Text type="secondary">关键词：{fd.keyword_score ?? 0}</Text>
+          {byType.length > 0 && <Text type="secondary">类型：{byType.map(([k, v]) => `${k}×${v}`).join('、')}</Text>}
+        </Space>
+        {(fd.keyword_hits || []).length > 0 && (
+          <Space wrap size={4}>
+            <Text strong>关键词命中：</Text>
+            {fd.keyword_hits.map((k) => (
+              <Tag key={k} color={encoded.has(k) ? 'purple' : 'orange'}
+                title={encoded.has(k) ? '解码层命中（原文不可见，单独触发转内网）' : ''}>{k}{encoded.has(k) ? '（解码层）' : ''}</Tag>
+            ))}
+          </Space>
+        )}
+        {hits.length > 0 && (
+          <Space direction="vertical" size={2}>
+            <Text strong>逐条命中（{hits.length}）：</Text>
+            {hits.slice(0, 20).map((h, i) => (
+              <Text key={i} type="secondary">
+                {h.type}｜{h.value_preview || ''}｜位置 {h.start}-{h.end}｜权重 {h.weight}{h.via && h.via !== 'raw' ? `｜${h.via} 层` : ''}
+              </Text>
+            ))}
+            {hits.length > 20 && <Text type="secondary">…仅显示前 20 条（完整数据见 CSV 导出）</Text>}
+          </Space>
+        )}
+      </>)}
+      {hasFile && (<>
+        <Text strong>文件预检结果：</Text>
+        {pairs.length > 0 && <Text type="secondary">{pairs.map(([k, v]) => `${k}=${v}`).join('　')}</Text>}
+        {lists.map(([k, v]) => (
+          <Text key={k} type="secondary">{k}：{String(v).slice(0, 120)}{v.length > 5 ? ` …共 ${v.length} 项` : ''}</Text>
+        ))}
+      </>)}
     </Space>
   );
 };
@@ -127,6 +189,13 @@ export default function AuditPage() {
   }, [ruleNames]);
 
   const search = () => { writeUrl(f); setPageNo(1); load(1); };
+  // 会话追溯：同会话 ID 作为全文条件重查（q 匹配含 session_id；
+  // shortcut: 仅热窗行有 session_id，MySQL 行无此列，超出 5000 条热窗的老记录追不到）
+  const traceSession = (sid) => {
+    const next = { ...fRef.current, q: sid };
+    fRef.current = next; // load 读 fRef，同 tick 内必须手动同步（键入路径靠重渲染更新）
+    setF(next); writeUrl(next); setPageNo(1); load(1);
+  };
   const exportCsv = () => {
     const p = new URLSearchParams();
     Object.entries(f).forEach(([k, v]) => { if (v) p.set(k, v); });
@@ -136,12 +205,12 @@ export default function AuditPage() {
   const setFld = (k) => (e) => { const next = { ...f, [k]: e.target.value }; setF(next); writeUrl(next); };
 
   /* 列宽全 % + tableLayout=fixed：表跟随容器、列按比例分配，窄屏不再撑横向滚动。
-     用户query 给 25% 定比（原 auto 弹性列靠内容顶宽，fixed 下必须有显式宽度） */
+     用户query 给 34% 定比（原 auto 弹性列靠内容顶宽，fixed 下必须有显式宽度；
+     2026-10-29 删 Provider 列后 +9%——该列空值多、属单行排查信息，移入展开详情） */
   const cols = [
-    /* 时间/Provider 加 ellipsis 防溢出；cell-center 必需——theme.css 把 ellipsis 列强制
+    /* 时间加 ellipsis 防溢出；cell-center 必需——theme.css 把 ellipsis 列强制
        左对齐，align:center 会被压掉（同模型/动作列） */
     { title: '时间', dataIndex: 'time', width: '11%', align: 'center', ellipsis: true, className: 'cell-center' },
-    { title: 'Provider', dataIndex: 'provider', width: '9%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
     { title: '动作 / 规则', width: '12%', align: 'center', ellipsis: true, className: 'cell-center',
       render: (_, r) => {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
@@ -156,7 +225,7 @@ export default function AuditPage() {
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
     { title: <>{'客户端 IP'}<Tip term="client_ip" /></>, dataIndex: 'client_ip', width: '9%', align: 'center', render: (v) => v || '—' },
     { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
-    { title: <>{'用户query'}<Tip term="query" /></>, dataIndex: 'text_preview', width: '25%',
+    { title: <>{'用户query'}<Tip term="query" /></>, dataIndex: 'text_preview', width: '34%',
       render: (v) => (
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block', maxWidth: '100%' }}
           title={v}>{v || '—'}</span>
@@ -191,7 +260,7 @@ export default function AuditPage() {
               { value: '503', label: '503 不可用' },
             ]}
             onChange={(v) => { const next = { ...f, status: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/调用方/模型/L2/影子…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
+          <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/调用方/模型/provider/L2/影子…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
           <Button type="primary" icon={<SearchOutlined />} onClick={search}>查询</Button>
            <Button type="primary" icon={<DownloadOutlined />} onClick={exportCsv}>导出 CSV</Button>
         </Space>
@@ -213,10 +282,30 @@ export default function AuditPage() {
         sticky={wideSticky()}
         tableLayout="fixed"
         locale={{ emptyText: '当前筛选无审计记录：可扩大时间范围、清空筛选条件，或换关键词试试' }}
-        expandable={{ expandedRowRender: (rec) => <L2Detail rec={rec} />,
-          rowExpandable: (rec) => !!normL2(rec.l2),
-          /* 展开列原本是 48px 空白表头，装饰一个朝下箭头提示「这列能展开看 L2 详情」 */
-          columnTitle: <Tooltip title="展开查看该行的 L2 判定详情"><DownOutlined style={{ color: 'rgba(0,0,0,0.35)' }} /></Tooltip> }}
+        expandable={{ expandedRowRender: (rec) => (
+          /* 单行一站式详情：meta 排（状态码/风险分/层级/会话追溯）+ L1 命中构成 + L2 判定（复用 L2Detail）。
+             provider 不入展开区（2026-10-29 二轮）：模型名/请求模型已隐含落点，常规行显示即噪音；
+             异常落点（模型像内网、实际外发，如 10-21 事故行）用全文搜索 provider 名或 CSV 查。
+             输出格式标准：字段对一律「标签：值」（全角冒号；主标签 strong、补充项 secondary），
+             段标题一律 strong+全角冒号；原始数据行（逐条命中 ｜ 分列 / 文件预检 k=v）保持紧凑记录式 */
+          <Space className="audit-l2detail" direction="vertical" size={6} style={{ fontSize: 'var(--gw-fs-12)', maxWidth: 880, margin: '0 auto' }}>
+            <Space wrap size={12}>
+              <Text><Text strong>状态码：</Text>{rec.status_code || '—'}</Text>
+              {rec.risk_score != null && <Text><Text strong>风险分：</Text>{rec.risk_score}</Text>}
+              {rec.layer && <Text><Text strong>层级：</Text>{rec.layer}</Text>}
+              {rec.session_id
+                ? <a onClick={() => traceSession(rec.session_id)} title="查同会话 ID 的全部请求">会话：{rec.session_id.slice(0, 14)}… 追溯</a>
+                : <Text type="secondary">会话：—</Text>}
+              {rec.downgraded_from && <Text type="secondary">降级自：{rec.downgraded_from}</Text>}
+              {rec.requested_model && rec.requested_model !== rec.model && <Text type="secondary">请求模型：{rec.requested_model}</Text>}
+            </Space>
+            {(typeof rec.findings === 'object' && rec.findings !== null || rec.file_findings) &&
+              <FindingsDetail f={typeof rec.findings === 'object' ? rec.findings : undefined} file={rec.file_findings} />}
+            <L2Detail rec={rec} />
+          </Space>
+        ),
+          /* 展开列原本是 48px 空白表头，装饰一个朝下箭头提示「这列能展开看完整详情」 */
+          columnTitle: <Tooltip title="展开查看该行完整判定详情（L1 命中构成 / L2 判定）"><DownOutlined style={{ color: 'rgba(0,0,0,0.35)' }} /></Tooltip> }}
         pagination={{
           current: data?.page || 1, pageSize: data?.limit || 50, total: data?.total || 0,
           onChange: (pg) => setPageNo(pg), showSizeChanger: false,

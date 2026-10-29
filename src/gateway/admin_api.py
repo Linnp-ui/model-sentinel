@@ -401,7 +401,7 @@ def cleanup_logs_api(days: float = 90.0):
 
 @router.get("/suggestions")
 def suggestions_api(hours: float = 24.0):
-    """3.3 调节策略建议（规则引擎）。
+    """3.3 策略调节建议（规则引擎）。
 
     meta 供 UI 明示口径：触发指标 = 异常处置（拦截 ∪ 本地路由）；规则 0/5/6
     用 30 天独立窗口、规则 1/2/3/4/7 用 hours 窗口 —— 同一张卡片上并存两个窗口。
@@ -479,13 +479,36 @@ def suggestion_apply_api(req: SuggestionApplyReq):
             missing = [n for n in req.order if n and n not in cur]
             if missing:
                 raise HTTPException(404, f"规则不存在：{missing[0]}")
-            slots = sorted(cur[n]["priority"] for n in names)
+            # 按锁定规则分段：每段非锁定规则只在段内 permute，不跨锁定屏障
             done = {}
-            for n, p in zip(names, slots):
-                row = dict(cur[n])
-                row["priority"] = p
-                _pa.upsert_policy(row, original_name=n)
-                done[n] = p
+            locked_fields = ("priority_locked", "locked", "locked_priority", "pinned", "fixed_priority")
+            def _is_locked(p):
+                return any(p.get(k) for k in locked_fields)
+            # 当前策略按 priority 排序
+            ordered = sorted(cur.values(), key=lambda x: x.get("priority", 100))
+            # 切段
+            segments = []
+            run = []
+            for p in ordered:
+                if _is_locked(p):
+                    if run:
+                        segments.append(run)
+                        run = []
+                else:
+                    run.append(p)
+            if run:
+                segments.append(run)
+            for seg in segments:
+                seg_names_set = {p.get("name") for p in seg}
+                seg_selected = [n for n in names if n in seg_names_set]
+                if len(seg_selected) < 2:
+                    continue
+                slots = sorted(cur[n]["priority"] for n in seg_selected)
+                for n, sl in zip(seg_selected, slots):
+                    row = dict(cur[n])
+                    row["priority"] = sl
+                    _pa.upsert_policy(row, original_name=n)
+                    done[n] = sl
             return {"ok": True, "reordered": done, "skipped_locked": locked}
         if not req.rule_a or not req.rule_b or req.rule_a == req.rule_b:
             raise HTTPException(422, "需填 rule_a 和 rule_b（且不同）")
@@ -2426,7 +2449,7 @@ async def route_inspect_api(body: RouteInspectReq):
                                    "image_url": {"url": _du(f.filename or "upload", raw)}})
                 else:
                     extra_findings["ocr_empty_and_image"] = True  # 解码失败按不可读处理
-            inline_text, inline_bad = await _m._inline_media_scan("chat", [{"role": "user", "content": blocks}])
+            inline_text, inline_bad, _, _ = await _m._inline_media_scan("chat", [{"role": "user", "content": blocks}])
             merged = (text + "\n" + inline_text).strip() if (text.strip() or inline_text.strip()) else ""
             for f in files:
                 files_out.append({"filename": f.filename or "upload", "note": "image_url 内联（workbuddy 口径）"})
@@ -2447,7 +2470,7 @@ async def route_inspect_api(body: RouteInspectReq):
             rbody = {"input": [{"role": "user", "content": cblocks}]}
             from src.gateway.responses_filectx import extract_responses_filectx
             file_ctx = extract_responses_filectx(rbody, text)
-            inline_text, inline_bad = await _m._inline_media_scan("responses", rbody)
+            inline_text, inline_bad, _, _ = await _m._inline_media_scan("responses", rbody)
             merged = (text + "\n" + inline_text).strip() if (text.strip() or inline_text.strip()) else ""
         if inline_bad:
             extra_findings["ocr_empty_and_image"] = True

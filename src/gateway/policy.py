@@ -69,7 +69,7 @@ class Policy(_DictLike):
     description: str = ""
     when: Union[str, Dict[str, Any]] = "always"
     target: Optional[PolicyTarget] = None
-    # 优先级锁定：被锁定的规则不参与调节策略建议的「优先级重排」（规则 4），
+    # 优先级锁定：被锁定的规则不参与策略调节建议的「优先级重排」（规则 4），
     # 其 priority 不会被 suggestion/apply 覆盖。别名字段同步，任一为 true 即锁定。
     priority_locked: bool = False
     locked: bool = False

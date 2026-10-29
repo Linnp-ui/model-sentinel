@@ -3,7 +3,7 @@
 需求映射：
 - 3.1 模型调用量·时间周期-人员(IP)：stats_overview/stats_group/stats_daily
 - 3.2 拦截量统计：stats_group(dim='action') + blocked 维度
-- 3.3 调节策略建议：build_suggestions() 规则引擎，支持一键应用（加黑名单）
+- 3.3 策略调节建议：build_suggestions() 规则引擎，支持一键应用（加黑名单）
 - 明细落库不阻塞主链路：单线程 ThreadPoolExecutor fire-and-forget；
   store 故障静默吞掉（绝不影响 /v1/* 转发）。
 - 保留策略：默认 90 天（AI_GATEWAY_LOG_RETENTION_DAYS 可调），机会式清理
@@ -643,27 +643,41 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
             lbl = (g.get("label") or "")
             if lbl.startswith("l1:"):
                 hits[lbl[3:]] = g.get("calls", 0)
-        groups: dict = {}
         reorder_min = _scaled(th["reorder_min_hits_base"], _rule_window_hours(th))
-        for p in load_policy():
-            if p.name == "默认放行":
-                continue
-            # 优先级被锁定的规则不参与自动重排建议（其 priority 保持原值）
-            if getattr(p, "priority_locked", False) or getattr(p, "locked", False) \
-               or getattr(p, "locked_priority", False) or getattr(p, "pinned", False) \
-               or getattr(p, "fixed_priority", False):
-                continue
-            c = hits.get(p.name, 0)
-            if c >= reorder_min:
-                groups.setdefault(p.action, []).append((p.name, c, p.priority))
-        for action, cands in groups.items():
-            if len(cands) < 2:
-                continue
-            prio = {n: p for n, _, p in cands}
-            slots = sorted(prio.values())
-            want = [n for n, _, _ in sorted(cands, key=lambda t: (-t[1], t[2]))]
-            cur = [n for n, _, _ in sorted(cands, key=lambda t: (t[2], -t[1]))]
-            if want != cur:
+        all_rules = [p for p in load_policy() if p.name != "默认放行"]
+        # 按 action 分组，组内按 priority 排序；锁定规则作为屏障，非锁定规则只在
+        # 连续段内 permute，避免跨过锁定规则（或未触发规则）改变相对顺序。
+        by_action: dict = {}
+        for p in all_rules:
+            by_action.setdefault(p.action, []).append(p)
+        for action, rules in by_action.items():
+            rules = sorted(rules, key=lambda p: p.priority)
+            # 切出连续的非锁定段
+            segments = []
+            cur_seg = []
+            for p in rules:
+                locked = (getattr(p, "priority_locked", False) or getattr(p, "locked", False)
+                          or getattr(p, "locked_priority", False) or getattr(p, "pinned", False)
+                          or getattr(p, "fixed_priority", False))
+                if locked:
+                    if cur_seg:
+                        segments.append(cur_seg)
+                        cur_seg = []
+                else:
+                    cur_seg.append(p)
+            if cur_seg:
+                segments.append(cur_seg)
+            for seg in segments:
+                cands = [(p.name, hits.get(p.name, 0), p.priority) for p in seg
+                         if hits.get(p.name, 0) >= reorder_min]
+                if len(cands) < 2:
+                    continue
+                prio = {n: pr for n, _, pr in cands}
+                slots = sorted(pr for _, _, pr in cands)
+                want = [n for n, _, _ in sorted(cands, key=lambda t: (-t[1], t[2]))]
+                cur = [n for n, _, _ in sorted(cands, key=lambda t: (t[2], -t[1]))]
+                if want == cur:
+                    continue
                 new_p = {n: slots[i] for i, n in enumerate(want)}
                 moved = [n for n in want if new_p[n] != prio[n]]
                 moves = "; ".join(f"{n} {hits[n]}次 {prio[n]}→{new_p[n]}"
@@ -675,7 +689,7 @@ def build_suggestions(store, window_hours: float = 24.0) -> list:
                     "severity": "info",
                     "metric": f"{len(moved)} 条规则错位 / 近 {win_d} 天（{action} 组内）",
                     "message": (f"按近 {win_d} 天触发次数，{action} 组内高频规则应排前面：{moves}。"
-                                f"各组在自己槽位内重排、不跨组（block 与 route_local 互不干涉）"),
+                                f"各组在自己槽位内重排、不跨锁定/未触发规则"),
                     "apply": {"kind": "reorder", "order": want},
                 })
     except Exception:

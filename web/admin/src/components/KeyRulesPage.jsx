@@ -6,7 +6,7 @@ import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
-// ---------------- 调节策略建议（总览 + KEY 黑白名单页共用；onApplied 供宿主刷新自己的表格） ----------------
+// ---------------- 策略调节建议（总览 + KEY 黑白名单页共用；onApplied 供宿主刷新自己的表格） ----------------
 const sevColor = { high: 'red', warn: 'orange', info: 'blue' };
 // 一键应用的按钮文案/确认提示/颜色按 kind 走（后端 6 种：black/white/unwhite/reorder/remove_rule/add_limit）。
 // 旧三元式只认 white/unwhite，reorder/remove_rule/add_limit 全部误标「一键拉黑」且确认框拼出空名。
@@ -262,7 +262,7 @@ export function SuggestionCard({ onApplied }) {
   };
   return (
     <>
-    <Card title={<>调节策略建议<Tip term="suggest" /></>}
+    <Card title={<>策略调节建议<Tip term="suggest" /></>}
       extra={<Space>
         <Select value={hours} onChange={setHours} style={{ width: 130 }}
           options={RANGES.map((r) => ({ value: r.hours, label: r.label }))} />

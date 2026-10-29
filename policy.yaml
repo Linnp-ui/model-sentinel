@@ -22,6 +22,23 @@ policies:
       - sk-ant-
       - ghp_
       - aws_secret
+  target: null
+  priority_locked: true
+  match:
+    combiner: any
+    rows:
+    - content_type: prompt
+      match_type: regex
+      match_value: AKIA[0-9A-Z]{16}
+    - content_type: prompt
+      match_type: regex
+      match_value: '-----BEGIN (RSA )?PRIVATE KEY-----'
+    - content_type: prompt
+      match_type: regex
+      match_value: sk-[0-9a-fA-F]{32}
+    - content_type: prompt
+      match_type: contains
+      match_value: sk-ant-, ghp_, aws_secret
 - name: tainted_file_ref
   priority: 5
   action: route_local
@@ -32,6 +49,11 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
+  priority_locked: true
+  match:
+    content_type: tainted_file
+    match_type: bool
+    match_value: 'true'
 - name: financial_local_only
   priority: 10
   action: route_local
@@ -97,6 +119,17 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
+- name: remote_attachment_route_local
+  priority: 14
+  description: 远端 URL 附件（image_url / file.url / document source.type=url，字节不过网关）⇒ 内容不可检 ⇒
+    fail-closed 转内网，不 fail-open 放行（与未解析二进制同口径：看不见的内容不出境）
+  when:
+    any:
+    - findings.remote_attachment == true: true
+  action: route_local
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
 - name: pii_weighted_route_local
   priority: 20
   action: route_local
@@ -110,8 +143,8 @@ policies:
 - name: ocr_empty_image_route_local
   priority: 30
   action: route_local
-  description: 图片走了 OCR 但没识别出任何文字（OCR 引擎缺失 / 文件损坏 / 不支持的格式）
-    ⇒ fail-closed 转内网，不 fail-open 放行（P0-3）
+  description: 图片走了 OCR 但没识别出任何文字（OCR 引擎缺失 / 文件损坏 / 不支持的格式） ⇒ fail-closed 转内网，不 fail-open
+    放行（P0-3）
   when:
     any:
     - findings.ocr_empty_and_image == true: true

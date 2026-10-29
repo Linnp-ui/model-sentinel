@@ -40,6 +40,7 @@ CONTENT_TYPE_FIELD = {
     "unparsed_binary": "findings.unparsed_binary",
     "parse_failed": "findings.parse_failed",
     "ocr_empty": "findings.ocr_empty_and_image",
+    "remote_attachment": "findings.remote_attachment",
 }
 MATCH_TYPE_OP = {
     "regex": "matches_regex",   # 正则
@@ -79,6 +80,7 @@ MATCH_CHOICES: List[Tuple[str, str, str, str]] = [
     ("unparsed_binary", "bool", "开关 · 二进制未解析 = 是", "匹配项=是/否：文件是二进制但没解析出任何文字（扩展名伪装、未知格式、文件损坏）时，填「是」命中。fail-closed 兜底：认不出的文件宁可转本地，不直接放行出境"),
     ("parse_failed", "bool", "开关 · 解析失败 = 是", "匹配项=是/否：文件解析过程失败（格式损坏/内容异常）时，填「是」命中。fail-closed 兜底，同上"),
     ("ocr_empty", "bool", "开关 · OCR 空 = 是", "匹配项=是/否：图片走了 OCR 但没识别出任何文字（纯扫描件、图里无字、OCR 引擎缺失）时，填「是」命中。fail-closed 兜底，同上"),
+    ("remote_attachment", "bool", "开关 · 远端附件 = 是", "匹配项=是/否：请求带了远端 URL 附件（http(s) 的 image_url / document source.url 等）时，填「是」命中。这类附件的字节不过网关、无法预检，fail-closed 兜底：看不见的内容转本地，不直接放行出境"),
 ]
 MATCH_PAIRS = {(ct, mt) for ct, mt, *_ in MATCH_CHOICES}
 # 自带字段的匹配类型：内容类型对它们无意义（build_when 直接忽略该参数）

@@ -127,6 +127,41 @@ def test_rule_priority_suggestion_and_reorder(tmp_path, monkeypatch):
     finally:
         _pol.invalidate_policy_cache()
 
+def test_rule_priority_reorder_respects_locked(tmp_path, monkeypatch):
+    # 优先级锁定：被锁定的规则不参与重排建议，其 priority 不被覆盖
+    import yaml
+    from src.gateway import policy as _pol
+    from src.gateway.admin_store import get_admin_store
+    p = tmp_path / "policy.yaml"
+    p.write_text(yaml.safe_dump({"policies": [
+        {"name": "rl_slow", "priority": 10, "action": "route_local", "priority_locked": True,
+         "when": {"any": [{"text contains_any": ["rs"]}]},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+        {"name": "rl_fast", "priority": 20, "action": "route_local",
+         "when": {"any": [{"text contains_any": ["rf"]}]},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+    ]}, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(p))
+    monkeypatch.setenv("AI_GATEWAY_SUGGEST_RULE_WINDOW_HOURS", "24")
+    _pol.invalidate_policy_cache()
+    store = get_admin_store()
+    try:
+        for _ in range(50):
+            store.insert_request_log({"key_name": "pytest-locked", "action": "block", "model": "m",
+                                      "provider": "p", "client_ip": "9.9.9.9",
+                                      "blocked_reason": "l1:rl_fast"})
+        for _ in range(15):
+            store.insert_request_log({"key_name": "pytest-locked", "action": "block", "model": "m",
+                                      "provider": "p", "client_ip": "9.9.9.9",
+                                      "blocked_reason": "l1:rl_slow"})
+        items = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
+        ro = [s for s in items if (s.get("apply") or {}).get("kind") == "reorder"]
+        assert ro == [], items
+        prio = {x.name: x.priority for x in _pol.load_policy()}
+        assert prio == {"rl_slow": 10, "rl_fast": 20}, prio
+    finally:
+        _pol.invalidate_policy_cache()
+
 def test_silent_rule_suggests_removal(tmp_path, monkeypatch):
     # 规则5：长窗口零触发的规则建议删除；一键删除后建议消失
     import yaml
@@ -2697,7 +2732,8 @@ def test_parse_when_roundtrip_and_switch_rules():
     # build_when -> parse_when 往返
     for args in [("filename", "contains", "a, b"), ("prompt", "regex", "AKIA"),
                  ("prompt", "contains", "x,y"), ("watermark", "contains", "a,b"),
-                 ("session_confidential", "bool", "是"), ("parse_failed", "bool", "false")]:
+                 ("session_confidential", "bool", "是"), ("parse_failed", "bool", "false"),
+                 ("remote_attachment", "bool", "是")]:
         w = policy_admin.build_when(*args)
         p = policy_admin.parse_when(w)
         assert p, f"build_when 产物无法逆解析: {w}"
@@ -2734,6 +2770,43 @@ def test_parse_when_roundtrip_and_switch_rules():
                     json={"when": {"any": [{"tainted_file.hit == true": True}]}})
     assert r.status_code == 200 and r.json()["parsed"]["content_type"] == "tainted_file"
     assert client.post("/admin/api/policies/parse-when", json={"when": "always"}).json()["parsed"] is None
+
+
+def test_policy_yaml_rules_builder_expressible():
+    """policy.yaml 每条规则都必须构造器可表达（2026-10-29「remote_attachment_route_local」教训）。
+
+    手写 when 构造器认不出 ⇒ 编辑弹窗构造器空白+「解析不出」，用户看不见也改不了
+    匹配条件。护栏：每条规则的 when 须满足其一——
+    (1) parse_when 能逆解析；(2) 规则带 match 字段（构造器状态已落库）；
+    (3) when == "always"（无条件，平凡情形）。
+    要新增 findings 开关/手写条件，先扩 CONTENT_TYPE_FIELD / MATCH_CHOICES 再写规则。
+    """
+    import yaml
+    from src.gateway import policy_admin
+    from src.gateway.policy import DEFAULT_POLICY
+    doc = yaml.safe_load(DEFAULT_POLICY.read_text(encoding="utf-8")) or {}
+    assert doc.get("policies"), "policy.yaml 空"
+    for p in doc["policies"]:
+        when = p.get("when")
+        ok = (policy_admin.parse_when(when) is not None
+              or bool(p.get("match")) or when == "always")
+        assert ok, f"规则「{p.get('name')}」when 构造器无法表达（编辑弹窗将空白）：{when}"
+
+
+def test_file_findings_list_capped_for_audit():
+    """审计 file_findings 列表值封顶：千表/万列工作簿的 sheet_names/headers
+    不许撑大 Redis 审计 JSON；截断补「…共N项」标记，展开区总数不丢。"""
+    from src.gateway import main as m
+    ff = {"sheet_names": [f"s{i}" for i in range(255)], "headers": ["a", "b"], "char_count": 10}
+    m._note_file_findings(ff)
+    got = m._CURRENT_FILE_FINDINGS.get()
+    assert len(got["sheet_names"]) == m._FILE_FINDINGS_LIST_CAP + 1, got
+    assert got["sheet_names"][-1] == "…共255项", got
+    assert got["headers"] == ["a", "b"]  # 未超 cap 原样
+    assert got["char_count"] == 10
+    m._CURRENT_FILE_FINDINGS.set(None)  # 清场，避免串到同上下文后续用例
+    m._note_file_findings({})
+    assert m._CURRENT_FILE_FINDINGS.get() is None  # 空 dict 不落（保持 None 语义）
 
 
 def test_when_nested_any_all_rejected():

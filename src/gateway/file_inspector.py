@@ -755,14 +755,22 @@ def inspect_inline_bytes(data: bytes) -> Dict[str, Any]:
             r = inspect_file(data, 'inline.xlsx')
         elif magic == 'docx':
             r = inspect_file(data, 'inline.docx')
+        elif magic is None and _looks_textual(data[:50000]):
+            # codex input_file 的 csv/txt/tsv：按文本解析，不再一律 fail-closed
+            r = inspect_file(data, 'inline.txt')
         else:
             return {'text': '', 'unreadable': True}
         text = r.get('text') or ''
-        if text.strip() == '' or r.get('findings', {}).get('ocr_empty_and_image'):
-            return {'text': text, 'unreadable': True}
-        return {'text': text, 'unreadable': False}
+        f = r.get('findings') or {}
+        # findings 随结果一起返回：失败路径也带 unparsed_binary/parse_failed/ocr_empty_and_image，
+        # 这些本身就是 fail-closed 的预检结论，供审计展开区在非 /v1/files/check 场景下显示。
+        # sheet_names/headers 同返：审计 file_findings 的文件段要显示表名/表头（多 blob 由调用方去重合并）。
+        extra = {'sheet_names': r.get('sheet_names') or [], 'headers': r.get('headers') or []}
+        if text.strip() == '' or f.get('ocr_empty_and_image') or f.get('parse_failed'):
+            return {'text': text, 'unreadable': True, 'findings': f, **extra}
+        return {'text': text, 'unreadable': False, 'findings': f, **extra}
     except Exception:
-        return {'text': '', 'unreadable': True}
+        return {'text': '', 'unreadable': True, 'findings': {'unparsed_binary': True, 'text_preview': '', 'char_count': 0}}
 
 
 def _content_parts(content: Any) -> list:
@@ -773,15 +781,22 @@ def _content_parts(content: Any) -> list:
     return []
 
 
-def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool, bool]:
-    """chat messages (pydantic 或 dict) → ([bytes], overflow_or_bad, has_image)。
+def _is_http_url(u: Any) -> bool:
+    """附件引用是否为远端 http(s) URL（字节不过网关，需 fail-closed）。"""
+    return isinstance(u, str) and u.strip().lower().startswith(('http://', 'https://'))
+
+
+def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool, bool, bool]:
+    """chat messages (pydantic 或 dict) → ([bytes], overflow_or_bad, has_image, remote)。
 
     has_image = 存在内联图片块（含解码失败的）：供路由层模态过滤
     （带图请求不选纯文本候选，见 alias_router.alias_candidates）。
+    remote = 存在远端 http(s) URL 附件（字节不过网关，不可检）⇒ 调用方 fail-closed。
     """
     blobs: list = []
     bad = False
     total = 0
+    remote = False
     items = messages if isinstance(messages, list) else []
     for m in items:
         c = getattr(m, 'content', None) if not isinstance(m, dict) else m.get('content')
@@ -800,6 +815,8 @@ def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool, bool]:
                     bad = True
                 elif len(blobs) < _INLINE_MEDIA_MAX_ITEMS:
                     blobs.append(raw)
+            elif isinstance(url, str) and url.strip() and not url.startswith('data:'):
+                remote = True  # 远端 URL 附件（http/file/…非 data:）：内容不过网关 ⇒ fail-closed
             if t in ('input_audio', 'audio'):
                 au = p.get('input_audio')
                 adata = (au.get('data') if isinstance(au, dict) else None) or p.get('data')
@@ -807,19 +824,21 @@ def collect_inline_blobs_chat(messages: Any) -> Tuple[list, bool, bool]:
                     bad = True  # 音频不转写：有数据即 fail-closed
     if total > _INLINE_MEDIA_MAX_ITEMS:
         bad = True  # 超 cap 的部分没检查 → fail-closed
-    return blobs, bad, total > 0  # chat 只收图片块：total 即图片数
+    return blobs, bad, total > 0, remote  # chat 只收图片块：total 即图片数
 
 
-def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool, bool]:
-    """Anthropic messages body → ([bytes], overflow_or_bad, has_image)。
+def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool, bool, bool]:
+    """Anthropic messages body → ([bytes], overflow_or_bad, has_image, remote)。
 
     has_image 只数 image/input_image 块；document（PDF）暂不计入模态
     （模型对文件块的支持未实测，不声明不硬滤）。
+    remote = 存在 source.type=url/file 的远端引用（字节不过网关，不可检）⇒ fail-closed。
     """
     blobs: list = []
     bad = False
     total = 0
     n_img = 0
+    remote = False
     msgs = (body.get('messages', []) or []) if isinstance(body, dict) else []
     for m in msgs:
         c = m.get('content') if isinstance(m, dict) else None
@@ -838,26 +857,32 @@ def collect_inline_blobs_anthropic(body: Any) -> Tuple[list, bool, bool]:
                     bad = True
                 elif len(blobs) < _INLINE_MEDIA_MAX_ITEMS:
                     blobs.append(raw)
-            elif src.get('type') not in ('url', 'file', 'text'):
+            elif src.get('type') in ('url', 'file'):
+                remote = True  # 远端 URL / 文件引用：内容不过网关不可检 ⇒ fail-closed
+            elif src.get('type') == 'text':
+                pass  # 内联文本 source：内容本就在块里，交给文本审查
+            else:
                 bad = True  # 未知 source 类型 → fail-closed
     if total > _INLINE_MEDIA_MAX_ITEMS:
         bad = True
-    return blobs, bad, n_img > 0
+    return blobs, bad, n_img > 0, remote
 
 
-def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool, bool]:
-    """OpenAI Responses body → ([bytes], overflow_or_bad, has_image)。
+def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool, bool, bool]:
+    """OpenAI Responses body → ([bytes], overflow_or_bad, has_image, remote)。
 
     has_image 只数 input_image/image/image_url 块；input_file（codex 附件）
     不计入模态（文件块支持未实测，不声明不硬滤）。
+    remote = 存在远端 http(s) URL 附件（字节不过网关，不可检）⇒ 调用方 fail-closed。
     """
     blobs: list = []
     bad = False
     total = 0
     n_img = 0
+    remote = False
 
     def _block(b: Any) -> None:
-        nonlocal total, bad, n_img
+        nonlocal total, bad, n_img, remote
         if not isinstance(b, dict):
             return
         t = b.get('type', '')
@@ -871,15 +896,24 @@ def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool, bool]:
                     bad = True
                 elif len(blobs) < _INLINE_MEDIA_MAX_ITEMS:
                     blobs.append(raw)
+            elif isinstance(v, str) and v.strip() and not v.startswith('data:'):
+                remote = True  # 远端 URL 图（http/file/…非 data:）：内容不过网关 ⇒ fail-closed
         elif t in ('input_file', 'file'):
             fd = b.get('file_data')
-            if isinstance(fd, str) and fd.startswith('data:'):
-                total += 1
-                raw = decode_inline_data_url(fd)
-                if raw is None:
+            if isinstance(fd, str) and fd:
+                if fd.startswith('data:'):
+                    total += 1
+                    raw = decode_inline_data_url(fd)
+                    if raw is None:
+                        bad = True
+                    elif len(blobs) < _INLINE_MEDIA_MAX_ITEMS:
+                        blobs.append(raw)
+                elif _is_http_url(fd):
+                    remote = True  # 远端 URL 文件 ⇒ 远端附件转内网
+                else:
+                    # 裸 base64（无 data: 前缀，非 URL）：内容不可检 ⇒ fail-closed。
+                    # 对齐 anthropic「未知 source 类型 → bad」口径（原静默跳过 = 口径不一致）。
                     bad = True
-                elif len(blobs) < _INLINE_MEDIA_MAX_ITEMS:
-                    blobs.append(raw)
         elif t == 'input_audio':
             au = b.get('input_audio')
             adata = (au.get('data') if isinstance(au, dict) else None) or b.get('data')
@@ -899,4 +933,4 @@ def collect_inline_blobs_responses(body: Any) -> Tuple[list, bool, bool]:
                 _block(item)
     if total > _INLINE_MEDIA_MAX_ITEMS:
         bad = True
-    return blobs, bad, n_img > 0
+    return blobs, bad, n_img > 0, remote

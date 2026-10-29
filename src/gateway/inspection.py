@@ -290,19 +290,28 @@ def inspect_text(text: str) -> Dict:
 
     def _scan_layer(layer_text, via):
         layer_digits = _strip_pii_separators(layer_text)
+        seen = set()
         for name, pat in PATTERNS.items():
-            match_text = layer_digits if name in ("idcard", "bankcard", "phone") else layer_text
+            # 去分隔符副本抓「空格/横线拆开」的号码；原文副本抓「与相邻数字列粘连」的号码
+            # （旧实现只扫去分隔符副本：表格里行号+身份证会并成 19 位串，校验位失败漏报）
+            texts = ((layer_text, layer_digits) if name in ("idcard", "bankcard", "phone")
+                     else (layer_text,))
             n = 0
-            for m in pat.finditer(match_text):
-                if n >= _PATTERN_MATCH_CAP:
-                    break
-                n += 1
-                val = m.group(0)
-                if name == "bankcard" and not luhn_valid(val):
-                    continue
-                if name == "idcard" and not idcard_valid(val):
-                    continue
-                _emit(name, val, m.start(), via)
+            for match_text in texts:
+                for m in pat.finditer(match_text):
+                    if n >= _PATTERN_MATCH_CAP:
+                        break
+                    val = m.group(0)
+                    key = (name, val)
+                    if key in seen:
+                        continue
+                    if name == "bankcard" and not luhn_valid(val):
+                        continue
+                    if name == "idcard" and not idcard_valid(val):
+                        continue
+                    n += 1
+                    seen.add(key)
+                    _emit(name, val, m.start(), via)
 
     _scan_layer(pii_text, "raw")
     decoded = _decode_layers(pii_text)

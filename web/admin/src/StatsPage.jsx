@@ -13,14 +13,15 @@ const DONUT_COLORS = ['#1677ff', '#52c41a', '#faad14', '#ff4d4f', '#722ed1',
 
 // 横向条形列表：低基数排名（2~10 类）。环图"一大扇区+一条缝"不可读（实测 2 provider
 // 97.7%/2.3%、3 KEY 99.4%/0.4%/0.2%），条形长度+数值标签可直接比较
-function HBarList({ items, testid, renderVal = (x) => String(x.count), total: totalProp }) {
+function HBarList({ items, testid, renderVal = (x) => String(x.count), total: totalProp, onSelect }) {
   if (!items || !items.length) return null;
   const total = totalProp || items.reduce((s, x) => s + (x.count || 0), 0) || 1;
   const maxV = Math.max(...items.map((x) => x.count || 0), 1);
   return (
     <div data-testid={testid}>
       {items.map((x, i) => (
-        <div key={x.labelTitle || x.label || i} style={{ display: 'flex', alignItems: 'center', gap: 'var(--gw-sp-8)', marginBottom: 'var(--gw-sp-6)', fontSize: 'var(--gw-fs-14)' }}>
+        <div key={x.labelTitle || x.label || i} style={{ display: 'flex', alignItems: 'center', gap: 'var(--gw-sp-8)', marginBottom: 'var(--gw-sp-6)', fontSize: 'var(--gw-fs-14)',
+          cursor: onSelect ? 'pointer' : undefined }} onClick={onSelect ? () => onSelect(x) : undefined}>
           <span style={{ width: 180, flex: '0 0 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
             title={x.labelTitle || (typeof x.label === 'string' ? x.label : '')}>{x.label}</span>
           <div style={{ flex: 1, background: 'transparent', borderRadius: 3, height: 14 }}>
@@ -267,8 +268,14 @@ export default function StatsPage() {
                   ? <HBarList testid="stats-rule-bars" total={ruleHits.total}
                       items={(ruleHits.items).slice(0, 10).map((it) => ({
                         label: <RuleZh name={it.rule} />, labelTitle: ruleZh(it.rule), count: it.count,
-                        title: `最后命中 ${String(it.last_seen || '').slice(5, 16)}`,
+                        rule: it.rule,
+                        title: `最后命中 ${String(it.last_seen || '').slice(5, 16)}｜点击查看审计明细`,
                       }))}
+                      /* 死胡同修复：点规则条 → 审计页带规则+同窗口筛选 */
+                      onSelect={(x) => {
+                        const since = (RANGES.find((r) => r.hours === hours) || {}).since || '';
+                        window.location.hash = `/audit?rule=${encodeURIComponent(x.rule)}&since=${encodeURIComponent(since)}`;
+                      }}
                       renderVal={(x) => `${x.count} 次`} />
                   : <Alert type="info" showIcon message="窗口内无规则命中（全部放行且无规则触发）" />}
             </Card>

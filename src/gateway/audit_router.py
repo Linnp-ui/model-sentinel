@@ -96,7 +96,21 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
         return str(v)
 
     _keys = ("time", "type", "rule", "action", "provider", "local", "model",
-             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2", "status_code")
+             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2", "status_code", "risk_score", "layer", "findings", "file_findings")
+
+    def _entry_val(k, e):
+        if k == "time":
+            return _to_beijing(e.get(k))
+        if k in ("findings", "file_findings"):
+            # 热窗键名 findings，MySQL 行读取后叫 findings_json：归一后整对象返回。
+            # file_findings 只在热窗（Redis）键里，MySQL 无此列 ⇒ 窗口查询行返回 None。
+            if k == "findings":
+                return e.get("findings") or e.get("findings_json")
+            return e.get(k)
+        if k == "l2":
+            return e.get(k)
+        return _plain(e.get(k))
+
     for _e in page_entries:
         if not _e.get("status_code"):
             _e["status_code"] = _entry_status(_e)
@@ -105,7 +119,7 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
         "c_allow": c_allow, "c_route": c_route, "c_block": c_block,
         "c_other": c_other,
         "kpi": kpi,
-        "entries": [{k: (_to_beijing(e.get(k)) if k == "time" else (e.get(k) if k == "l2" else _plain(e.get(k)))) for k in _keys} for e in page_entries],
+        "entries": [{k: _entry_val(k, e) for k in _keys} for e in page_entries],
     })
 
 @router.get("/admin/csv", dependencies=[Depends(_admin_auth)])

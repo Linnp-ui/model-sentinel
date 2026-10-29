@@ -1119,6 +1119,60 @@ def test_codex_session_id_strips_environment_context():
         {"type": "input_text", "text": "<system-reminder>volatile info</system-reminder>\n你好"}]}]}
     assert _main._codex_session_id(body_e) == _main._codex_session_id(body_a)
 
+def test_chat_session_id():
+    """workbuddy 等 chat 客户端不发 X-Session-ID：首条 user 消息指纹当会话 key。"""
+    from src.gateway import main as _main
+    turn1 = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "帮我核对 9 月工资表的实发合计"},
+    ]
+    sid = _main._chat_session_id(turn1)
+    assert sid and sid.startswith("chat-") and len(sid) == 21
+    # 同一对话后续轮次（全量重发 messages，首条不变）→ 指纹不变
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "实发合计 30000"},
+        {"role": "user", "content": "再看下 10 月的"},
+    ]
+    assert _main._chat_session_id(turn2) == sid
+    # 首问不同 → 指纹不同
+    other = [{"role": "user", "content": "帮我总结工资表"}]
+    assert _main._chat_session_id(other) != sid
+    # 首条是纯图（无文本块）→ 不取图当指纹，落到后续 user 文本
+    img_first = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]},
+        {"role": "assistant", "content": "x"},
+        {"role": "user", "content": "再看下报错"},
+    ]
+    assert _main._chat_session_id(img_first) == _main._chat_session_id([{"role": "user", "content": "再看下报错"}])
+    assert _main._chat_session_id([]) is None
+    assert _main._chat_session_id(None) is None
+    assert _main._chat_session_id([{"role": "assistant", "content": "x"}]) is None
+
+def test_chat_session_id_strips_client_envelope():
+    """指纹剥掉 workbuddy 样板信封：OS 版本/工作目录/当前时间变化不改变指纹。"""
+    from src.gateway import main as _main
+    a = [{"role": "user", "content": (
+        '<system-reminder data-role="user-context">\n<user_info>\nOS Version: win32\n'
+        "Workspace Folder: C:\\Users\\a\\WorkBuddy\\x\n</user_info>\n</system-reminder>\n\n"
+        "帮我核对 9 月工资表.xlsx 的实发合计")}]
+    b = [{"role": "user", "content": (
+        '<system-reminder data-role="user-context">\n<user_info>\nOS Version: linux\n'
+        "Workspace Folder: /tmp/b\n</user_info>\n</system-reminder>\n\n"
+        "帮我核对 9 月工资表.xlsx 的实发合计")}]
+    # 样板不同、真问题相同 → 指纹相同
+    assert _main._chat_session_id(a) == _main._chat_session_id(b)
+    # user_query 信封：当前时间是易变字段，只取用户输入段
+    q1 = [{"role": "user", "content": (
+        "<user_query>文件路径：E:\\task1\\追踪表.xlsx\n用户输入：问题归属最多的是哪个机器\n"
+        "当前时间：2026-09-20 11:20:26 GMT+8\n期望返回：按产品名称统计</user_query>")}]
+    q2 = [{"role": "user", "content": (
+        "<user_query>文件路径：E:\\task1\\追踪表.xlsx\n用户输入：问题归属最多的是哪个机器\n"
+        "当前时间：2026-10-28 09:01:00 GMT+8\n期望返回：按产品名称统计</user_query>")}]
+    assert _main._chat_session_id(q1) == _main._chat_session_id(q2)
+    # 只有样板、无用户真问题 → None
+    d = [{"role": "user", "content": "<environment_context>\n  cwd: /x\n</environment_context>"}]
+    assert _main._chat_session_id(d) is None
+
 def test_responses_should_mark_pure_text():
     # 2026-10-26：纯文本机密判定也标会话（第一轮判密 ⇒ 同会话粘本地）；
     # 可用性兜底不标（L2 抖一次不该锁会话 7 天）。

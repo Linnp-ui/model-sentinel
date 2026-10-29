@@ -505,10 +505,13 @@ export default function RulesPage() {
   const cols = [
     /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。原 scroll.x=1070 定宽
        在窄屏撑出横向滚动；fixed 布局下 % 才是真·定比（auto 布局 % 只是建议值） */
-    { title: <>{'优先级'}<Tip term="rule_priority" /></>, dataIndex: 'priority', width: '10%', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort,
+    { title: <>{'优先级'}<Tip term="rule_priority" /></>, dataIndex: 'priority', width: '10%', align: 'center', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort,
       render: (v, rec) => (rec.priority_locked
-        ? <span><LockOutlined style={{ marginRight: 4, color: '#faad14' }} />{v}</span>
-        : v) },
+        ? <span style={{ position: 'relative', display: 'inline-block', minWidth: '100%', textAlign: 'center' }}>
+            <LockOutlined style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', color: '#faad14' }} />
+            {v}
+          </span>
+        : <span style={{ display: 'inline-block', minWidth: '100%', textAlign: 'center' }}>{v}</span>) },
     { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, align: 'center', className: 'cell-center',
       render: (v) => <Text code title={v}><RuleZh name={v} /></Text> },
     { title: <>{'动作'}<Tip term="action" /></>, dataIndex: 'action', width: '12%',
@@ -634,15 +637,15 @@ export default function RulesPage() {
              <Form.Item name="priority" label={<>{'优先级（小者先）'}<Tip term="rule_priority" /></>}>
               <InputNumber min={0} max={1000} />
             </Form.Item>
-            <Form.Item name="priority_locked" label="锁定优先级" valuePropName="checked">
-              <Switch />
-            </Form.Item>
             <Form.Item name="action" label={<>{'动作'}<Tip term="action" /></>} rules={[{ required: true }]}>
               <Select style={{ width: 140 }} options={[
                 { value: 'allow', label: 'allow 放行' },
                 { value: 'route_local', label: 'route_local 转内网' },
                 { value: 'block', label: 'block 拦截' },
-              ]} />
+               ]} />
+            </Form.Item>
+            <Form.Item name="priority_locked" label="锁定优先级" valuePropName="checked">
+              <Switch />
             </Form.Item>
           </Space>
           <Card title={<>匹配方式构造器 <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)', fontWeight: 'normal' }}>（字段悬停看说明）</Text>
