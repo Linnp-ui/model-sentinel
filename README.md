@@ -5,6 +5,8 @@
 
 ## 架构
 
+![系统架构](docs/figures/fig4-1-architecture.png)
+
 ```
 客户端 (OpenAI SDK / Anthropic / codex / 管理台)
   -> Gateway (FastAPI, :8080)
@@ -82,6 +84,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env        # OLLAMA_MOCK=true，AI_GATEWAY_ADMIN_PASSWORD=<你的管理密码>
 .venv/bin/python -m uvicorn src.gateway.main:app --host 0.0.0.0 --port 8080
 ```
+
+![部署拓扑](docs/figures/fig4-3-deploy.png)
 
 已有内网模型时（`.env`）：
 
