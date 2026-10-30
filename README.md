@@ -69,18 +69,18 @@
 ## 系统流程
 
 ```mermaid
-flowchart LR
-  C[客户端] --> G[Gateway :8080]
-  G --> A[鉴权]
-  A --> F[文件预检]
-  F --> L1[L1 规则]
-  L1 -->|灰区| L2[L2 小模型]
-  L1 --> P[策略引擎]
+graph LR
+  C["客户端"] --> G["Gateway"]
+  G --> A["鉴权"]
+  A --> F["文件预检"]
+  F --> L1["L1 规则"]
+  L1 -->|灰区| L2["L2 小模型"]
+  L1 --> P["策略引擎"]
   L2 --> P
-  P -->|allow| E[外网 Provider]
-  P -->|route_local| I[内网模型]
-  P -->|block| B[拦截/转内网]
-  G --> AU[审计日志]
+  P -->|allow| E["外网 Provider"]
+  P -->|route_local| I["内网模型"]
+  P -->|block| B["拦截/转内网"]
+  G --> AU["审计日志"]
 ```
 
 ## 快速开始
