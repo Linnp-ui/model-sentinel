@@ -63,7 +63,7 @@
   外发域名/路径白名单（`AI_GATEWAY_STRICT_EGRESS`）、24h 指标环 + Prometheus `/admin/metrics`
 - **管理台**（`/admin`，内置前端）：key 登记/启停、规则 CRUD、provider 注册、对外模型别名组、
   外网候选（价格/上下文/rank + 失败自动切换）、内部模型登记（含健康检查）、模型限流、
-  L2 配置/提示词（历史版本回滚）、审计查询（状态码筛选）/CSV 导出、route-inspect 全链路干跑、熔断手动开关
+  L2 配置/提示词（历史版本回滚）、审计查询（状态码筛选）/CSV 导出、日志明细查询（MySQL 全量，含延迟/token 分解）、route-inspect 全链路干跑、熔断手动开关
 - **文档**：`docs/user-manual.md`（用户接入）/ `docs/admin-manual.md`（管理台操作）
 
 ## 快速开始
