@@ -68,16 +68,7 @@
 
 ## 系统流程
 
-```
-客户端 -> Gateway(:8080)
-  -> 鉴权 -> 文件预检 -> L1 规则
-       |-> (灰区) L2 小模型
-  -> 策略引擎(policy.yaml)
-       |-> allow        -> 外网 Provider
-       |-> route_local  -> 内网模型
-       |-> block        -> 拦截/转内网
-  -> 审计日志
-```
+![系统流程图](docs/figures/fig4-2-sequence.png)
 
 ## 快速开始
 
