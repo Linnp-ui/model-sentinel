@@ -258,7 +258,7 @@ async def _responses_direct_stream(
     首字节前命中 fallback_codes 或连接失败 ⇒ raise _ResponsesUnsupported，
     由调用方回退 chat 桥接；其余 >=400 抛 RoutingError（不静默吞掉）。
     """
-    # 外网转发只看本次解析出的凭据（ukey），不看 prov.configured（库存≠本请求有权用，T44 坑见 gotchas）
+    # 外网转发只看本次解析出的凭据（ukey），不看 prov.configured（库存≠本请求有权用，T44 坑）
     if not prov.local and not ukey:
         raise RoutingError(f"provider {prov.name} 未配置密钥", 503,
                             type_="provider_not_configured")

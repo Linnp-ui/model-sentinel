@@ -67,6 +67,30 @@ def versions() -> dict:
     return {"versions": sorted(vs, reverse=True), "current": cur}
 
 
+def list_reports() -> dict:
+    """盘上评估报告（vN.json，版本升序）：管理台「版本评估」查看路径。
+
+    job.done 的候选报告只在内存里（网关重启即失）；盘上报告是每版三门
+    （battery/现影子对照/标注回归/分歧回归）+ 相对上一版 diff 的持久历史。"""
+    out = []
+    try:
+        for n in os.listdir(REPORTS_DIR):
+            if re.fullmatch(r"v\d+\.json", n):
+                try:
+                    with open(os.path.join(REPORTS_DIR, n), encoding="utf-8") as f:
+                        x = json.load(f)
+                    # 必须是带 version 的对象：合法 JSON 的数组/字符串会让下面的
+                    # sort(x.get(...)) 抛 AttributeError 拖垮整个端点
+                    if isinstance(x, dict) and x.get("version") is not None:
+                        out.append(x)
+                except Exception:
+                    continue
+    except OSError:
+        pass
+    out.sort(key=lambda x: x.get("version") or 0)
+    return {"reports": out}
+
+
 def status() -> dict:
     from src.gateway.admin_store import get_admin_store
     out = dict(JOB, log_tail=list(JOB["log"])[-40:])

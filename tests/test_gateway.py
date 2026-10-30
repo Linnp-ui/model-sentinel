@@ -1989,7 +1989,7 @@ def test_stats_summary_endpoint():
 
 def test_admin_metrics_timeseries_shape():
     # 防半截 revert 复现：metrics_timeseries 函数体曾留未定义 hours/RING_POINTS
-    # 致线上 500，端点无测试覆盖（见 agents/gotchas.md）
+    # 致线上 500，端点无测试覆盖
     r = client.get("/admin/metrics/timeseries")
     assert r.status_code == 200
     d = r.json()
@@ -2012,6 +2012,55 @@ def test_l2_divergences_shape():
     assert r3.status_code == 200
     assert r3.headers["content-type"].startswith("application/jsonl")
     assert "attachment" in r3.headers.get("content-disposition", "")
+
+
+def test_l2_divergences_export_since_passthrough(monkeypatch):
+    # 导出与列表端点同参支持 since（管理台按灌数轮次窗导出，口径才与表一致）
+    import datetime as _dt
+    from src.gateway.audit_store import get_audit_store
+
+    now = _dt.datetime.now()
+    mk = lambda days, rid: {
+        "req_id": rid, "ts": (now - _dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"),
+        "l2": {"label": "NORMAL", "shadow_label": "CONFIDENTIAL"},
+    }
+    old, new = mk(10, "exp-old-1"), mk(1, "exp-new-1")
+    def fake_query(since=None, **kw):
+        if since is None:
+            return [old, new]
+        return [r for r in (old, new)
+                if _dt.datetime.strptime(r["ts"][:19], "%Y-%m-%d %H:%M:%S") >= since]
+    monkeypatch.setattr(get_audit_store(), "query_mysql", fake_query)
+
+    body = client.get("/admin/api/l2-divergences/export", params={"hours": 720}).text
+    assert "exp-old-1" in body and "exp-new-1" in body
+    since_arg = (now - _dt.timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    body = client.get("/admin/api/l2-divergences/export",
+                      params={"hours": 24, "since": since_arg}).text
+    assert "exp-new-1" in body and "exp-old-1" not in body
+
+
+def test_logs_list_filter_and_cleanup():
+    # 明细库 /logs：窗口+key 过滤、分页形状；cleanup 只删超期行
+    import datetime as _dt
+    from src.gateway.admin_store import get_admin_store
+    st = get_admin_store()
+    now = _dt.datetime.utcnow()  # ts 一律 UTC 基
+    st.insert_request_log({"key_name": "pytest-logs", "model": "m-a", "provider": "p",
+                           "action": "allow", "client_ip": "8.8.8.8", "status_code": 200,
+                           "prompt_tokens": 10, "completion_tokens": 5})
+    st.insert_request_log({"key_name": "pytest-logs-old", "model": "m-a",
+                           "ts": (now - _dt.timedelta(days=100)).strftime("%Y-%m-%d %H:%M:%S")})
+    d = client.get("/admin/api/logs", params={"hours": 720, "key_name": "pytest-logs"}).json()
+    assert {"items", "total"} <= set(d)
+    assert d["total"] == 1 and d["items"][0]["key_name"] == "pytest-logs"
+    # 宽窗（100d）里新旧两行都在；90 天清理只动老行
+    d = client.get("/admin/api/logs", params={"hours": 2400, "model": "m-a"}).json()
+    assert d["total"] == 2
+    r = client.post("/admin/api/logs/cleanup", params={"days": 90})
+    assert r.status_code == 200 and r.json()["deleted"] >= 1
+    d = client.get("/admin/api/logs", params={"hours": 2400, "model": "m-a"}).json()
+    assert all(row["key_name"] != "pytest-logs-old" for row in d["items"])
 
 
 def test_l2_divergences_label_roundtrip():
@@ -2361,6 +2410,24 @@ def test_l2_retrain_versions_api():
     assert "versions" in d and "current" in d and isinstance(d["versions"], list)
 
 
+def test_l2_retrain_reports_api(tmp_path, monkeypatch):
+    # 版本评估查看路径：盘上报告按版本升序返回（乱序落盘也不影响）
+    from src.gateway import l2_retrain
+    d = tmp_path / "reports"
+    d.mkdir()
+    (d / "v34.json").write_text('{"version": 34, "ts": "t2", "report": {"battery": {"total": 1, "correct": 1}}}', encoding="utf-8")
+    (d / "v18.json").write_text('{"version": 18, "ts": "t1", "report": {}}', encoding="utf-8")
+    (d / "bad.json").write_text("not json", encoding="utf-8")
+    # 合法 JSON 但非对象 / 缺 version：必须跳过，不许让 sort 抛 AttributeError 500
+    (d / "v99.json").write_text("[1, 2, 3]", encoding="utf-8")
+    (d / "v98.json").write_text('{"ts": "no-version-key"}', encoding="utf-8")
+    monkeypatch.setattr(l2_retrain, "REPORTS_DIR", str(d))
+    r = client.get("/admin/api/l2/retrain/reports")
+    assert r.status_code == 200
+    vers = [x["version"] for x in r.json()["reports"]]
+    assert vers == [18, 34], vers
+
+
 def test_l2_retrain_latest_prompt_fix_reads_last(monkeypatch, tmp_path):
     # 候选 prompt 持久化：读最后一行合法 JSON；坏行忽略；无文件返回 {}
     from src.gateway import l2_retrain
@@ -2487,6 +2554,16 @@ def test_l2_prompt_versions_roundtrip(monkeypatch):
     assert client.get("/admin/api/l2-prompt-versions").json()["items"][0]["source"] == "rollback"
     assert client.get("/admin/api/l2-prompts").json()["system_prompt"] == cur
     assert client.post("/admin/api/l2-prompt-versions/999999/rollback").status_code == 404
+
+
+def test_l2_prompt_versions_keep_latest_three():
+    # 只留最近 3 版（回滚窗口就这么点，旧全文不占库）
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    for i in range(5):
+        store.save_prompt_version(f"p{i}", "", operator="t", source="save")
+    items = store.list_prompt_versions(limit=50)
+    assert [x["system_preview"] for x in items] == ["p4", "p3", "p2"]
 
 
 def test_l2_divergences_dedup_collapse():

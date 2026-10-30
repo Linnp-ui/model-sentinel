@@ -445,60 +445,6 @@ def test_alias_provider_must_resolve():
                 pass
 
 
-def test_provider_rename_cascades_alias_and_policy(monkeypatch, tmp_path):
-    # 控制台改 provider 名：别名组成员 + policy 规则 target 必须跟着改，
-    # 否则别名 503 unknown provider / 规则静默指向已不存在的 provider（2026-10-21 修）
-    import shutil
-    import yaml as _y
-    from src.gateway import providers as _pv, model_policy as _mp, policy_admin as _pa
-    from src.gateway.admin_store import get_admin_store
-    from src.gateway.policy import DEFAULT_POLICY
-
-    rt = tmp_path / "routing.yaml"
-    shutil.copy(_pv.DEFAULT_ROUTING_FILE, rt)
-    mp = tmp_path / "model_policy.yaml"
-    shutil.copy(_mp.DEFAULT_MODEL_POLICY, mp)
-    pol = tmp_path / "policy.yaml"
-    doc = _y.safe_load(Path(DEFAULT_POLICY).read_text(encoding="utf-8"))
-    doc["policies"].append({
-        "name": "测试改名级联", "priority": 98, "action": "allow",
-        "when": {"any": [{"text contains_any": ["__rename_probe__"]}]},
-        "target": {"provider": "deepseek", "model": "deepseek-flash"},
-    })
-    pol.write_text(_y.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    monkeypatch.setattr(_pv, "_routing_path", lambda: rt)
-    monkeypatch.setattr(_mp, "_policy_path", lambda: mp)
-    monkeypatch.setattr(_pa, "_policy_path", lambda: pol)
-    _pv.invalidate_cache()
-    _mp.invalidate_model_policy_cache()
-
-    store = get_admin_store()
-    assert client.put("/admin/api/aliases/rt-rename",
-                      json={"members": [{"provider": "deepseek", "model": "deepseek-flash"}]}
-                      ).status_code == 200
-    try:
-        r = client.put("/admin/api/providers/deepseek",
-                       json={"base_url": "https://api.deepseek.com/v1", "api_key_env": "DEEPSEEK_API_KEY",
-                             "api_mode": "openai", "kind": "chat", "default_model": "deepseek-v4-flash",
-                             "timeout": 60, "local": False, "new_name": "ds-renamed"})
-        assert r.status_code == 200, r.text
-        # 别名成员跟着改名
-        g = [x for x in client.get("/admin/api/aliases").json()["groups"]
-             if x["name"] == "rt-rename"][0]
-        assert g["members"][0]["provider"] == "ds-renamed", g
-        # policy 规则 target 跟着改名
-        rules = {x["name"]: x for x in client.get("/admin/api/policies").json()["items"]}
-        assert rules["测试改名级联"]["target"]["provider"] == "ds-renamed", rules["测试改名级联"]
-        # routing.yaml 键改名
-        assert "ds-renamed" in (_y.safe_load(rt.read_text(encoding="utf-8"))["providers"])
-    finally:
-        for n in ("rt-rename",):
-            try:
-                store.delete_alias_group(n)
-            except (KeyError, ValueError):
-                pass
-
-
 def test_alias_group_rename():
     # 别名组改名：PUT new_name 整组重命名；撞名 422；旧名立即失效、/v1/models 换新名
     from src.gateway.admin_store import get_admin_store

@@ -52,6 +52,7 @@ from .stat_scope import is_abnormal, is_blocked, is_local_route, to_beijing
 
 _IP_CACHE_TTL_S = 5.0
 _ENTRY_TTL_S = 30.0  # P1: 注册表 entry 缓存（精确+模糊+负缓存），写操作 bump 版本即时失效
+_PROMPT_VERSION_KEEP = 3  # L2 提示词历史版本只留最近 3 版（回滚窗口）
 
 metadata = MetaData()
 
@@ -859,14 +860,19 @@ class AdminStore:
             try:
                 with self._engine.begin() as conn:
                     conn.execute(insert(prompt_versions).values(**row))
+                    # 只留最近 3 版：页面拿来回滚近几次改动，全文多留只是占库
+                    keep = [r[0] for r in conn.execute(
+                        select(prompt_versions.c.id).order_by(prompt_versions.c.id.desc())
+                        .limit(_PROMPT_VERSION_KEEP))]
+                    conn.execute(sa_delete(prompt_versions).where(prompt_versions.c.id.notin_(keep)))
                 return
             except Exception as e:
                 print(f"[admin_store] prompt_versions insert failed, fallback memory: {e!r}")
         with self._mem_lock:
             self._prompt_version_seq += 1
             self._prompt_versions.append(dict(row, id=self._prompt_version_seq))
-            if len(self._prompt_versions) > 200:
-                del self._prompt_versions[:-200]
+            if len(self._prompt_versions) > _PROMPT_VERSION_KEEP:
+                del self._prompt_versions[:-_PROMPT_VERSION_KEEP]
 
     def list_prompt_versions(self, limit: int = 50) -> list[dict]:
         """历史版本列表（system_prompt 只给 200 字预览 + sha12，详情走 get）。"""

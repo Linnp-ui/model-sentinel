@@ -963,7 +963,6 @@ class ProviderUpsertReq(BaseModel):
     default_model: str = Field(default="", max_length=256)
     timeout: float = Field(default=60.0, ge=1, le=600)
     local: bool = False
-    new_name: str = Field(default="", max_length=64)
     extra_headers: Optional[Dict[str, str]] = None  # None=未传，更新时不动原值
 
 
@@ -1037,83 +1036,19 @@ def update_provider_api(request: Request, name: str, body: ProviderUpsertReq):
     provs = raw.get("providers") or {}
     if name not in provs and _pv.load_routing().get(name) is None:
         raise HTTPException(404, f"provider 不存在：{name}")
-    target = (body.new_name or name).strip()
-    if target != name:
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", target):
-            raise HTTPException(422, f"provider 名不合法：{target!r}")
-        if target in (provs or {}) or _pv.load_routing().get(target) is not None:
-            raise HTTPException(409, f"provider {target} 已存在")
-        # 重命名：更新引用（routing 默认、model_policy 候选/内部模型、别名组成员）
-        routing = raw.get("routing") or {}
-        for fld in ("default_external", "default_local", "default_embedding"):
-            if routing.get(fld) == name:
-                routing[fld] = target
-        raw["routing"] = routing
-        # model_policy
-        try:
-            import yaml as _y
-            mp_raw = _y.safe_load(Path(_pv.DEFAULT_MODEL_POLICY if hasattr(_pv, "DEFAULT_MODEL_POLICY") else "model_policy.yaml").read_text(encoding="utf-8")) if False else None
-        except Exception:
-            mp_raw = None
-        # 直接操作 model_policy.yaml 文件
-        try:
-            from src.gateway import model_policy as _mp
-            mp_path = _mp._policy_path()
-            mp_doc = _y.safe_load(mp_path.read_text(encoding="utf-8")) or {}
-            mp = mp_doc.get("model_policy", mp_doc) if isinstance(mp_doc, dict) else {}
-            for c in (mp.get("external_candidates") or []):
-                if _same_provider(c.get("provider"), name):
-                    c["provider"] = target
-            for m in (mp.get("internal_models") or []):
-                if _same_provider(m.get("provider"), name):
-                    m["provider"] = target
-            mp_doc["model_policy" if "model_policy" in mp_doc else "model_policy"] = mp
-            # 保持原结构
-            if "model_policy" not in mp_doc and isinstance(mp_doc, dict):
-                mp_doc = {"model_policy": mp}
-            _y.safe_dump(mp_doc, open(mp_path, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
-            _mp.invalidate_model_policy_cache()
-        except Exception as e:
-            raise HTTPException(422, f"model_policy 更新失败：{e}")
-        # 别名组成员
-        try:
-            store = get_admin_store()
-            for g in store.list_alias_groups():
-                changed = False
-                members = [dict(m) for m in (g.get("members") or [])]
-                for m in members:
-                    if _same_provider(m.get("provider"), name):
-                        m["provider"] = target
-                        changed = True
-                if changed:
-                    store.update_alias_group(g.get("name"), members,
-                                             description=g.get("description") or "",
-                                             intent=bool(g.get("intent")))
-        except Exception as e:
-            raise HTTPException(422, f"别名组引用更新失败：{e}")
-        # policy 规则 target（不改则规则静默指向已不存在的 provider ⇒ 行为漂移）
-        try:
-            from src.gateway import policy_admin as _pa
-            _op = _operator(request)
-            for rule in _pa.list_policies():
-                tgt = rule.get("target") or {}
-                if not _same_provider(tgt.get("provider"), name):
-                    continue
-                new_rule = dict(rule)
-                new_rule["target"] = {**tgt, "provider": target}
-                _pa.upsert_policy(new_rule, original_name=rule.get("name"), operator=_op)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(422, f"policy 规则 target 更新失败：{e}")
+    target = name  # provider 名创建后不可改（身份键，被 routing/model_policy/别名组/policy 引用）
     # move provider entry
     if name in provs:
         entry = provs.pop(name)
         provs[target] = entry
+    old_local = (provs.get(name) or {}).get("local")
     merged = {k: v for k, v in (provs.get(target) or {}).items() if k != "api_key_value"}
     payload = _provider_payload(body)
     payload.pop("new_name", None)
     merged.update(payload)
+    # local 是安全边界：创建后不可改（误设=内容静默出境），强制保留原值
+    if old_local is not None:
+        merged["local"] = bool(old_local)
     provs[target] = merged
     raw["providers"] = provs
     # providers.save_providers  expects full dict and writes yaml; but raw already modified routing; save_providers reloads raw anyway losing refs? Use save_providers only for providers + routing? save_providers writes whole raw including routing we mutated? Let's inspect: save_providers reads _routing_path raw independently, doesn't accept routing. It overwrites providers only but preserves raw routing? It calls load_raw fresh, so our raw mutations not persisted. Need instead write routing.yaml manually.
@@ -1635,7 +1570,7 @@ def l2_prompts_put(req: L2PromptsPutReq, request: Request):
 
 @router.get("/l2-prompt-versions")
 def l2_prompt_versions_api(limit: int = 50):
-    """L2 提示词历史版本（每次 PUT 前快照；system 只给 200 字预览 + sha12）。"""
+    """L2 提示词历史版本（每次 PUT 前快 snapshot；system 只给 200 字预览 + sha12）。"""
     items = get_admin_store().list_prompt_versions(limit)
     for r in items:
         r["ts"] = to_beijing(r.get("ts"))
@@ -1813,7 +1748,7 @@ def l2_shadow_stats(hours: int = 168, since: str = "", until: str = ""):
 
 
 # ---------------- L2 影子看板：趋势 / 分歧样本 / 标注 / 导出（数据源 MySQL audit_logs.l2 列） ----------------
-# l2 列 2026-09-28 才加（此前影子数据只在 Redis 热缓存 5000 条，见 agents/gotchas.md）；
+# l2 列 2026-09-28 才加（此前影子数据只在 Redis 热缓存 5000 条）；
 # ts 存 UTC，cutoff 一律 Python utcnow()，禁用 SQL NOW()（北京时间，窗口恒空）。
 
 def _cutoff(hours: int, since: str = ""):
@@ -2023,13 +1958,15 @@ def l2_divergences_auto_label(req: AutoLabelReq):
 
 
 @router.get("/l2-divergences/export")
-def l2_divergences_export(hours: int = 168, cell: str = "", labeled: str = "all"):
-    """导出分歧样本 JSONL（含标注），喂 build_laya_dataset / 离线分析。"""
+def l2_divergences_export(hours: int = 168, cell: str = "", labeled: str = "all", since: str = ""):
+    """导出分歧样本 JSONL（含标注），喂 build_laya_dataset / 离线分析。
+
+    since 与列表端点同参：管理台按灌数轮次窗（since+hours=24）导出时口径才与表一致。"""
     try:
         hours = max(1, min(int(hours), 720))
     except (TypeError, ValueError):
         hours = 168
-    rows = _l2_divergence_rows(hours)
+    rows = _l2_divergence_rows(hours, since)
     if cell in ("nc", "cn"):
         rows = [x for x in rows if x["cell"] == cell]
     labels = get_admin_store().get_l2_labels([x["req_id"] for x in rows])
@@ -2171,6 +2108,13 @@ def l2_retrain_versions_api():
     """盘上可用 checkpoint 版本 + 当前影子版本（晋升下拉用）。"""
     from src.gateway import l2_retrain
     return l2_retrain.versions()
+
+
+@router.get("/l2/retrain/reports")
+def l2_retrain_reports_api():
+    """各影子版本盘上评估报告（三门 + 回归 diff）：管理台「版本评估」卡数据源。"""
+    from src.gateway import l2_retrain
+    return l2_retrain.list_reports()
 
 
 class PromptTestReq(BaseModel):
@@ -2741,7 +2685,7 @@ def circuit_set_api(request: Request, name: str, body: CircuitSetReq):
 # 停机信号：uvicorn 0.30 对「未完成的流式响应」只置 keep_alive=False 不断连，
 # 且 lifespan shutdown 排在连接排空之后 —— 永不结束的 SSE 生成器会把 stop 拖满
 # systemd TimeoutStopSec=90s 然后 SIGKILL，浏览器端报 net::ERR_INCOMPLETE_CHUNKED_ENCODING。
-# 修法：unit 的 ExecStop 先 kill -USR1 $MAINPID（见 agents/deploy.md），生成器见
+# 修法：unit 的 ExecStop 先 kill -USR1 $MAINPID，生成器见
 # sse_stop 正常 return（chunked 终止块照发），连接干净排空，进程快速自退。
 sse_stop = asyncio.Event()
 

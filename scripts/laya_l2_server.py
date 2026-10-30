@@ -7,7 +7,7 @@ Laya 不是生成式 LLM（无 OpenAI 协议，vLLM 跑不了），走 Python SD
 判据从网关内置 L2 system prompt（small_model.SYSTEM_PROMPT）搬进 choice 题
 criteria——换 Laya 不改判密口径。
 
-不是 vllm-* unit：禁止通配批量操作（见 agents/vllm-hosts.md 硬约束）。
+不是 vllm-* unit：禁止通配批量操作（各 unit 独立，通配会停掉全部模型）。
 """
 import os
 import time

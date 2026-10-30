@@ -121,12 +121,12 @@ export default function KeysPage() {
       </Card>
       <Modal title="编辑 API KEY" open={modalOpen} onOk={submit} onCancel={() => { setEditing(null); form.resetFields(); setModalOpen(false); }}>
         <Form form={form} layout="vertical">
-          <Form.Item name="name" label="名称（人员标识，统计归因用）" rules={[{ required: true }]}>
+          <Form.Item name="name" label="名称（人员标识，统计归因用）" rules={[{ required: true }]} htmlFor="key-name">
             <Input id="key-name" />
           </Form.Item>
-          <Form.Item name="owner" label="归属团队"><Input id="key-owner" /></Form.Item>
-          <Form.Item name="note" label="备注"><Input.TextArea id="key-note" rows={2} /></Form.Item>
-          <Form.Item name="weekly_cost_cap" label={<>{'近 7 天费用上限（元，0=不限）'}<Tip text="按这个 KEY 近 7 天 token 用量折算的内部费用；达到上限后请求直接 429 拒绝（不是提示）。" /></>}><Input id="key-cost-cap" type="number" min={0} style={{ width: '100%' }} /></Form.Item>
+          <Form.Item name="owner" label="归属团队" htmlFor="key-owner"><Input id="key-owner" /></Form.Item>
+          <Form.Item name="note" label="备注" htmlFor="key-note"><Input.TextArea id="key-note" rows={2} /></Form.Item>
+          <Form.Item name="weekly_cost_cap" label={<>{'近 7 天费用上限（元，0=不限）'}<Tip text="按这个 KEY 近 7 天 token 用量折算的内部费用；达到上限后请求直接 429 拒绝（不是提示）。" /></>} htmlFor="key-cost-cap"><Input id="key-cost-cap" type="number" min={0} style={{ width: '100%' }} /></Form.Item>
         </Form>
       </Modal>
       <Modal title="生成 API KEY" open={genOpen}
@@ -134,11 +134,11 @@ export default function KeysPage() {
         onCancel={() => { setGenOpen(false); genForm.resetFields(); }}
         okText="生成">
         <Form form={genForm} layout="vertical">
-          <Form.Item name="name" label="名称（人员标识）" rules={[{ required: true, min: 1 }]}>
+          <Form.Item name="name" label="名称（人员标识）" rules={[{ required: true, min: 1 }]} htmlFor="gen-name">
             <Input id="gen-name" placeholder="张三" />
           </Form.Item>
-          <Form.Item name="owner" label="归属团队"><Input id="gen-owner" placeholder="平台/算法/产品" /></Form.Item>
-          <Form.Item name="note" label="备注"><Input.TextArea id="gen-note" rows={2} placeholder="选填" /></Form.Item>
+          <Form.Item name="owner" label="归属团队" htmlFor="gen-owner"><Input id="gen-owner" placeholder="平台/算法/产品" /></Form.Item>
+          <Form.Item name="note" label="备注" htmlFor="gen-note"><Input.TextArea id="gen-note" rows={2} placeholder="选填" /></Form.Item>
         </Form>
         {genResult && (
           <div style={{ marginTop: 'var(--gw-sp-12)' }}>

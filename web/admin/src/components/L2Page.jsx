@@ -6,6 +6,7 @@ import { api, errText } from '../api';
 import { bj, wideSticky } from '../utils.js';
 import WheelGate from './WheelGate.jsx';
 import { Tip } from '../terms.jsx';
+import Arrow from './Arrow.jsx';
 
 const { Text } = Typography;
 
@@ -158,6 +159,19 @@ export default function L2Page() {
     try { setJob(await api('/l2/retrain/status')); } catch { setJob(null); }
   }, []);
   useEffect(() => { loadJob(); }, [loadJob]);
+  // 版本评估：盘上报告（每版三门+回归 diff 的持久历史；「优化管道」卡只挂最近一轮的内存报告）
+  const [reports, setReports] = useState([]);
+  const [repVer, setRepVer] = useState('');
+  const [repErr, setRepErr] = useState('');
+  const loadReports = useCallback(async () => {
+    try {
+      const d = await api('/l2/retrain/reports');
+      setReports(d.reports || []);
+      setRepVer((cur) => cur || String((d.reports || []).slice(-1)[0]?.version ?? ''));
+      setRepErr('');
+    } catch (e) { setRepErr(errText(e)); }  // 报错与「盘上无报告」区分，别给假阴性
+  }, []);
+  useEffect(() => { loadReports(); }, [loadReports]);
   /* 版本下拉只在训练状态**真的变了**时刷新。原先依赖 job?.state：首屏 status 返回后
      state 由 undefined 变成 'idle' 也算一次变化 → versions 被拉两遍（实测 9 个请求里
      有 3 个重复）。用 ref 记住上次状态，只在真变化时跑。 */
@@ -166,7 +180,8 @@ export default function L2Page() {
     if (lastState.current === job?.state) return;
     lastState.current = job?.state;
     loadVers();
-  }, [loadVers, job?.state]);
+    loadReports();  // 训练 done/failed 时盘上多了一份新报告
+  }, [loadVers, job?.state, loadReports]);
   useEffect(() => {
     if (!job || job.state !== 'running') return undefined;
     const t = setInterval(loadJob, 10000);
@@ -206,7 +221,7 @@ export default function L2Page() {
   const candVer = (job?.candidate || '').match(/v(\d+)$/)?.[1] || '?';
   const canStart = job && job.state !== 'running' && job.labeled_count >= job.min_labels;
   const JobCard = () => (
-         <Card title={<>优化管道<Tip text="把人工标注喂给模型重新训练，得到一个候选版本，测一遍没变差再「晋升」给影子用。权威判密模型默认 qwen（env 可切 laya，切后无影子可晋升）；晋升只换影子。" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
+         <Card title={<>优化管道<Tip text="把人工标注喂给模型重新训练，得到候选版本，测过再「晋升」给影子用。晋升只换影子，不换主判。" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
       <Space wrap size="middle" align="center">
         <Text>人工标注 <Text strong>{job?.labeled_count ?? '-'}</Text> / 门槛 {job?.min_labels ?? '-'}</Text>
         {job?.state === 'running' && (
@@ -310,13 +325,75 @@ export default function L2Page() {
       </Space>
       {job?.state === 'running' && job.log_tail?.length > 0 && (
         <WheelGate>
-        <pre style={{ maxHeight: 320, overflow: 'auto', overscrollBehavior: 'contain', fontSize: 'var(--gw-fs-13)', lineHeight: 1.6, marginTop: 'var(--gw-sp-8)', marginBottom: 0 }}>
+        <pre style={{ maxHeight: 320, overflow: 'auto', overscrollBehavior: 'contain', fontSize: 'var(--gw-fs-14)', lineHeight: 1.6, marginTop: 'var(--gw-sp-8)', marginBottom: 0 }}>
           {job.log_tail.join('\n')}
         </pre>
         </WheelGate>
       )}
     </Card>
   );
+
+  // 版本评估：盘上报告的持久历史（上面优化管道卡只挂最近一轮的内存报告，重启即失）
+  const ReportCard = () => {
+    const sel = reports.find((r) => String(r.version) === repVer) || null;
+    return (
+      <Card title={<>{'版本评估'}<Tip text="各影子版本的评估报告（训练完生成、重启不丢）：三门检查 + 相对上一版的回归 diff。晋升前先核对。" /></>}
+        style={{ marginBottom: 'var(--gw-sp-12)' }}
+        extra={reports.length > 0 && (
+          <Select size="small" value={repVer || undefined} onChange={setRepVer} style={{ width: 150 }}
+            options={[...reports].reverse().map((r) => ({
+              value: String(r.version),
+              label: `v${r.version}${r.version === vers.current ? '（现影子）' : ''}`,
+            }))} />
+        )}>
+        {!sel ? (repErr
+          ? <Text type="danger">评估报告加载失败：{repErr}</Text>
+          : <Text type="secondary">盘上暂无评估报告（优化管道训练完成后生成）。</Text>) : (() => {
+          const b = sel.report?.battery || {};
+          const base = sel.report?.baseline;
+          const lb = sel.report?.labeled || {};
+          const dg = sel.report?.divergences;
+          const rg = sel.report?.regressions;
+          const cx = (k) => (b.cats?.[k] ? `${b.cats[k].correct}/${b.cats[k].total}` : '-');
+          return (
+            <Space direction="vertical" size={4} style={{ fontSize: 'var(--gw-fs-13)', width: '100%' }}>
+              <Text type="secondary">评测时间 {sel.ts || '-'} · qwen prompt {sel.report?.prompt?.sha1 || '-'}</Text>
+              <Space wrap size={12}>
+                <Text><Text strong>候选 battery：</Text>{b.correct}/{b.total}（探针 {cx('probe')} · 真实 {cx('real')} · 回归 {cx('reg')}）</Text>
+                {base && <Text><Text strong>现影子同电池：</Text>{base.correct}/{base.total}</Text>}
+                <Text><Text strong>标注回归：</Text>{lb.matched}/{lb.total}</Text>
+                {dg && <Text><Text strong>分歧回归：</Text>{dg.matched}/{dg.total}{dg.unmatched ? `（未匹配 ${dg.unmatched}）` : ''}</Text>}
+              </Space>
+              {rg && (
+                <Space wrap size={6}>
+                  <Text><Text strong>相对上一版 v{rg.against}：</Text></Text>
+                  {rg.new.length > 0
+                    ? <Text type="danger">新错 {rg.new.length} 条：{rg.new.join('；')}</Text>
+                    : <Text type="success">零新错</Text>}
+                  {rg.fixed.length > 0 && <Text type="success">修好 {rg.fixed.length} 条：{rg.fixed.join('；')}</Text>}
+                  {rg.still.length > 0 && <Text type="secondary">仍错 {rg.still.length} 条</Text>}
+                </Space>
+              )}
+              {b.wrong?.length > 0 && (
+                <Space direction="vertical" size={2}>
+                  <Text strong>候选错题（{b.wrong.length}）：</Text>
+                  {b.wrong.map((w, i) => (
+                    <Text key={i} type="secondary">{w.name}｜want={w.want} got={w.got} p={w.p}｜{(w.preview || '').slice(0, 60)}…</Text>
+                  ))}
+                </Space>
+              )}
+              {lb.missed?.length > 0 && (
+                <Text type="danger">标注回归错 {lb.missed.length} 条：{lb.missed.map((m) => `${m.req_id}(want${m.want}/p${m.p})`).join('，')}</Text>
+              )}
+              {dg?.missed?.length > 0 && (
+                <Text type="danger">分歧回归漏判 {dg.missed.length} 条：{dg.missed.map((m, i) => `want=${m.want} got=${m.got} p=${m.p}｜${(m.text || '').slice(0, 40)}`).join('；')}</Text>
+              )}
+            </Space>
+          );
+        })()}
+      </Card>
+    );
+  };
 
   const submitLabel = async (req_id, label) => {
     setDivs((d) => d.map((x) => (x.req_id === req_id ? { ...x, label } : x)));
@@ -403,8 +480,8 @@ export default function L2Page() {
   const cols = [
     /* 时间是纯文本无省略号：窄列溢出到邻列，加 ellipsis 裁切 */
     { title: '时间', dataIndex: 'ts', width: '15%', ellipsis: true, render: (v) => bj(v) },
-    { title: '主 → 影', width: '24%',
-      render: (_, x) => <Space size={4}>{labelTag(x.main)}<span>→</span>{labelTag(x.shadow)}</Space> },
+    { title: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>主 <Arrow size={12} /> 影</span>, width: '24%',
+      render: (_, x) => <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>{labelTag(x.main)}<Arrow size={12} />{labelTag(x.shadow)}</div> },
     { title: '影子置信度', dataIndex: 'shadow_prob', width: '9%',
       render: (v) => (v == null ? '-' : Number(v).toFixed(3)) },
     { title: '用户query', dataIndex: 'text_preview', width: '32%', ellipsis: true,
@@ -523,6 +600,7 @@ export default function L2Page() {
           ]} />
       </Card>
       <JobCard />
+      <ReportCard />
       {pendingNew > 0 && (
         <Alert type="info" showIcon style={{ marginBottom: 'var(--gw-sp-8)' }}
           message={`${pendingNew} 条新分歧`}
@@ -575,6 +653,8 @@ export default function L2Page() {
               ]} />
             <Input.Search size="small" allowClear placeholder="搜内容/文件名" style={{ width: 200 }}
               onSearch={(v) => setQ(v)} />
+            <Button size="small"
+              onClick={() => window.open(`/admin/api/l2-divergences/export?${win}&cell=${encodeURIComponent(cellF)}&labeled=${labeledF}`)}>导出</Button><Tip text="按当前窗口/分歧类型/标注筛选导出 JSONL（含标注，不受上方关键词搜索影响），喂训练管道或离线分析。" />
             <Select size="small" value={autoModel} onChange={setAutoModel} style={{ width: 200 }}
               options={autoModels.map((m) => ({ value: m.value, label: m.label }))} />
             <Button size="small" loading={autoBusy} onClick={runAutoLabel}>模型自动标注</Button><Tip text="让内网模型先给未标注的分歧样本出草稿，你点「采纳」才写进标注（模型说的不算数）。" />

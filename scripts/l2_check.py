@@ -5,7 +5,7 @@
 
 不带参数 = 取盘上版本号最大的 checkpoint（通常就是刚训完那个）。做四件事：
   1. 打印 var/l2-reports/vN.json 的三门（battery / 标注回归 / 分歧回归）+ 相对上一版 diff
-  2. 起 8004 临时服务加载候选（**显式 PID**，别用 pgrep，见 agents/gotchas.md）
+  2. 起 8004 临时服务加载候选（**显式 PID**，别用 pgrep）
   3. 候选与现役各跑一遍 scripts/eval_ood_holdout.py（220 条分布外），并排对比
   4. 收尾 kill 8004（try/finally，崩了也不留进程占 GPU5）
 

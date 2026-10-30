@@ -9,6 +9,7 @@ import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
 import DailyHeatmap, { dailyPointsFromChart } from './components/DailyHeatmap.jsx';
 import { ProviderHealthCard } from './components/ProviderPage.jsx';
 import { SuggestionCard } from './components/KeyRulesPage.jsx';
+import Arrow from './components/Arrow.jsx';
 
 // ---------------- 降级事件流：流式降级 / 本地路由 / L2 不可用（数据源 audit_logs） ----------------
 // Tag 用 antd 预设色名（浅底深字，AA 达标）；计数文字用语义色变量（深浅各自达标）——
@@ -66,7 +67,7 @@ function EventStreamCard({ events, go }) {
           </Space>
           {/* 跳转入口与「Provider 健康检查」卡的「Provider 管理 →」同款：link 按钮放 extra */}
           <Tooltip title="跳审计页：降级事件明细（本地路由 / 流式降级 / L2 不可用，同一时间窗）">
-            <Button type="link" size="small" style={{ padding: 0 }} onClick={nav}>审计明细 →</Button>
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={nav} icon={<Arrow />} iconPosition="end">审计明细</Button>
           </Tooltip>
         </Space>
       }>
@@ -104,7 +105,7 @@ function Kpi({ testid, title, value, suffix, color, bar, go, hint }) {
       onKeyDown={go ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); nav(); } } : undefined}
       style={{ borderLeft: `3px solid ${bar ?? color ?? '#e2e4ea'}`, cursor: go ? 'pointer' : 'default' }}
       styles={{ body: { height: 96, padding: 'var(--gw-sp-12) var(--gw-sp-16)', display: 'flex', flexDirection: 'column' } }}>
-      <T type="secondary" style={{ fontSize: 'var(--gw-fs-14)', height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 'var(--gw-sp-4)', fontSize: 20, lineHeight: 1, color: 'var(--gw-primary)' }}>→</span>}</T>
+      <T type="secondary" style={{ fontSize: 'var(--gw-fs-14)', height: 20, display: 'flex', alignItems: 'center' }}>{title}{go && <span style={{ marginLeft: 'var(--gw-sp-4)', color: 'var(--gw-primary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', height: 20, lineHeight: 0 }}><Arrow size={16} /></span>}</T>
       {/* 24→32：5 个 KPI 是总览页唯一的量化入口，字号小要眯眼看 */}
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 'var(--gw-sp-6)' }}>
         <T strong style={{ fontSize: 32, lineHeight: 1.25, color, whiteSpace: 'nowrap' }}>{value}</T>
@@ -123,7 +124,7 @@ function ChartPanel({ title, go, children, fill }) {
       // fill：卡片体变成纵向 flex，内容（热力图）才能拉满卡高
       styles={fill ? { body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } } : undefined}
       extra={go ? (
-      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }}>详情 →</Button>) : null}>
+      <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = go; }} icon={<Arrow />} iconPosition="end">详情</Button>) : null}>
       {children}
     </Card>
   );
@@ -150,11 +151,12 @@ export default function OverviewPage() {
     // 不能把刚切窗接上的遮罩立刻拆掉
     const seq = ++seqRef.current;
     try {
-      const [ts, ov, ch, ev] = await Promise.all([
+      const [ts, ov, ch, ev, bill] = await Promise.all([
         get('/admin/metrics/timeseries?recent=20'),
         get(`/admin/api/stats/overview?hours=${h}`),
         get(`/admin/api/stats/chart?hours=${h}`),
         get(`/admin/api/events?hours=${h}`).catch(() => null),
+        get(`/admin/api/stats/billing?hours=${h}`).catch(() => null),
       ]);
       // 切窗后旧窗请求才落地 → 丢弃，防止旧窗数据覆盖新窗（30s 轮询与切窗竞态）
       if (h !== hoursRef.current) return;
@@ -170,6 +172,7 @@ export default function OverviewPage() {
         routeLocal: ov.local_routed || 0,
         total: ov.total || 0,
         tokens: ov.tokens_total || 0,
+        cost: bill?.total_cost ?? 0,
         events: ev,
       });
       setErr('');
@@ -273,7 +276,9 @@ export default function OverviewPage() {
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-tokens" title={<>Token 用量<Tip term="token" /></>} bar="#13c2c2"
-            value={d && d.tokens ? d.tokens.toLocaleString() : '-'} go="/stats?focus=billing"
+            value={d && d.tokens ? d.tokens.toLocaleString() : '-'}
+            suffix={d && d.cost != null ? `tokens · ¥${Number(d.cost).toFixed(2)}` : 'tokens'}
+            go="/stats?focus=billing"
             hint="跳统计页并定位：Token 计费（KEY × 金额 / 每日金额）" />
         </Col>
       </Row>
@@ -285,7 +290,10 @@ export default function OverviewPage() {
             {qpsEmpty ? (
               <Alert type="info" showIcon message={qpsEmpty} />
             ) : hours <= 24 ? (
-              <UPlotChart height={300} yVal={qpsAxis} series={qpsSeries} />
+              <>
+                <T type="secondary" style={{ fontSize: 'var(--gw-fs-12)', display: 'block', marginBottom: 'var(--gw-sp-4)' }}>{'\u00A0'}</T>
+                <UPlotChart height={300} yVal={qpsAxis} series={qpsSeries} />
+              </>
             ) : (
               <>
                 <T type="secondary" style={{ fontSize: 'var(--gw-fs-12)', display: 'block', marginBottom: 'var(--gw-sp-8)' }}>
@@ -304,7 +312,7 @@ export default function OverviewPage() {
               <>
                 {/* 与统计页同图同编码：点大小含义只在那里有提示，落地页补同款 */}
                 <T type="secondary" style={{ fontSize: 'var(--gw-fs-12)', display: 'block', marginBottom: 'var(--gw-sp-4)' }}>
-                  散点：点大小 ∝ 桶内样本数 n（小样本桶的分位数≈单请求值）
+                  点大小 = 样本大小
                 </T>
                 <UPlotChart height={300} yVal={msAxis} series={latSeries} />
               </>

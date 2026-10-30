@@ -106,7 +106,7 @@ export default function MetricsSection({ hours = 24 }) {
       qps: { tags: qpsSeries, fmt: qpsFmt, yVal: qpsAxis, series: qpsSeries, empty: qpsEmpty },
       err: { tags: errSeries, fmt: pct, yVal: pct, series: errSeries, empty: errEmpty },
       lat: { tags: chartLatSeries, fmt: msFmt, yVal: msAxis, series: chartLatSeries, empty: latEmpty,
-            hint: '散点：点大小 ∝ 桶内样本数 n（小样本桶的分位数≈单请求值）' },
+            hint: '点大小 = 样本大小' },
       l2: { tags: [...l2LatSeries, ...l2RateSeries], fmt: msFmt, yVal: msAxis, series: l2LatSeries, empty: l2Empty,
             second: { label: 'L2 触发占比 sampled/(sampled+skipped)：白名单 key 95% 跳 L2，占比随流量构成波动', yVal: pct, series: l2RateSeries } },
     };
@@ -126,7 +126,7 @@ export default function MetricsSection({ hours = 24 }) {
               ? `${(ch.ts || []).length} 桶仅 ${nzBuckets} 桶有流量 → 日粒度（北京时区）` : null, empty: qpsEmpty },
       err: { tags: errSeries, fmt: pct, yVal: pct, series: errSeries, empty: errEmpty },
       lat: { tags: chartLatSeries, fmt: msFmt, yVal: msAxis, series: chartLatSeries, empty: latEmpty,
-            hint: '散点：点大小 ∝ 桶内样本数 n（小样本桶的分位数≈单请求值）' },
+            hint: '点大小 = 样本大小' },
       l2: null, // request_log 未记逐请求 L2 数据，大窗口无此 tab
     };
   }

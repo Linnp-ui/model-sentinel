@@ -3,6 +3,7 @@ import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, mes
 import { api, errText, usePoll } from '../api.js';
 import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
+import Arrow from './Arrow.jsx';
 
 const { Text } = Typography;
 // ---------------- Provider 注册表（routing.yaml 读写；密钥仍只走 env） ----------------
@@ -43,13 +44,9 @@ function ProviderRegistryCard() {
     delete body.api_key;
     setSaving(true);
     try {
-      const oldName = modal?.row ? modal.row.name : body.name;
-      if (modal?.row) {
-        if (body.name && body.name !== oldName) body.new_name = body.name;
-        delete body.name;
-      }
-      const name = modal?.row ? (body.new_name || oldName) : body.name;
-      if (modal?.row) await api(`/providers/${encodeURIComponent(oldName)}`, { method: 'PUT', body: JSON.stringify(body) });
+      const name = modal?.row ? modal.row.name : body.name;
+      if (modal?.row) delete body.name;
+      if (modal?.row) await api(`/providers/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify(body) });
       else await api('/providers', { method: 'POST', body: JSON.stringify(body) });
       if (keyVal) {
         try { await api(`/providers/${encodeURIComponent(name)}/key`, { method: 'PUT', body: JSON.stringify({ value: keyVal }) }); }
@@ -119,7 +116,7 @@ function ProviderRegistryCard() {
         onOk={save} confirmLoading={saving} onCancel={() => setModal(null)} destroyOnClose width={560}>
         <Form form={form} layout="vertical" size="small">
           <Form.Item name="name" label="名称" rules={[{ required: true, pattern: /^[A-Za-z0-9_-]+$/, message: '仅字母/数字/_/-' }]}>
-            <Input placeholder="如 oneapi" />
+            <Input placeholder="如 oneapi" disabled={!!modal?.row} />
           </Form.Item>
           <Form.Item name="base_url" label={<>{'base_url'}<Tip term="base_url" /></>} rules={[{ required: true }]}>
             <Input placeholder="https://api.example.com/v1" />
@@ -149,7 +146,7 @@ function ProviderRegistryCard() {
             <InputNumber min={1} max={600} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="local" label={<>{'内网 provider（local: true，内容不出境）'}<Tip term="local_provider" /></>} valuePropName="checked">
-            <Switch aria-label="内网 provider" />
+            <Switch aria-label="内网 provider" disabled={!!modal?.row} />
           </Form.Item>
         </Form>
       </Modal>
@@ -185,9 +182,9 @@ export function ProviderHealthCard({ compact = false }) {
     setChecking(false);
   };
   return (
-    <Card title="Provider 健康检查"
+    <Card title="健康检查"
       extra={<Space>
-        {compact && <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/provider'; }}>Provider 管理 →</Button>}
+        {compact && <Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/provider'; }} icon={<Arrow />} iconPosition="end">Provider 管理</Button>}
         <Button size="small" loading={checking} onClick={() => check('')}>全部检查</Button>
       </Space>}>
       <Table size="small" sticky={wideSticky()} rowKey="name" pagination={false} tableLayout="fixed" dataSource={rows || []}

@@ -5,7 +5,7 @@ import { api, errText } from '../api.js';
 // ---------------- 1.1/1.2/1.3 模型配置 ----------------
 // 外部候选表单共享项：Provider 下拉 + 按 provider 拉模型列表供模型自动补全（手输仍可用）。
 // 用于 ExternalCandidatesCard 新增/编辑弹窗、别名弹窗内"新增外部候选"。
-export function ExternalCandidateFormItems({ form }) {
+export function ExternalCandidateFormItems({ form, disabled = false }) {
   const [providers, setProviders] = useState([]);
   const [modelOpts, setModelOpts] = useState({}); // provider -> [{value,label}]
   const prov = Form.useWatch('provider', form);
@@ -28,11 +28,12 @@ export function ExternalCandidateFormItems({ form }) {
   return (<>
     <Form.Item name="provider" label="Provider" rules={[{ required: true }]}>
       <Select showSearch placeholder="选择 provider"
+              disabled={disabled}
               options={providers.map((p) => ({ value: p.name, label: p.name + (p.local ? '（内网）' : '') }))}
               onChange={(v) => loadModels(v)} />
     </Form.Item>
     <Form.Item name="model" label="模型" rules={[{ required: true }]}>
-      <AutoComplete options={modelOpts[prov] || []} style={{ width: '100%' }}
+      <AutoComplete disabled={disabled} options={modelOpts[prov] || []} style={{ width: '100%' }}
                     filterOption={(inp, opt) => String((opt && opt.value) || '').toLowerCase().includes(inp.toLowerCase())}
                     placeholder="下拉选择或手输模型名"
                      onSelect={(v, opt) => {

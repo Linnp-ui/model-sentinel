@@ -54,7 +54,7 @@ export default function CertGuidePage() {
 
       <Card title="命令行客户端">
         <Paragraph>装完 CA 后以下都不需要额外参数；未装时按需指定：</Paragraph>
-        <pre style={{ ...PRE, maxHeight: 240 }}>
+        <pre style={{ ...PRE, overflowY: 'visible' }}>
           {`# curl（--cacert 仅未装 CA 时需要；/health 免 key，装完 CA 直接访问即可）\ncurl --cacert gateway-internal-ca.crt ${origin}/health\n\n# Python / requests\nREQUESTS_CA_BUNDLE=gateway-internal-ca.crt\n\n# Node\nNODE_EXTRA_CA_CERTS=gateway-internal-ca.crt\n\n# Go (codex / reqwest)\nSSL_CERT_FILE=gateway-internal-ca.crt`}
         </pre>
       </Card>

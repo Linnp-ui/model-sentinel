@@ -20,9 +20,8 @@ RING_POINTS = 8640
 PCT_WINDOW_S = float(os.getenv("AI_GATEWAY_PCT_WINDOW_S", "300"))
 
 # ---- 落盘持久化 -----------------------------------------------------------
-# Ring.points 过去是纯内存 deque，一次部署重启（生产走 kill -9，见
-# AGENTS.d/03-deploy.md）就把 6h 运行指标清零，表现为「刚灌完流量，
-# 部署完窗口只剩几发」。这里每个 tick 追加一行 JSONL、启动时回灌尾部，
+# Ring.points 过去是纯内存 deque，一次部署重启（scripts/deploy.sh）就把 6h 运行
+# 指标清零，表现为「刚灌完流量，部署完窗口只剩几发」。这里每个 tick 追加一行 JSONL、启动时回灌尾部，
 # compaction 保证文件不无限增长。
 # 约束：uvicorn 单进程（生产 unit 无 --workers）；多进程会互相踩 compaction。
 PERSIST_ENV = "AI_GATEWAY_RING_PERSIST"

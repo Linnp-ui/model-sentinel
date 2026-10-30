@@ -5,7 +5,7 @@ import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
   FileSearchOutlined, CloudServerOutlined,
   AuditOutlined, DashboardOutlined, SafetyCertificateOutlined, ExperimentOutlined,
-  MenuFoldOutlined, MenuUnfoldOutlined, FileProtectOutlined,
+  MenuFoldOutlined, MenuUnfoldOutlined, FileProtectOutlined, DatabaseOutlined,
 } from '@ant-design/icons';
 
 // 页面级代码分割：每个页面独立 chunk，首屏只下 shell，打开哪个页才加载哪个页。
@@ -128,6 +128,7 @@ const PAGES = {
   stats: lazy(() => import('./StatsPage.jsx')),
   l2: lazy(() => import('./components/L2Page.jsx')),
   audit: lazy(() => import('./components/AuditPage.jsx')),
+  logs: lazy(() => import('./components/LogsPage.jsx')),
   password: lazy(() => import('./components/PasswordPage.jsx')),
   cert: lazy(() => import('./components/CertGuidePage.jsx')),
 };
@@ -143,6 +144,7 @@ const PAGE_TITLES = {
   stats: '统计可视化',
   l2: 'L2 影子',
   audit: '审计日志',
+  logs: '请求明细',
   password: '管理员密码',
   cert: '证书安装',
 };
@@ -201,6 +203,7 @@ const MENU_ITEMS = [
     { key: 'stats', icon: <BarChartOutlined />, label: '统计可视化' },
     { key: 'l2', icon: <SafetyCertificateOutlined />, label: 'L2 影子' },
     { key: 'audit', icon: <FileSearchOutlined />, label: '审计日志' },
+    { key: 'logs', icon: <DatabaseOutlined />, label: '请求明细' },
   ]},
   { type: 'group', label: '系统', children: [
     { key: 'password', icon: <LockOutlined />, label: '管理员密码' },

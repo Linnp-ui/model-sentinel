@@ -16,7 +16,9 @@ from src.gateway.main import app
 
 client = TestClient(app)
 
-_ASSETS = sorted(glob.glob(os.path.join("static", "admin", "assets", "*.js")))
+# 只看大于 GZipMiddleware minimum_size(1024) 的产物：小于阈值的 chunk（如 Arrow）本就不压
+_ASSETS = [p for p in sorted(glob.glob(os.path.join("static", "admin", "assets", "*.js")))
+           if os.path.getsize(p) >= 1024]
 _INDEX = os.path.join("static", "admin", "index.html")
 
 

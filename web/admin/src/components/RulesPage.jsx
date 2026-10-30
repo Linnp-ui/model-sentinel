@@ -5,6 +5,7 @@ import { api, errText, usePoll } from '../api.js';
 import { L2PromptsSection } from './ModelPolicyPage.jsx';
 import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
+import Arrow from './Arrow.jsx';
 
 const { Text } = Typography;
 import { ACTION_INFO, RuleZh } from '../ruleNames.jsx';
@@ -56,7 +57,7 @@ const SCOPE_TIPS = {
 const L2_CROSS_LINK = (
   <Tooltip title="端点 / 模型 / 超时 / 影子 / 灰区下限在「模型配置」页的审查模型卡">
     <Button type="link" size="small" style={{ padding: 0 }}
-      onClick={() => { window.location.hash = '/modelpolicy'; }}>审查模型 →</Button>
+      onClick={() => { window.location.hash = '/modelpolicy'; }} icon={<Arrow />} iconPosition="end">审查模型</Button>
   </Tooltip>
 );
 
@@ -140,6 +141,7 @@ export default function RulesPage() {
   const [editing, setEditing] = useState(null); // 规则名或 null=新增
   const [prioSort, setPrioSort] = useState('ascend'); // 优先级仅升/降两态，点击直接切换
   const [form] = Form.useForm();
+  const priorityLocked = Form.useWatch('priority_locked', form);
   const [aiLoading, setAiLoading] = useState(false);
   // 拦截模式 on_block：fallback_local（转内网回答）↔ reject（真实 403）；写 routing.yaml 热重载
   const [onBlockMode, setOnBlockMode] = useState('fallback_local');
@@ -505,7 +507,7 @@ export default function RulesPage() {
   const cols = [
     /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配。原 scroll.x=1070 定宽
        在窄屏撑出横向滚动；fixed 布局下 % 才是真·定比（auto 布局 % 只是建议值） */
-    { title: <>{'优先级'}<Tip term="rule_priority" /></>, dataIndex: 'priority', width: '10%', align: 'center', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort,
+    { title: '优先级', dataIndex: 'priority', width: '10%', align: 'center', sorter: (a, b) => a.priority - b.priority, sortOrder: prioSort,
       render: (v, rec) => (rec.priority_locked
         ? <span style={{ position: 'relative', display: 'inline-block', minWidth: '100%', textAlign: 'center' }}>
             <LockOutlined style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', color: '#faad14' }} />
@@ -567,7 +569,7 @@ export default function RulesPage() {
 
       <L2RulesCard />
 
-      <Card title="历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
+      <Card title="L1规则历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
         {versions.length ? (
           <Table rowKey="id" size="small" scroll={{ y: 400 }} pagination={false} tableLayout="fixed" dataSource={versions} columns={[
             /* 列宽全 % + tableLayout=fixed；操作列两个链接按钮，14% 够放 */
@@ -595,7 +597,7 @@ export default function RulesPage() {
 
       <Card title="L2 提示词历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
         {promptVersions.length ? (
-          <Table rowKey="id" size="small" scroll={{ y: 400 }} pagination={false} tableLayout="fixed" dataSource={promptVersions} columns={[
+          <Table rowKey="id" size="small" pagination={false} tableLayout="fixed" dataSource={promptVersions} columns={[
             { title: '时间', dataIndex: 'ts', width: '16%' },
             { title: 'system prompt 预览', width: '70%', ellipsis: true,
               render: (_, r) => {
@@ -619,23 +621,23 @@ export default function RulesPage() {
 
       <Modal title="版本内容" open={verView != null} onCancel={() => setVerView(null)}
         footer={null} width={720}>
-        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-12)' }}>{verView || ''}</pre>
+        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-14)' }}>{verView || ''}</pre>
       </Modal>
 
       <Modal title="L2 提示词版本内容" open={promptVerView != null} onCancel={() => setPromptVerView(null)}
         footer={null} width={720}>
-        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-12)' }}>{promptVerView || ''}</pre>
+        <pre style={{ maxHeight: 480, overflow: 'auto', fontSize: 'var(--gw-fs-14)' }}>{promptVerView || ''}</pre>
       </Modal>
 
       <Modal title={editing ? `编辑规则：${editing}` : '新增规则'} open={modalOpen}
         destroyOnClose onOk={submit} onCancel={requestClose} width={680}>
         <Form form={form} layout="vertical" onValuesChange={onFormValuesChange}>
           <Space style={{ width: '100%' }} size="middle">
-            <Form.Item name="name" label="规则名" rules={[{ required: true }]}>
+            <Form.Item name="name" label="规则名" rules={[{ required: true }]} htmlFor="rule-name">
               <Input id="rule-name" />
             </Form.Item>
-             <Form.Item name="priority" label={<>{'优先级（小者先）'}<Tip term="rule_priority" /></>}>
-              <InputNumber min={0} max={1000} />
+             <Form.Item name="priority" label="优先级（小者先）">
+              <InputNumber min={0} max={1000} disabled={!!priorityLocked} />
             </Form.Item>
             <Form.Item name="action" label={<>{'动作'}<Tip term="action" /></>} rules={[{ required: true }]}>
               <Select style={{ width: 140 }} options={[
@@ -726,14 +728,14 @@ export default function RulesPage() {
           </Card>
 
           <Form.Item name="when_json" label="when 条件（JSON，最终以此保存）"
-            rules={[{ required: true }]}>
-            <Input.TextArea id="rule-when-json" rows={4} style={{ fontFamily: 'monospace' }} />
+            rules={[{ required: true }]} htmlFor="rule-when-json">
+            <Input.TextArea id="rule-when-json" rows={4} />
           </Form.Item>
           <Space>
-            <Form.Item name="target_provider" label="目标 provider（可选）" style={{ marginBottom: 0 }}>
+            <Form.Item name="target_provider" label="目标 provider（可选）" style={{ marginBottom: 0 }} htmlFor="rule-target-provider">
               <Select id="rule-target-provider" showSearch allowClear style={{ width: 200 }} options={providers.map((p) => ({ value: p.name, label: p.local ? `${p.name} (local)` : p.name }))} onChange={onProviderChange} />
             </Form.Item>
-            <Form.Item name="target_model" label="目标 model（可选）" style={{ marginBottom: 0 }}>
+            <Form.Item name="target_model" label="目标 model（可选）" style={{ marginBottom: 0 }} htmlFor="rule-target-model">
               {modelsFailed ? (
               <Input id="rule-target-model" />
             ) : (

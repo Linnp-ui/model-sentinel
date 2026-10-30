@@ -29,6 +29,11 @@ body.ant-scrolling-effect { width: auto !important; }
      间距基数 4px：4 / 6（紧凑段间距）/ 8 / 12 / 16 / 24
      字号阶梯：12（次要说明）/ 13（表格正文）/ 14（正文）/ 16（卡片标题）/ 18（页面标题）/ 24（KPI 数字）
      一次性展示尺寸（图标 20 / 徽章大数字 22 / 总览 KPI 32 / 冷门单值）不进刻度，留字面量。 */
+  /* 全站唯一字体族（antd 系统栈）。<pre>/<code> 不写就是浏览器默认 monospace，
+     与控制台其他文字不同族 ⇒ 在下面统一继承这一族。 */
+  --gw-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+
   --gw-sp-4: 4px;
   --gw-sp-6: 6px;
   --gw-sp-8: 8px;
@@ -97,10 +102,18 @@ body { background: var(--gw-bg); color: var(--gw-text); }
 .ant-table-cell { white-space: nowrap; }
 /* 空表提示是用户要读的正文（如「尚未检查，点右上角…」），antd 默认 0.25 在白底仅 1.83:1 */
 .ant-table-tbody > tr.ant-table-placeholder > td { color: var(--gw-text-2) !important; }
-/* code 字号统一 12px：antd 默认 0.85em 会随父级缩到 10.2/11.9px（表内 URL、key 掩码、规则上下文名） */
-code { font-size: var(--gw-fs-12) !important; }
-/* 证书安装页例外：行内 code 芯片与步骤正文/命令块同号（14px），其余页沿用 12px */
-.cert-guide code { font-size: var(--gw-fs-14) !important; }
+/* 全站字体族统一：正文 / 代码块 / 行内 code 同一族（antd 默认系统栈）。
+   pre 不写 font-family 会落到浏览器默认 monospace、与周围正文不同族；
+   .ant-typography code 由 antd css-in-js 硬写 fontFamilyCode（SFMono），
+   故带上该选择器一起盖掉。 */
+body, pre, code, kbd, samp, .ant-typography code, .ant-typography pre,
+/* uPlot 自带 CSS 在 .uplot 上写死 system-ui 打头的栈（按需加载，样式后注入），
+   图例/轴标签是 DOM 节点 ⇒ 提高一级 specificity 盖掉 */
+body .uplot, .uplot * {
+  font-family: var(--gw-font);
+}
+/* code 字号跟随周围正文：antd 默认 0.85em 会随父级缩到 10.2/11.9px，比同格文字小一号 */
+code { font-size: 1em !important; }
 /* 每列最窄列宽：rc-table 默认 tableLayout=fixed，列宽只认 col 的 %，单元格
    min-width/内容宽都不参与布局 ⇒ ellipsis 列可被压到 0、各表横滚起点互不相同
    （2026-10 实测；auto 布局也不行——Blink 把 nowrap 全文宽当硬下限，长文本列
@@ -126,6 +139,10 @@ code { font-size: var(--gw-fs-12) !important; }
 .tbl-limits col:nth-child(5) { min-width: 150px; }
 .tbl-circuit col:nth-child(2) { min-width: 150px; }
 .tbl-circuit col:nth-child(6) { min-width: 170px; }
+.tbl-logs col:nth-child(2) { min-width: 110px; }
+.tbl-logs col:nth-child(3) { min-width: 110px; }
+.tbl-logs col:nth-child(4) { min-width: 90px; }
+.tbl-logs col:nth-child(8) { min-width: 150px; }
 /* sticky 模式下 rc-table 把表头拆成独立 <table>：表头列是实测 px 宽、表体仍走 % 宽，
    上面这些 col min-width 只会夹住表头（px 列才吃 min-width）⇒ 表头/表体列错位
    （实测 rules 7px、L2 分歧表 45px）。表头宽度本就是按表体实测回填的，无需再夹一遍 */
@@ -226,6 +243,10 @@ code { font-size: var(--gw-fs-12) !important; }
    line-height:normal(18px)，文字比旁边正文高约 1.25px（基线错位，实测墨迹行差 1.25px）。
    排除 primary（实底按钮有自己的居中口径，改行高会把文字压低）。 */
 .ant-card-extra .ant-btn-sm:not(.ant-btn-primary) { line-height: 22px !important; }
+
+/* antd 的图标容器默认 display:block，内联 SVG 会按基线偏下约 1px；
+   改成 flex 后由容器负责垂直居中。 */
+.ant-btn-icon { display: inline-flex; align-items: center; }
 
 /* default（outlined）普通按钮 = 中性描边（正文色 + 卡片底 + 描边）。
    红只留给 danger（删除/移除/回滚/打开熔断…，源码里都是

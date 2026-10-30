@@ -6,7 +6,7 @@
   给了 since 就优先于 hours（与管理台轮次切窗同口径，见 admin_api._cutoff）。
 汇总走 /admin/api/l2-shadow-stats（读 Redis 热缓存近 5000 条）；
 分歧明细走 audit_logs（MySQL，ts 存 UTC——窗口 cutoff 用 datetime.utcnow()，
-别用 SQL NOW()（北京时间），窗口条件会恒空，见 agents/gotchas.md）。
+别用 SQL NOW()（北京时间），窗口条件会恒空）。
 nc=主放影密（laya 更严），cn=主密影放（主过判密）；主判定 degraded 不可比，排除。
 """
 import base64

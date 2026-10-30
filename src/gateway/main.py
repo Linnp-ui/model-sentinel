@@ -15,7 +15,7 @@ Gateway 主入口 — 公司内网大模型请求的统一出口。
     「# ---- 端点 ----」区段          /v1/* 转发端点、/v1/files/check、/admin* 页面
     admin_api.py（include 的 router） 管理面 REST：key/规则/模型/provider/审计/L2 影子
 
-改 src/*.py 后必须重启 gateway.service 并核对 MainPID 变更（流程见 agents/deploy.md）。
+改 src/*.py 后必须重启 gateway.service 并核对 MainPID 变更（用 scripts/deploy.sh）。
 """
 
 from __future__ import annotations
@@ -262,7 +262,7 @@ async def _log_retention_startup():
             await _asyncio.sleep(6 * 3600)
 
     _asyncio.create_task(_loop())
-    # 状态条 SSE 停机收尾：unit ExecStop 先 kill -USR1 $MAINPID（见 agents/deploy.md），
+    # 状态条 SSE 停机收尾：unit ExecStop 先 kill -USR1 $MAINPID，
     # status_stream 生成器见 sse_stop 立即正常 return，别让长连接把 stop 拖满 90s 被 SIGKILL。
     from .admin_api import register_sse_stop
     register_sse_stop()
