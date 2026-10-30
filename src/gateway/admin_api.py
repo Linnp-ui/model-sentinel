@@ -83,6 +83,24 @@ _VERR_MSG_ZH = {
 }
 
 
+def _json_safe(obj):
+    """递归把异常/非 JSON 对象压成 str，保证 FastAPI 序列化不炸 500。"""
+    if isinstance(obj, BaseException):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    try:
+        import json as _j
+        _j.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
 def _verrors(e: ValidationError) -> list:
     """e.errors() 里 value_error 的 ctx 持有 ValueError 实例（非 JSON 可序列化，
     形如 {'error': ValueError(...)}），直接当 422 detail 会让 FastAPI 序列化
@@ -91,13 +109,7 @@ def _verrors(e: ValidationError) -> list:
     for err in e.errors():
         err.pop("input", None)  # 不回显原始值（密码/长文本），前端只用 loc/msg
         err.pop("url", None)    # RequestValidationError.errors() 不接受 include_url 参数
-        ctx = err.get("ctx")
-        if isinstance(ctx, BaseException):
-            ctx = str(ctx)
-        elif isinstance(ctx, dict):
-            ctx = {k: (str(v) if isinstance(v, BaseException) else v) for k, v in ctx.items()}
-        if ctx is not None and not isinstance(ctx, (str, int, float, bool, list, dict)):
-            ctx = str(ctx)
+        ctx = _json_safe(err.get("ctx"))
         if ctx is not err.get("ctx"):
             err = {**err, "ctx": ctx}
         msg = str(err.get("msg", ""))
@@ -107,6 +119,9 @@ def _verrors(e: ValidationError) -> list:
             msg = _VERR_MSG_ZH.get(err.get("type", ""), msg)
         if msg != err.get("msg"):
             err = {**err, "msg": msg}
+        # loc 可能含不可序列化对象，统一过一遍
+        if "loc" in err:
+            err = {**err, "loc": _json_safe(err.get("loc"))}
         out.append(err)
     return out
 
@@ -380,6 +395,8 @@ def list_logs_api(
     key_name: str = "",
     model: str = "",
     action: str = "",
+    provider: str = "",
+    status_code: int = 0,
     hours: float = 168.0,
 ):
     """请求明细分页（新→旧）。"""
@@ -387,8 +404,17 @@ def list_logs_api(
     since, until = _win(hours)
     return store.list_request_logs(
         limit=limit, offset=offset, ip=ip, key_name=key_name,
-        model=model, action=action, since=since, until=until,
+        model=model, action=action, provider=provider, status_code=status_code,
+        since=since, until=until,
     )
+
+
+@router.get("/logs/facets")
+def logs_facets_api(hours: float = 168.0):
+    """明细页筛选下拉选项：时间窗内 key_name/model/provider/client_ip 的 distinct 值。"""
+    store = get_admin_store()
+    since, until = _win(hours)
+    return store.request_log_facets(since, until)
 
 
 @router.post("/logs/cleanup")

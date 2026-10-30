@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Table, Button, Input, Modal, Form, Space, message, Popconfirm, Typography, Alert, Card, Tag } from 'antd';
-import { KeyOutlined, CopyOutlined, ImportOutlined } from '@ant-design/icons';
+import { Table, Button, Input, Modal, Form, Space, message, Popconfirm, Typography, Alert, Card, Tag, Dropdown } from 'antd';
+import { KeyOutlined, CopyOutlined, ImportOutlined, MoreOutlined } from '@ant-design/icons';
 import { api, errText, copyText } from '../api.js';
 import { wideSticky } from '../utils.js';
 import { Tip } from '../terms.jsx';
@@ -96,12 +96,21 @@ export default function KeysPage() {
     {
       title: '操作',
       width: '27%',
+      // 编辑/删除/⋯ 恒一行：窄屏行高不随按钮换行变高；「调用明细」收进 ⋯ 菜单
       render: (_, rec) => (
-        <Space wrap>
+        <Space>
           <Button type="link" onClick={() => openEdit(rec)}>编辑</Button>
           <Popconfirm title="确认删除该 KEY 映射？" onConfirm={() => del(rec.id)}>
             <Button type="link" data-testid={`keys-del-${rec.id}`} danger>删除</Button>
           </Popconfirm>
+          <Dropdown menu={{ items: [{
+            key: 'logs',
+            label: '调用明细',
+            title: '跳请求明细：按该 KEY 名称过滤的调用记录（含延迟 / token 分解）',
+            onClick: () => { window.location.hash = `/logs?key_name=${encodeURIComponent(rec.name || '')}`; },
+          }] }}>
+            <Button type="text" aria-label="更多操作" icon={<MoreOutlined />} />
+          </Dropdown>
         </Space>
       ),
     },

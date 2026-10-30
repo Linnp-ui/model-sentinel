@@ -16,6 +16,7 @@ export const RULE_ZH = {
   key_blacklist: '密钥黑名单',
   encoded_keyword: '编码关键词转内网',
   review_text_overflow: '超审查预算转内网',
+  local_alias_bypass: '全内网别名放行',
   // 历史旧规则名→现名
   financial_local_only: '财务表转内网',
   drawing_local_only: '图纸转内网',
@@ -36,6 +37,7 @@ const SYSTEM_RULES = new Set([
   'l2_confidential', 'l2_unavailable', 'l2_injection',
   'encoded_keyword', 'review_text_overflow',
   'first_chunk_fallback', 'prompt_too_long_fallback',
+  'local_alias_bypass',
 ]);
 
 // 动作（audit_logs.action）→ [中文名, Tag 底色]：审计页与总览降级事件流共用一张表

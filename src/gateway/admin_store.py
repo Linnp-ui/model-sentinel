@@ -1833,6 +1833,8 @@ class AdminStore:
         key_name: str = "",
         model: str = "",
         action: str = "",
+        provider: str = "",
+        status_code: int = 0,
         since: str = "",
         until: str = "",
     ) -> dict:
@@ -1846,6 +1848,10 @@ class AdminStore:
             rows = [r for r in rows if r.get("model") == model]
         if action:
             rows = [r for r in rows if r.get("action") == action]
+        if provider:
+            rows = [r for r in rows if r.get("provider") == provider]
+        if status_code:
+            rows = [r for r in rows if r.get("status_code") == status_code]
         for r in rows:
             r["ts"] = _ts_str(r.get("ts"))
         rows.sort(key=lambda r: r.get("ts", ""), reverse=True)
@@ -1854,6 +1860,18 @@ class AdminStore:
         for r in items:
             r["ts"] = to_beijing(r.get("ts"))  # 展示 +8h（排序已按 UTC，顺序不变）
         return {"items": items, "total": total}
+
+    def request_log_facets(self, since: str = "", until: str = "") -> dict:
+        """明细筛选字段的窗内 distinct 值（key_name/model/provider/client_ip），供前端下拉。
+
+        走 _log_rows 同一条缓存路径，成本与一次明细分页查询相当；空值丢弃。"""
+        rows = self._log_rows(since, until)
+        out = {}
+        for f in ("key_name", "model", "provider", "client_ip"):
+            vals = {r.get(f) or "" for r in rows}
+            vals.discard("")
+            out[f] = sorted(vals)
+        return out
 
     def purge_request_logs(self, before: str) -> int:
         """删除 before（'YYYY-MM-DD HH:MM:SS'）之前的明细，返回删除行数。"""

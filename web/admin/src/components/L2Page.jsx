@@ -536,7 +536,8 @@ export default function L2Page() {
 
   return (
     <div>
-       <Card title={<>{`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`}<Tip term="shadow" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
+       <Card title={<>{`影子模型汇总${shadowVer ? `（${shadowVer}）` : ''}`}<Tip term="shadow" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}
+        extra={<Tooltip title="跳审计页：只看主判与影子判定不一致的样本"><Button type="link" size="small" style={{ padding: 0 }} onClick={() => { window.location.hash = '/audit?shadow=mismatch'; }} icon={<Arrow />} iconPosition="end">不一致样本</Button></Tooltip>}>
         {/* space-evenly + 无 column gap：左、中、右三段空白恒等（center+gap 做不到，中缝总比两边多一个 gap） */}
         <div style={{ display: 'flex', rowGap: 'var(--gw-sp-16)', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-evenly' }}>
         <Space size="large" wrap>

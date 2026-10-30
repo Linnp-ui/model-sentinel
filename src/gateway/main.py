@@ -175,7 +175,10 @@ app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 @app.exception_handler(RequestValidationError)
 async def _validation_zh(request: Request, exc: RequestValidationError):
-    """管理台请求体校验错统一中文；/v1 保持 FastAPI 原始形状（协议契约不动）。"""
+    """管理台请求体校验错统一中文；/v1 保持 FastAPI 原始形状（协议契约不动）。
+
+    两边都对 errors() 做 JSON 安全清洗：pydantic 的 value_error 上下文会携带
+    ValueError 实例，FastAPI 默认处理器直接 json.dumps 会 500。"""
     if request.url.path.startswith("/admin"):
         from src.gateway.admin_api import _verrors
         return JSONResponse(status_code=422, content={"detail": _verrors(exc)})

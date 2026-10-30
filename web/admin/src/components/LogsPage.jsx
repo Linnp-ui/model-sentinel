@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Card, Table, Button, Input, Select, Space, Tag, Typography, InputNumber, Popconfirm, message } from 'antd';
+import { Card, Table, Button, Select, Space, Tag, Typography, InputNumber, Popconfirm, message } from 'antd';
 import { DatabaseOutlined, SearchOutlined } from '@ant-design/icons';
 import { api, errText, RANGES } from '../api.js';
 import { wideSticky } from '../utils.js';
@@ -10,12 +10,25 @@ const { Text } = Typography;
 
 // 明细库（request_log）：统计/建议引擎的数据源，与审计日志页的 5000 条热窗
 // 是**两套存储**——这里查的是 MySQL 明细全量（含延迟/token 分解），无内容字段、不可展开。
-// 筛选态入 URL（#/logs?hours=..&key=..&model=..&action=..）：刷新留条件、可分享。
+// 筛选态入 URL（#/logs?hours=..&key_name=..&model=..&action=..&ip=..&provider=..&status_code=..）：
+// 刷新留条件、可分享。参数名与后端 /logs 端点一致（旧链接的 key= 仍兼容）。
 const LOG_ACTIONS = [
-  { value: '', label: '全部动作' },
   { value: 'allow', label: '放行' },
   { value: 'route_local', label: '本地路由' },
   { value: 'block', label: '拦截' },
+];
+const LOG_STATUSES = [
+  { value: '200', label: '200 成功' },
+  { value: '400', label: '400 参数错' },
+  { value: '401', label: '401 未鉴权' },
+  { value: '403', label: '403 拦截' },
+  { value: '404', label: '404 不存在' },
+  { value: '413', label: '413 过大' },
+  { value: '422', label: '422 不可处理' },
+  { value: '429', label: '429 限流' },
+  { value: '500', label: '500 内部错' },
+  { value: '502', label: '502 上游错' },
+  { value: '503', label: '503 不可用' },
 ];
 
 const cols = [
@@ -45,12 +58,20 @@ export default function LogsPage() {
   const [loading, setLoading] = useState(false);
   const [f, setF] = useState(() => {
     const p = new URLSearchParams(window.location.hash.split('?')[1] || '');
-    return { hours: p.get('hours') || '168', key: p.get('key') || '',
-             model: p.get('model') || '', action: p.get('action') || '' };
+    return { hours: p.get('hours') || '168', key_name: p.get('key_name') || p.get('key') || '',
+             model: p.get('model') || '', action: p.get('action') || '',
+             ip: p.get('ip') || '', provider: p.get('provider') || '',
+             status_code: p.get('status_code') || '' };
   });
   const [pageNo, setPageNo] = useState(1);
   const [cleanDays, setCleanDays] = useState(90);
   const [cleaning, setCleaning] = useState(false);
+  // 下拉选项 = 时间窗内 distinct 值（/logs/facets）；换时间窗重新拉
+  const [facets, setFacets] = useState({ key_name: [], model: [], provider: [], client_ip: [] });
+  const loadFacets = useCallback(async (hours) => {
+    try { setFacets(await api(`/logs/facets?hours=${hours}`)); } catch { /* 选项拉取失败不阻塞列表 */ }
+  }, []);
+  useEffect(() => { loadFacets(f.hours); }, [f.hours, loadFacets]);
   const writeUrl = (next) => {
     const p = new URLSearchParams();
     Object.entries(next).forEach(([k, v]) => { if (v) p.set(k, v); });
@@ -74,8 +95,14 @@ export default function LogsPage() {
 
   useEffect(() => { load(); }, [load, f.hours, f.action]);
 
-  const setFld = (k) => (e) => { const next = { ...f, [k]: e.target.value }; setF(next); writeUrl(next); };
   const search = () => { setPageNo(1); load(1); };
+  // 窗口 distinct 值下拉（内置搜索）：选中即查，与动作/时间窗同口径即时生效
+  const facetSel = (k, label, vals, w) => (
+    <Select style={{ width: w }} showSearch allowClear optionFilterProp="label"
+      placeholder={label} value={f[k] || undefined}
+      options={vals.map((v) => ({ value: v, label: v }))}
+      onChange={(v) => { const next = { ...f, [k]: v || '' }; setF(next); writeUrl(next); setPageNo(1); load(1); }} />
+  );
 
   const cleanup = async () => {
     setCleaning(true);
@@ -94,16 +121,21 @@ export default function LogsPage() {
           <Select style={{ width: 140 }} value={f.hours}
             options={RANGES.map((r) => ({ value: String(r.hours), label: r.label }))}
             onChange={(v) => { const next = { ...f, hours: v }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Select style={{ width: 120 }} value={f.action} options={LOG_ACTIONS}
+          <Select style={{ width: 120 }} value={f.action || undefined} options={LOG_ACTIONS} allowClear placeholder="动作"
             onChange={(v) => { const next = { ...f, action: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Input style={{ width: 150 }} placeholder="调用方（精确）" allowClear value={f.key} onChange={setFld('key')} onPressEnter={search} />
-          <Input style={{ width: 150 }} placeholder="模型（精确）" allowClear value={f.model} onChange={setFld('model')} onPressEnter={search} />
+          {facetSel('key_name', '调用方', facets.key_name, 180)}
+          {facetSel('model', '模型', facets.model, 170)}
+          {facetSel('ip', '客户端 IP', facets.client_ip, 140)}
+          {facetSel('provider', 'Provider', facets.provider, 150)}
+          <Select style={{ width: 120 }} value={f.status_code || undefined} options={LOG_STATUSES} allowClear placeholder="状态码"
+            onChange={(v) => { const next = { ...f, status_code: v || '' }; setF(next); writeUrl(next); setPageNo(1); load(1); }} />
           <Button type="primary" icon={<SearchOutlined />} onClick={search}>查询</Button>
         </Space>
       </Card>
       <Card title={<><DatabaseOutlined /> 请求明细<Tip text="数据源是 MySQL 明细库，与审计页热窗不同；仅调用元数据，行不可展开。" /></>}
         extra={
           <Space wrap>
+            <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>查调用耗时 / token / 成本（90 天全量）；查为什么拦/转内网去 <a onClick={() => { window.location.hash = '/audit'; }}>审计日志</a></Text>
             <InputNumber min={1} max={365} value={cleanDays} onChange={(v) => setCleanDays(v || 90)} style={{ width: 90 }} addonAfter="天前" />
             <Popconfirm title={`清理 ${cleanDays} 天前的全部明细？不可恢复（统计/建议引擎的历史数据会减少）。`}
               okText="确认清理" okButtonProps={{ danger: true }} onConfirm={cleanup}>

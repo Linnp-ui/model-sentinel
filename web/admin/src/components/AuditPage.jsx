@@ -114,7 +114,6 @@ const FindingsDetail = ({ f, file }) => {
 
 // ---------------- 审计日志（原 /admin 审计页） ----------------
 const AUDIT_ACTIONS = [
-  { value: '', label: '全部动作' },
   { value: 'allow', label: '放行' },
   { value: 'route_local', label: '本地路由' },
   { value: 'block', label: '拦截' },
@@ -215,7 +214,8 @@ export default function AuditPage() {
       render: (_, r) => {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
         return (
-          <Tag color={color} title={`动作：${name}｜规则：${r.rule || '—'}`} style={{ marginInlineEnd: 0 }}>
+          <Tag color={color} title={`动作：${name}｜规则：${r.rule || '—'}`} style={{ marginInlineEnd: 0, cursor: 'pointer' }}
+            onClick={() => { if (r.rule) window.location.hash = '/rules'; }}>
             {r.rule ? <RuleZh name={r.rule} /> : name}
           </Tag>
         );
@@ -238,19 +238,18 @@ export default function AuditPage() {
         <Space wrap>
           <Select style={{ width: 140 }} value={f.since} options={AUDIT_RANGES}
             onChange={(v) => { const next = { ...f, since: v }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Select style={{ width: 165 }} value={f.action} options={AUDIT_ACTIONS}
-            onChange={(v) => { const next = { ...f, action: v }; setF(next); setPageNo(1); writeUrl(next); }} />
+          <Select style={{ width: 165 }} value={f.action || undefined} options={AUDIT_ACTIONS} allowClear placeholder="动作"
+            onChange={(v) => { const next = { ...f, action: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
           <Select style={{ width: 190 }} value={f.rule || undefined} options={ruleOptions} allowClear showSearch
             optionFilterProp="label" placeholder="规则名"
             /* 下拉项显示系统内置标记（label 仍是纯字符串，搜索按名字匹配不受影响） */
             optionRender={(opt) => <RuleZh name={opt.value} />}
             onChange={(v) => { const next = { ...f, rule: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Select style={{ width: 150 }} value={f.shadow}
-            options={[{ value: '', label: '影子：全部' }, { value: 'mismatch', label: '主影不一致' }]}
+          <Select style={{ width: 150 }} value={f.shadow || undefined} allowClear placeholder="影子"
+            options={[{ value: 'mismatch', label: '主影不一致' }]}
             onChange={(v) => { const next = { ...f, shadow: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Select style={{ width: 130 }} value={f.status || ''} allowClear placeholder="状态码"
+          <Select style={{ width: 130 }} value={f.status || undefined} allowClear placeholder="状态码"
             options={[
-              { value: '', label: '状态码：全部' },
               { value: '2xx', label: '2xx 成功' },
               { value: '4xx', label: '4xx 客户端' },
               { value: '5xx', label: '5xx 错误' },
@@ -277,7 +276,8 @@ export default function AuditPage() {
           </Card>
         </>
       )}
-      <Card title={<>审计日志<Tip term="audit" /></>}>
+      <Card title={<>审计日志<Tip term="audit" /></>}
+        extra={<Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>查为什么拦/转内网（规则 / L2 判定）；查耗时和 token 去 <a onClick={() => { window.location.hash = '/logs'; }}>请求明细</a></Text>}>
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         sticky={wideSticky()}
         tableLayout="fixed"

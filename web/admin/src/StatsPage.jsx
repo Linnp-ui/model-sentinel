@@ -37,13 +37,30 @@ function HBarList({ items, testid, renderVal = (x) => String(x.count), total: to
 }
 
 // 按天计费竖向柱状图（北京日 × 金额，仅已定价行，与 daily_total 同口径）
+// 宽度实测（ResizeObserver，同 UPlotChart 模式）、高度恒定 220：
+// 页面变窄时柱变密但不压扁，天多超出最小宽时横向滚动。
 function BillDailyBars({ daily }) {
-  if (!daily || !daily.length) return <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Text type="secondary">暂无数据</Text></div>;
+  const hostRef = useRef(null);
+  const [w, setW] = useState(0);
+  useEffect(() => {
+    const el = hostRef.current;
+    if (!el) return undefined;
+    const ro = new ResizeObserver(() => setW(el.clientWidth));
+    ro.observe(el);
+    setW(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+  // host div 两种状态都渲染（ref/RO 跨空↔有数据不丢）
+  if (!daily || !daily.length) return (
+    <div ref={hostRef} style={{ overflowX: 'auto' }}>
+      <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Text type="secondary">暂无数据</Text></div>
+    </div>
+  );
   const byDay = {};
   daily.forEach((r) => { byDay[r.day] = (byDay[r.day] || 0) + (r.cost || 0); });
   const days = Object.keys(byDay).sort();
   const vals = days.map((d) => byDay[d]);
-  const W = 900, H = 220, padL = 48, padR = 10, padT = 24, padB = 26;
+  const W = Math.max(w || 900, days.length > 10 ? days.length * 38 : 0), H = 220, padL = 48, padR = 10, padT = 24, padB = 26;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const maxV = Math.max(0.0001, ...vals);
   const slot = plotW / days.length;
@@ -51,9 +68,9 @@ function BillDailyBars({ daily }) {
   const step = Math.ceil(days.length / 15);
   const y = (v) => padT + plotH * (1 - v / maxV);
   return (
-    <div style={{ overflowX: 'auto' }}>
-    <svg data-testid="billing-daily-bars" viewBox={`0 0 ${W} ${H}`}
-      style={{ display: 'block', width: '100%', minWidth: days.length > 10 ? days.length * 38 : undefined }}>
+    <div ref={hostRef} style={{ overflowX: 'auto' }}>
+    <svg data-testid="billing-daily-bars" width={W} height={H}
+      style={{ display: 'block' }}>
       {[0, 0.5, 1].map((g) => (
         <g key={g}>
           <line x1={padL} x2={W - padR} y1={y(maxV * g)} y2={y(maxV * g)} stroke="var(--gw-border)" />
