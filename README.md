@@ -37,6 +37,10 @@
 |---|---|---|
 | ![provider](docs/screenshots/admin-provider.png) | ![keys](docs/screenshots/admin-keys.png) | ![l2](docs/screenshots/admin-l2.png) |
 
+| 请求明细（调用耗时/Token 分解/成本，90 天留存） | | |
+|---|---|---|
+| ![logs](docs/screenshots/admin-logs.png) | | |
+
 ## 特性
 
 - **文件维度预检**：xlsx 表名/表头/内容、PDF 文本层/水印、docx、图片 OCR（tesseract/paddle，
