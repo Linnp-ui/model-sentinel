@@ -141,7 +141,6 @@ tests/             pytest 套件（零出境隔离，fixtures/ 含图纸 PDF 与
 static/            管理台前端构建产物（/admin 直服，须与 web/admin 同提交）
 web/admin/         管理台前端源码（React+antd+uPlot，npm run build 输出到 static/admin）
 docs/              用户说明书 / 管理台操作手册 / 内网 CA 安装说明（docs/https-cert-install.md）
-agents/            分层运维文档（部署 / vLLM 主机 / 策略路由 / env / 坑位记录）
 scripts/           内网 vLLM/Laya systemd 模板、L2 数据集/微调/评估（OOD/留出）、
                    候选体检 l2_check.py、标注挖掘 mine_audit_labels.py、影子轮次 shadow_pulse.py、灰区灌数
 policy.yaml        策略（priority 升序命中即停，Pydantic 强校验）
@@ -175,5 +174,4 @@ docker-compose.yml / Dockerfile
 - **生产启动强校验**（2026-10-27 起，仅启用 admin 密码时）：明细/审计库 URL 未配置、
   `AI_GATEWAY_L2_FAIL_MODE=open`（L2 挂了放行会泄密）、dev key 仍是默认弱值 ⇒ 启动即失败，
   把「配错静默落内存 / 静默泄密」挡在门外；dev/测试无 admin 密码则跳过
-- 客户端接入只需改 `base_url` + `api_key`，SDK 代码不动；Claude Code / Codex CLI 接入见
-  `agents/policy-routing.md`
+- 客户端接入只需改 `base_url` + `api_key`，SDK 代码不动
