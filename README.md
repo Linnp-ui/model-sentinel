@@ -66,6 +66,23 @@
   L2 配置/提示词（历史版本回滚）、审计查询（状态码筛选）/CSV 导出、日志明细查询（MySQL 全量，含延迟/token 分解）、route-inspect 全链路干跑、熔断手动开关
 - **文档**：`docs/user-manual.md`（用户接入）/ `docs/admin-manual.md`（管理台操作）
 
+## 系统流程
+
+```mermaid
+flowchart LR
+  C[客户端] --> G[Gateway :8080]
+  G --> A[鉴权]
+  A --> F[文件预检]
+  F --> L1[L1 规则]
+  L1 -->|灰区| L2[L2 小模型]
+  L1 --> P[策略引擎]
+  L2 --> P
+  P -->|allow| E[外网 Provider]
+  P -->|route_local| I[内网模型]
+  P -->|block| B[拦截/转内网]
+  G --> AU[审计日志]
+```
+
 ## 快速开始
 
 ```bash
