@@ -84,6 +84,11 @@ class SessionStore:
         self._r_disabled = False
         self._try_connect()
 
+    def reset(self) -> None:
+        """清空内存态会话（测试隔离用；不碰 Redis）。"""
+        with self._mem_lock:
+            self._mem.clear()
+
     def _try_connect(self):
         url = os.getenv("REDIS_URL", "").strip()
         if not url or redis is None:

@@ -182,7 +182,7 @@ export default function StatsPage() {
   // 失败横幅（总览页同款口径）：首拉失败时 !ov 会让 Spin 恒转，用户只看到死转圈
   const [err, setErr] = useState('');
   useEffect(() => { if (focus === 'billing') billingRef.current?.scrollIntoView({behavior:'smooth',block:'start'}); }, [billing]);
-  // 规则命中（audit_logs 窗口聚合，排除 默认放行 与 L2 判决 l2_confidential/l2_unavailable）：比 group_rule 的 26 个 label
+  // 规则命中（audit_logs 窗口聚合，排除 默认放行 与 全内网别名放行；L2 判决/系统内置判定计入）：比 group_rule 的 26 个 label
   // （top=「(unknown)」57.5%）信息量大——只有真实 firing 的规则 + 次数 + 最后命中
   const [ruleHits, setRuleHits] = useState(undefined);
 

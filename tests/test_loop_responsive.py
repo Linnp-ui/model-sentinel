@@ -41,7 +41,7 @@ def _health_elapsed(client) -> float:
 
 def _chat_threaded(client, result: dict):
     """后台线程发一个走 allow 全链路（mock 上游）的 chat 请求。"""
-    body = {"model": "AB-flash", "messages": [{"role": "user", "content": "你好"}]}
+    body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "你好"}]}
     result["resp"] = client.post("/v1/chat/completions", headers=H, json=body)
 
 

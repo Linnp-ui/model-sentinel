@@ -125,6 +125,10 @@ from .identity import (
 # 审计归因：当前请求的调用方 key（由 _admin_ip_filter_mw 在 /v1/* 写入）。
 # 中间件是 async，set 后在同一请求 task 的 handler/log_entry 内可见。
 _CURRENT_CLIENT_KEY: ContextVar[str] = ContextVar("gw_client_key", default="")
+# 请求级 req_id：_admin_ip_filter_mw 在 /v1/* 生成，同一请求的审计行（log_entry 的
+# entry["id"] → audit_logs.req_id）与明细行（request_log.req_id）共用 ⇒ 审计页可按
+# req_id 联查明细的延迟/token。非 /v1 路由不 set，log_entry 回落自生成（行为不变）。
+_CURRENT_REQ_ID: ContextVar[str] = ContextVar("gw_req_id", default="")
 # 审计归因：当前请求文本的风险分（_review_text / 各 inspect_text 调用点写入，log_entry 自动补 risk_score）。
 _CURRENT_RISK: ContextVar = ContextVar("gw_risk_score", default=None)
 # 审计归因：当前请求文本的 L1 命中构成（与风险分同点写入，log_entry 自动补 findings；
@@ -863,9 +867,12 @@ def _chat_session_id(messages):
         if not isinstance(messages, list):
             return None
         for m in messages:
-            if not isinstance(m, dict) or m.get("role") != "user":
+            # 端点传进来的是 ChatReq.messages（ChatMessage pydantic 对象），
+            # 单测/旧调用传 dict；两种都要认，否则指纹恒 None（会话粘性失效）。
+            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+            if role != "user":
                 continue
-            c = m.get("content")
+            c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
             if isinstance(c, str):
                 first = c
             elif isinstance(c, list):
@@ -1575,6 +1582,30 @@ def _wl_l2_skip(request: Optional[Request]) -> bool:
     return skip
 
 
+def _key_tier_middle(request: Optional[Request]) -> bool:
+    """KEY 中间档（kind=middle）：强制转内网，跳过 L1+L2（内容不出境，无需审查）。
+
+    判定按请求缓存；任何异常都不命中（保持现状，不误放过）。
+    """
+    if request is None:
+        return False
+    cached = getattr(request.state, "gw_key_middle", None)
+    if cached is not None:
+        return cached
+    hit = False
+    try:
+        from . import admin_api as _admin_api
+        raw = _CURRENT_CLIENT_KEY.get() or ""
+        hit = bool(raw) and _admin_api.key_verdict(raw) == "middle"
+    except Exception:
+        hit = False
+    try:
+        request.state.gw_key_middle = hit
+    except Exception:
+        pass
+    return hit
+
+
 def _review_file_ctx(file_ctx: Optional[dict]) -> dict:
     """responses \u9644\u4ef6\u4e0a\u4e0b\u6587\u5e76\u5165 L1 ctx\uff08\u65e0\u5219\u5168\u7a7a\uff1b\u53ea\u53d6\u767d\u540d\u5355\u952e\uff09\u3002"""
     base = {"ext": "", "filename": "", "headers": [], "sheet_names": [], "text": ""}
@@ -1707,6 +1738,9 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
     _intent_ctx_reset(None)   # 同 task 二次审查（files_check）时不留上一轮的档位
     if model and _all_local_alias(model):
         return {"action": "allow", "name": "local_alias_bypass"}, {}, None
+    # KEY 中间档：强制转内网，跳过 L1+L2（route_local 在 resolve 里等价 force_local）
+    if _key_tier_middle(request):
+        return {"action": "route_local", "name": "key_middle_local"}, {}, None
 
     # F1: inspect_text 也走线程池——512KB 预算内的对抗文本（海量 b64/hex 候选、
     # 数字簇）单次仍有 ~150ms 纯 CPU，同步跑会阻塞事件循环（其他用户一起停）。
@@ -2157,7 +2191,9 @@ def log_entry(entry: dict, *, count: bool = True):
 
     # 显式 UTC 落库，不依赖宿主 TZ（展示层 to_beijing +8h）
     entry["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    entry["id"] = str(uuid.uuid4())[:8]
+    # 同一请求的审计行与明细行共用 req_id（中间件 _admin_ip_filter_mw 在 /v1/* 生成），
+    # 审计页按它联查明细的延迟/token。非 /v1 路由 ContextVar 为空 ⇒ 回落自生成（行为不变）。
+    entry["id"] = _CURRENT_REQ_ID.get() or str(uuid.uuid4())[:8]
     if not entry.get("token_masked"):
         _ck = _CURRENT_CLIENT_KEY.get()
         if _ck:
@@ -3763,7 +3799,7 @@ def _audit_shadow_mismatch(e) -> bool:
     return sl in ("CONFIDENTIAL", "NORMAL") and not l2.get("degraded") and sl != l2.get("label")
 
 
-def _audit_filter_rows(rows, *, ip="", token="", action="", provider="", rule="", type_="",
+def _audit_filter_rows(rows, *, ip="", token="", action="", provider="", model="", rule="", type_="",
                        q="", shadow="", since_dt=None, until_dt=None, status=""):
     """审计行统一筛选（列表接口与 CSV 导出共用，避免两处口径漂移）。
 
@@ -3790,6 +3826,11 @@ def _audit_filter_rows(rows, *, ip="", token="", action="", provider="", rule=""
         provider = provider.strip()
         if provider:
             out = [e for e in out if (e.get("provider") or "") == provider]
+    if model:
+        model = model.strip()
+        if model:
+            # model 列 = 实际应答模型（log_entry 写时已解析别名），精确匹配同 provider 口径
+            out = [e for e in out if (e.get("model") or "") == model]
     if rule:
         rule = rule.strip()
         if rule:
@@ -3993,6 +4034,14 @@ async def _admin_ip_filter_mw(request: Request, call_next):
     if not path.startswith("/v1/"):
         return await call_next(request)
 
+    # 请求级 req_id：本请求的审计行（log_entry 读 ContextVar）与明细行（下方显式传参）
+    # 共用，审计页按 req_id 联查明细的延迟/token。8 位 hex，与旧 audit id 同宽。
+    _req_id = uuid.uuid4().hex[:8]
+    try:
+        _CURRENT_REQ_ID.set(_req_id)
+    except Exception:
+        pass
+
     # 审计归因：/v1/* 请求的调用方 key 落 ContextVar，log_entry 自动补 token_masked
     _ck = ""
     _ident = None
@@ -4037,6 +4086,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
                 client_ip=_resolve_client_ip(request),
                 key_name=getattr(_ident, "name", "") or "",
                 key_id=getattr(_ident, "key_id", None) or 0,
+                req_id=_req_id,
                 action="block",
                 status_code=403,
                 blocked_reason="key_blacklist",
@@ -4127,6 +4177,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
                         client_ip=_resolve_client_ip(request),
                         key_name=_key_name,
                         key_id=_key_id,
+                        req_id=_req_id,
                         model=_model,
                         action=_act,
                         blocked_reason=_breason,
@@ -4190,6 +4241,7 @@ async def _admin_ip_filter_mw(request: Request, call_next):
                 client_ip=_resolve_client_ip(request),
                 key_name=_key_name,
                 key_id=_key_id,
+                req_id=_req_id,
                 model=_model,
                 action=_act,
                 blocked_reason=_breason,

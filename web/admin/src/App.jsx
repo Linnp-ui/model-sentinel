@@ -5,7 +5,7 @@ import {
   KeyOutlined, StopOutlined, ApiOutlined, LockOutlined, BarChartOutlined,
   FileSearchOutlined, CloudServerOutlined,
   AuditOutlined, DashboardOutlined, SafetyCertificateOutlined, ExperimentOutlined,
-  MenuFoldOutlined, MenuUnfoldOutlined, FileProtectOutlined, DatabaseOutlined,
+  MenuFoldOutlined, MenuUnfoldOutlined, FileProtectOutlined,
 } from '@ant-design/icons';
 
 // 页面级代码分割：每个页面独立 chunk，首屏只下 shell，打开哪个页才加载哪个页。
@@ -128,7 +128,6 @@ const PAGES = {
   stats: lazy(() => import('./StatsPage.jsx')),
   l2: lazy(() => import('./components/L2Page.jsx')),
   audit: lazy(() => import('./components/AuditPage.jsx')),
-  logs: lazy(() => import('./components/LogsPage.jsx')),
   password: lazy(() => import('./components/PasswordPage.jsx')),
   cert: lazy(() => import('./components/CertGuidePage.jsx')),
 };
@@ -144,7 +143,6 @@ const PAGE_TITLES = {
   stats: '统计可视化',
   l2: 'L2 影子',
   audit: '审计日志',
-  logs: '请求明细',
   password: '管理员密码',
   cert: '证书安装',
 };
@@ -202,8 +200,8 @@ const MENU_ITEMS = [
   { type: 'group', label: '观测', children: [
     { key: 'stats', icon: <BarChartOutlined />, label: '统计可视化' },
     { key: 'l2', icon: <SafetyCertificateOutlined />, label: 'L2 影子' },
+    // 请求明细 2026-11 并入审计日志页内页签（单一入口）；老 #/logs 链接由 readPage 落到本页
     { key: 'audit', icon: <FileSearchOutlined />, label: '审计日志' },
-    { key: 'logs', icon: <DatabaseOutlined />, label: '请求明细' },
   ]},
   { type: 'group', label: '系统', children: [
     { key: 'password', icon: <LockOutlined />, label: '管理员密码' },
@@ -216,7 +214,9 @@ const PAGE_ICONS = Object.fromEntries(
 
 const readPage = () => {
   // hash 可带页内 query（如 #/audit?q=..），取 ? 前的段做页面路由
-  const h = window.location.hash.replace(/^#\/?/, '').split('?')[0];
+  let h = window.location.hash.replace(/^#\/?/, '').split('?')[0];
+  // 请求明细已并入审计日志页内页签：老 #/logs 链接落到审计页（readTab 见 hash 段 logs 自动进明细页签）
+  if (h === 'logs') h = 'audit';
   return h in PAGES ? h : 'overview';
 };
 

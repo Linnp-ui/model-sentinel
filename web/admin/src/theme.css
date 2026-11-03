@@ -178,6 +178,19 @@ code { font-size: 1em !important; }
    宽度在 rc-table 注入的 <col class="ant-table-expand-icon-col"> 上（fixed 布局 col 压过 th，
    选 th 的 .ant-table-row-expand-icon-cell 不生效，2026-10 实测） */
 .audit-table .ant-table-expand-icon-col { width: 24px !important; }
+/* 审计页两个 item（2026-11 迭代）：
+   item1 = 页签栏 +「其他」（筛选/KPI；明细页签 = 筛选）——外框 .audit-tabmerge
+   承接卡片的 1px 边框（--gw-border）/10px 圆角/白底，overflow hidden 裁内块圆角，
+   内部各 Card 去边框圆角变内部分区；页签底线（ink-bar 轨道线）即表头与内容的分隔线。
+   item2 =「审计日志」表/明细表 = 外框外的独立普通卡片（外框 margin-bottom 16px 出间距）。
+   页签栏本体：small 默认上下 8px 留白收 4px（栏高刚好包住 22px 内容）、
+   nav 16px 下 margin 删掉、nav-wrap 左 padding 20px（页签不贴左缘）。 */
+.audit-tabmerge { border: 1px solid var(--gw-border); border-radius: 10px;
+  background: var(--gw-surface); overflow: hidden; margin-bottom: 16px; }
+.audit-tabmerge .ant-card { border: none !important; border-radius: 0; }
+.audit-tabs .ant-tabs-tab { padding-block: 4px !important; }
+.audit-tabs .ant-tabs-nav { margin-bottom: 0 !important; }
+.audit-tabs .ant-tabs-nav-wrap { padding-left: 20px !important; }
 /* 审计表 L2 展开详情：单 td 横跨整表，全局居中会让它悬浮在宽屏空带中间。
    宽度由组件侧 maxWidth+margin:auto 收口，这里把文字翻回左对齐（散文左对齐更好读，同省略列例外口径）。 */
 .audit-l2detail { text-align: left !important; }

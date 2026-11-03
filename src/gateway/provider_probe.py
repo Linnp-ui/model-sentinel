@@ -15,11 +15,13 @@ import asyncio
 import os
 import threading
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
 from .providers import load_routing
 from .routing import upstream_proxy
+from .small_model import _shadow_url
 
 # 探测间隔（默认 30s，比状态条 60s 推送更密，模型挂了最快 30s 内亮灯）
 _INTERVAL_S = float(os.getenv("AI_GATEWAY_PROVIDER_PROBE_INTERVAL", "30"))
@@ -63,12 +65,44 @@ def probe_one(prov, timeout: float = _TIMEOUT_S) -> dict:
     return entry
 
 
+def probe_shadow(timeout: float = _TIMEOUT_S) -> dict | None:
+    """影子 L2（laya 8003）存活：GET {origin}/health。未配 AI_GATEWAY_L2_SHADOW_URL 返回 None。
+
+    背景（2026-11-03）：v35 残缺权重致 laya-l2 崩溃循环 15.5h，期间 /health 全绿——
+    影子后端不在 provider 列表里，是上一轮监控盲区。判定口径与 provider 探活一致：端点通 + ok。
+    """
+    url = _shadow_url()
+    if not url:
+        return None
+    p = urlsplit(url)
+    entry: dict = {"name": "laya_shadow", "ok": False, "local": True}
+    t0 = time.monotonic()
+    try:
+        resp = httpx.get(f"{p.scheme}://{p.netloc}/health", timeout=timeout, trust_env=False)
+        entry["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        entry["status"] = resp.status_code
+        if resp.status_code == 200:
+            data = resp.json()
+            entry["ok"] = bool(data.get("ok"))
+            entry["model"] = data.get("model")
+        else:
+            entry["error"] = f"上游 HTTP {resp.status_code}"
+    except Exception as e:
+        entry["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        entry["error"] = repr(e)[:200]
+    entry["checked_at"] = time.time()
+    return entry
+
+
 def _round() -> None:
     """打一轮：全部 provider 顺序探测，写入缓存。在 worker 线程跑（不占事件循环）。"""
     cfg = load_routing()
     results = {}
     for name, prov in cfg.providers.items():
         results[name] = probe_one(prov)
+    sh = probe_shadow()
+    if sh is not None:
+        results["laya_shadow"] = sh
     with _lock:
         _liveness.update(results)
 

@@ -2,11 +2,17 @@
 Description=Laya multilingual decision model (L2 confidential classifier, port 8003, GPU 5)
 After=network-online.target
 Wants=network-online.target
+# 5/60s：单轮「启动→崩溃→重启」实测约 9s（6.7 次/分），10/60s 永远触发不到，
+# 会像 2026-11-03 v35 事故那样无限重试 15h+。5 次约 45s 内停住，进 failed 等人工处理。
+# 必须在 [Unit] 段：写进 [Service] 会被 systemd 忽略（systemd-analyze verify 会报）。
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 # 模板说明：本文件应与 /etc/systemd/system/laya-l2.service 保持一致。
 # 改动后：备份已装版本 → diff 核对 → cp 到 /etc → daemon-reload → 重启 → /health 核对
-# model 身份（配方见 AGENTS.md 部署节）。现役影子权重见 var/laya-l2.env（v30，2026-09-30 实查）。
+# model 身份（配方见 AGENTS.md 部署节）。现役影子权重见 var/laya-l2.env（v34，2026-11-03 实查；
+# v35 训练 3/4 epoch 中断未写 rl_agent_config.json，勿指回 v35 目录）。
 Type=simple
 User=your-user
 WorkingDirectory=/home/your-user
@@ -31,11 +37,9 @@ ExecStart=/home/your-user/venvs/laya/bin/python /home/your-user/gateway/scripts/
 
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=10
-StartLimitIntervalSec=60
 
-StandardOutput=append:/home/your-user/gateway/laya_l2.log
-StandardError=append:/home/your-user/gateway/laya_l2.log
+StandardOutput=append:/home/your-user/gateway/logs/laya_l2.log
+StandardError=append:/home/your-user/gateway/logs/laya_l2.log
 
 [Install]
 WantedBy=multi-user.target

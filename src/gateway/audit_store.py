@@ -622,6 +622,16 @@ class AuditStore:
             return {"enabled": False, "reason": "AUDIT_MYSQL_URL not set or pymysql not installed"}
         return self._mysql_writer.status()
 
+    def redis_status(self) -> dict:
+        """Redis 热窗状态（供告警/状态条读，不解析 backend() 字符串）。
+        未配 REDIS_URL 时同样返回 enabled=False，由调用方按 env 决定是否告警。"""
+        if self._r is not None:
+            return {"enabled": True, "retry_in": 0}
+        retry_in = 0
+        if self._r_disabled and self._r_disabled_since is not None:
+            retry_in = max(0, int(REDIS_RETRY_INTERVAL - (time.time() - self._r_disabled_since)))
+        return {"enabled": False, "retry_in": retry_in}
+
     def query_mysql(self, since: Optional[datetime] = None, until: Optional[datetime] = None,
                     action: Optional[str] = None, rule: Optional[str] = None,
                     type_: Optional[str] = None, limit: int = 5000) -> List[dict]:

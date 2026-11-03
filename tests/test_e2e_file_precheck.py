@@ -29,7 +29,7 @@ client = TestClient(app)
 KEY = "sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o"
 H = {"Authorization": f"Bearer {KEY}"}
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
-MODEL = "AB-flash"
+MODEL = "deepseek-flash"
 # 内容命中类规则：财务表 p10 / 隐私加权 p20，谁先取决于 policy 顺序，两者都算「内容预检生效」
 CONTENT_RULES = ("financial_local_only", "pii_weighted_route_local")
 # fail-closed 类规则：空图 p30 / 未解析二进制 p13

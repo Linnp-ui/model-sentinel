@@ -41,7 +41,7 @@ def test_responses_raw_b64_file_data_fail_closed():
     """file_data 不带 data: 前缀（裸 base64）必须 fail-closed，不得静默跳过
     （对齐解码失败/未知 source 口径，回归 2026-10-29 口径不一致）"""
     r = client.post("/v1/responses", headers=H, json={
-        "model": "AB-flash",
+        "model": "deepseek-flash",
         "input": [{"role": "user", "content": [
             # 首条用户文本与文件名均须全套件唯一：codex 会话指纹=首条 user 消息哈希
             # （撞会话 ⇒ p12 抢先）；responses 会把 input_file 文件名合成进审查文本
@@ -65,7 +65,7 @@ def _png_data_url(text):
 
 def test_chat_inline_confidential_hits_file_rule():
     r = client.post("/v1/chat/completions", headers=H, json={
-        "model": "AB-flash",
+        "model": "deepseek-flash",
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "识别这张图的标记（回归用例）"},
             {"type": "image_url", "image_url": {"url": _png_data_url("CONFIDENTIAL")}}]}]})

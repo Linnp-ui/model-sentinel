@@ -18,6 +18,7 @@ RULE_ZH = {
     "first_chunk_fallback": "首块转内网",
     "prompt_too_long_fallback": "长提示转内网",
     "key_blacklist": "密钥黑名单",
+    "key_middle_local": "密钥中间档转内网",
     "encoded_keyword": "编码关键词转内网",
     "review_text_overflow": "超审查预算转内网",
     "local_alias_bypass": "全内网别名放行",
@@ -41,7 +42,7 @@ SYSTEM_RULES = frozenset({
     "l2_confidential", "l2_unavailable", "l2_injection",
     "encoded_keyword", "review_text_overflow",
     "first_chunk_fallback", "prompt_too_long_fallback",
-    "local_alias_bypass",
+    "local_alias_bypass", "key_middle_local",
 })
 
 

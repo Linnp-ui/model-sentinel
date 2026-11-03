@@ -127,11 +127,13 @@ _FILE_MARK_RULES = frozenset({
 })
 
 
-# 可用性兜底规则：转本地不是因为内容判密，而是因为系统不可用/超预算。
-# 这类命中**不标会话机密**——否则 L2 抖一次（或长文超预算），整个对话被锁本地 7 天。
+# 可用性/策略兜底规则：转本地不是因为内容判密，而是系统不可用/超预算/KEY 中间档。
+# 这类命中**不标会话机密**——否则 L2 抖一次（或长文超预算）整个对话被锁本地 7 天；
+# KEY 中间档是调用方策略（撤档后不该残留会话机密）。
 NON_CONFIDENTIAL_RULES = frozenset({
     "l2_unavailable", "review_text_overflow",
     "first_chunk_fallback", "prompt_too_long_fallback",
+    "key_middle_local",
 })
 
 

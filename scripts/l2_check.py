@@ -4,7 +4,7 @@
     .venv/bin/python scripts/l2_check.py [版本号]
 
 不带参数 = 取盘上版本号最大的 checkpoint（通常就是刚训完那个）。做四件事：
-  1. 打印 var/l2-reports/vN.json 的三门（battery / 标注回归 / 分歧回归）+ 相对上一版 diff
+  1. 打印 var/l2-reports/vN.json 的三门（battery / 标注回归 / 分歧回归）+ 相对现役版本 diff
   2. 起 8004 临时服务加载候选（**显式 PID**，别用 pgrep）
   3. 候选与现役各跑一遍 scripts/eval_ood_holdout.py（220 条分布外），并排对比
   4. 收尾 kill 8004（try/finally，崩了也不留进程占 GPU5）
@@ -80,7 +80,7 @@ def print_gates(ckpt: str) -> None:
     print(f"[三门] battery {b.get('correct')}/{b.get('total')}  {cats}")
     print(f"       标注回归 {lb.get('matched')}/{lb.get('total')}   分歧回归 {dg.get('matched')}/{dg.get('total')}")
     reg = r.get("regressions") or {}
-    print(f"       相对 v{reg.get('against')}: 新退 {reg.get('new')}  修好 {reg.get('fixed')}")
+    print(f"       相对现役版本 v{reg.get('against')}: 新退 {reg.get('new')}  修好 {reg.get('fixed')}")
 
 
 def start_8004(ckpt: str):

@@ -50,6 +50,15 @@ def _mock_external(monkeypatch):
     monkeypatch.setattr(_rt, "_mock_enabled", lambda *a, **k: True)
 
 
+@pytest.fixture(autouse=True)
+def _reset_sessions():
+    """会话粘性 store 是单例：chat 指纹修好后，前一个用例标密的会话会粘到后一个
+    用例（同首问）→ 判决串味。每个用例前清空内存态（REDIS_URL 已在上面清空）。"""
+    from src.gateway.session_store import get_session_store
+    get_session_store().reset()
+    yield
+
+
 
 
 

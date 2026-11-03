@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
+from .admin_store import get_admin_store
 from .audit_store import get_audit_store
 from .stat_scope import is_local_route as _islr, to_beijing as _to_beijing
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ router = APIRouter()
 
 
 @router.get("/admin/audit/entries", dependencies=[Depends(_admin_page_auth)])
-async def audit_entries_api(request: Request, ip=None, token=None, action=None, page=None, since=None, until=None, provider=None, rule=None, q=None, sort=None, shadow=None, status=None):
+async def audit_entries_api(request: Request, ip=None, token=None, action=None, page=None, since=None, until=None, provider=None, model=None, rule=None, q=None, sort=None, shadow=None, status=None):
     _parse_window_ts = _m("_parse_window_ts")
     _enrich_audit_key_name = _m("_enrich_audit_key_name")
     _audit_filter_rows = _m("_audit_filter_rows")
@@ -46,9 +47,20 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
     since_dt = _parse_window_ts(since, naive_as_utc=False)
     until_dt = _parse_window_ts(until, is_until=True, naive_as_utc=False)
     entries = _audit_filter_rows(all_entries, ip=ip, token=token, action=action,
-                                 provider=provider, rule=rule, q=q, shadow=shadow,
+                                 provider=provider, model=model, rule=rule, q=q, shadow=shadow,
                                  since_dt=since_dt, until_dt=until_dt,
                                  status=status or "")
+    # 模型/Provider/IP 下拉选项 = 热窗 distinct（筛选前、窗口内），与明细页 /logs/facets 同语义
+    _f_model, _f_prov, _f_ip = set(), set(), set()
+    for _e in all_entries:
+        if _e.get("model"):
+            _f_model.add(_e["model"])
+        if _e.get("provider"):
+            _f_prov.add(_e["provider"])
+        if _e.get("client_ip"):
+            _f_ip.add(_e["client_ip"])
+    facets = {"model": sorted(_f_model), "provider": sorted(_f_prov),
+              "client_ip": sorted(_f_ip)}
 
     def _t_key(x):
         return str(x.get("time") or x.get("ts") or "").replace("T", " ")[:19]
@@ -72,6 +84,15 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
     end = start + limit
     page_entries = entries[start:end]
 
+    # 行级联查：当前页（≤50 个）req_id 批量取明细的延迟/token 分解。
+    # 401/非请求行/req_id 上线前的老行无明细行 ⇒ usage 缺省，前端不渲染。
+    _usage_map = {}
+    try:
+        _usage_map = get_admin_store().request_log_by_req_ids(
+            [str(e.get("id") or "")[:32] for e in page_entries])
+    except Exception:
+        pass  # 联查失败不影响审计列表主体
+
     total = total_filtered
     c_allow = sum(1 for e in entries if e.get("action") == "allow")
     c_route = sum(1 for e in entries if _islr(e.get("action")))
@@ -80,7 +101,7 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
 
     kpi = {"total": total, "c_allow": c_allow, "c_route": c_route,
            "c_block": c_block, "c_other": c_other, "source": "window"}
-    _un_sqlable = any((x or "").strip() for x in (ip, token, provider, q, shadow, status))
+    _un_sqlable = any((x or "").strip() for x in (ip, token, provider, model, q, shadow, status))
     if not _un_sqlable:
         _c = store.count_mysql(since=since_dt, until=until_dt,
                                action=(action or "").strip() or None,
@@ -96,9 +117,12 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
         return str(v)
 
     _keys = ("time", "type", "rule", "action", "provider", "local", "model",
-             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2", "status_code", "risk_score", "layer", "findings", "file_findings")
+             "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2", "status_code", "risk_score", "layer", "findings", "file_findings", "usage")
 
     def _entry_val(k, e):
+        if k == "usage":
+            # 对象整体返回（勿走 _plain 的 str() 兜底）；无明细行 ⇒ None
+            return _usage_map.get(str(e.get("id") or "")[:32])
         if k == "time":
             return _to_beijing(e.get(k))
         if k in ("findings", "file_findings"):
@@ -119,6 +143,7 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
         "c_allow": c_allow, "c_route": c_route, "c_block": c_block,
         "c_other": c_other,
         "kpi": kpi,
+        "facets": facets,
         "entries": [{k: _entry_val(k, e) for k in _keys} for e in page_entries],
     })
 
@@ -133,6 +158,8 @@ async def export_csv(
     ip=None,
     token=None,
     q=None,
+    provider=None,
+    model=None,
     shadow=None,
     status=None,
     source="auto",
@@ -160,7 +187,9 @@ async def export_csv(
         until_dt = _parse_window_ts(until, default=datetime.now(timezone.utc).replace(tzinfo=None), is_until=True, naive_as_utc=False)
         rows = store.query_mysql(since=since_dt, until=until_dt, action=action, rule=rule, type_=type, limit=limit)
         _enrich_audit_key_name(rows)
-        rows = _audit_filter_rows(rows, ip=ip, token=token, q=q, shadow=shadow, status=status)
+        # provider/model 无 SQL 下推（同列表接口口径），内存过滤；与列表页筛选态一致
+        rows = _audit_filter_rows(rows, ip=ip, token=token, provider=provider, model=model,
+                                  q=q, shadow=shadow, status=status)
         for r in rows:
             if "error" in r:
                 continue
@@ -188,6 +217,7 @@ async def export_csv(
         rows_hot = sorted(store.all(), key=lambda x: str(x.get("time") or x.get("ts") or "").replace("T", " ")[:19])
         _enrich_audit_key_name(rows_hot)
         rows_hot = _audit_filter_rows(rows_hot, ip=ip, token=token, action=action,
+                                      provider=provider, model=model,
                                       rule=rule, type_=type, q=q, shadow=shadow, status=status)
         for e in rows_hot:
             if not e.get("key_name"):

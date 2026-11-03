@@ -10,12 +10,12 @@ KEY = "sk_shGD8A0lZpIJbcGavN8z6GBcSl-DGIsecJqgF4r0k_o"
 H = {"Authorization": f"Bearer {KEY}"}
 
 def test_chat_allow():
-    r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"总结CAP定理"}]})
+    r = client.post("/v1/chat/completions", headers=H, json={"model":"deepseek-flash","messages":[{"role":"user","content":"总结CAP定理"}]})
     assert r.status_code == 200
     assert r.json()["gateway"]["action"] == "allow"
 
 def test_chat_pii_route_local():
-    r = client.post("/v1/chat/completions", headers=H, json={"model":"gpt-4o-mini","messages":[{"role":"user","content":"员工张三 身份证 110101199001011237"}]})
+    r = client.post("/v1/chat/completions", headers=H, json={"model":"deepseek-flash","messages":[{"role":"user","content":"员工张三 身份证 110101199001011237"}]})
     assert r.status_code == 200
     assert r.json()["gateway"]["action"] == "route_local"
 
@@ -44,7 +44,7 @@ def test_model_rate_limit(tmp_path, monkeypatch):
     p.write_text(yaml.safe_dump({"model_policy": {
         "external_candidates": [],
         "internal_models": [],
-        "model_limits": [{"model": "gpt-4o-mini", "rpm": 1, "enabled": True}],
+        "model_limits": [{"model": "deepseek-flash", "rpm": 1, "enabled": True}],
         "review_model": {"threshold": 0.7},
     }}, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(p))
@@ -52,9 +52,9 @@ def test_model_rate_limit(tmp_path, monkeypatch):
     get_limiter().reset()
     body = lambda m: {"model": m, "messages": [{"role": "user", "content": "hello"}]}
     try:
-        r1 = client.post("/v1/chat/completions", headers=H, json=body("gpt-4o-mini"))
+        r1 = client.post("/v1/chat/completions", headers=H, json=body("deepseek-flash"))
         assert r1.status_code == 200
-        r2 = client.post("/v1/chat/completions", headers=H, json=body("gpt-4o-mini"))
+        r2 = client.post("/v1/chat/completions", headers=H, json=body("deepseek-flash"))
         assert r2.status_code == 429
         assert r2.json()["detail"]["type"] == "model_rate_limited"
         r3 = client.post("/v1/chat/completions", headers=H, json=body("deepseek/deepseek-chat"))
@@ -599,7 +599,7 @@ def test_bare_internal_model_name_routes_local():
     assert r2.json()["gateway"]["provider"] == "vllm_local"
     # 未登记的裸名仍按原样交给上游（不 404：线上有客户端用历史模型名请求）
     r3 = client.post("/v1/chat/completions", headers=H,
-                     json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "你好"}]})
+                     json={"model": "deepseek-flash", "messages": [{"role": "user", "content": "你好"}]})
     assert r3.status_code == 200
     assert r3.json()["gateway"]["provider"] == "deepseek", r3.json()["gateway"]
     # 网关知道但不是对话模型的内部名（laya 的 /classify 决策模型）⇒ 404，
@@ -824,13 +824,91 @@ def test_blacklist_block_keeps_key_identity():
         # 双写包装契约：detail 与其余错误统一（脚本读 detail），error 保 OpenAI SDK 兼容
         assert body.get("detail", {}).get("type") == "key_blocked", body
         assert body.get("error", {}).get("type") == "key_blocked", body
-        groups = {g["label"]: g for g in store.stats_group("2000-01-01 00:00:00", "2099-01-01 00:00:00", "key_name")}
+        # log_request_async 是线程池 fire-and-forget：轮询等落库（上限 2s），
+        # 否则断言抢在写线程前 → 偶发 KeyError（全量负载下实测复现过）
+        groups = {}
+        for _ in range(40):
+            groups = {g["label"]: g for g in store.stats_group("2000-01-01 00:00:00", "2099-01-01 00:00:00", "key_name")}
+            if groups.get(name, {}).get("blocked", 0) >= 1:
+                break
+            _time.sleep(0.05)
         assert groups[name]["blocked"] >= 1, groups
     finally:
         store.remove_key_rule(rid)
         store.delete_api_key(kid)
         with store._mem_lock:  # 清掉本用例写入的明细行（共享 memory store）
             store._logs[:] = [x for x in store._logs if x.get("key_name") != name]
+
+
+def test_key_rule_unique_one_list_per_key():
+    # 一个 key 只能归属一个名单：已登记后再登记任何一档都拒绝
+    import time as _time
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    plain = "sk_middle_%d" % int(_time.time() * 1000)
+    rid = store.add_key_rule(kind="middle", key_value=plain)["id"]
+    try:
+        assert store.lookup_key(plain) == "middle"
+        for other in ("white", "black", "middle"):
+            try:
+                store.add_key_rule(kind=other, key_value=plain)
+            except ValueError as e:
+                assert "只能归属一个名单" in str(e), e
+            else:
+                raise AssertionError(f"同一 key 重复登记 {other} 应被拒绝")
+        # 移除后可换档
+        store.remove_key_rule(rid)
+        rid2 = store.add_key_rule(kind="black", key_value=plain)["id"]
+        assert store.lookup_key(plain) == "black"
+        rid = rid2
+    finally:
+        store.remove_key_rule(rid)
+
+
+def test_keyrule_api_rejects_duplicate_kind():
+    # 管理台 API：同一个 key 已在名单，再 POST 任意一档 → 422（不是静默多档共存）
+    import time as _time
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    plain = "sk_dup_%d" % int(_time.time() * 1000)
+    rid = store.add_key_rule(kind="white", key_value=plain)["id"]
+    try:
+        r = client.post("/admin/api/keyrules", json={"kind": "middle", "key_value": plain})
+        assert r.status_code == 422, r.text[:200]
+        assert "只能归属一个名单" in r.text
+    finally:
+        store.remove_key_rule(rid)
+
+
+def test_key_middle_forces_local_skips_l1_l2(monkeypatch):
+    # 中间档 KEY：直接转内网，跳过 L1+L2（内容不出境，无需审查）
+    import time as _time
+    from src.gateway import main as _m
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    plain = "sk_mid_run_%d" % int(_time.time() * 1000)
+    name = "pytest-middle"
+    kid = store.create_api_key(plain, name, "", "pytest middle tier")["id"]
+    rid = store.add_key_rule(kind="middle", key_value=plain)["id"]
+
+    def _boom(*a, **k):
+        raise AssertionError("中间档不应进入 L1/L2 审查")
+
+    monkeypatch.setattr(_m, "inspect_text", _boom)       # L1 入口
+    monkeypatch.setattr(_m, "small_classify", _boom)     # L2 单块
+    monkeypatch.setattr(_m, "classify_chunks", _boom)    # L2 分块
+    try:
+        # 内容本身会触发 block（密钥类），中间档跳审 → 仍是 route_local 不 403
+        r = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {plain}"},
+                        json={"model": "vllm_local/qwen2.5:7b",
+                              "messages": [{"role": "user", "content": "sk-abcdef0123456789abcdef0123456789"}]})
+        assert r.status_code == 200, r.text[:300]
+        gw = r.json()["gateway"]
+        assert gw["action"] == "route_local", gw
+        assert gw["policy_rule"] == "key_middle_local", gw
+    finally:
+        store.remove_key_rule(rid)
+        store.delete_api_key(kid)
 
 
 def test_unregistered_key_401_not_logged_as_traffic():
@@ -1171,7 +1249,7 @@ def test_l2_always_switch(monkeypatch):
         return {"label": "CONFIDENTIAL", "confidence": 0.95, "reason": "pytest"}
 
     monkeypatch.setattr(_m, "small_classify", _fake)
-    body = {"model": "gpt-4o-mini",
+    body = {"model": "deepseek-flash",
             "messages": [{"role": "user", "content": "薪酬明细已核对完毕，周五前把草案发我。"}]}
     monkeypatch.delenv("AI_GATEWAY_L2_ALWAYS", raising=False)
     r = client.post("/v1/chat/completions", headers=H, json=body)
@@ -1227,7 +1305,7 @@ def test_l2_history_e2e_multi_turn(monkeypatch):
 
     monkeypatch.setattr(_m, "classify_chunks", _fake_chunks)
     monkeypatch.setenv("AI_GATEWAY_L2_ALWAYS", "true")
-    body = {"model": "gpt-4o-mini", "messages": [
+    body = {"model": "deepseek-flash", "messages": [
         {"role": "user", "content": "这份薪酬表核对一下"},
         {"role": "assistant", "content": "好的"},
         {"role": "user", "content": "把第三列改成 24055"}]}
@@ -1259,7 +1337,7 @@ def test_l2_history_shadow_ab(monkeypatch):
         "chunk_chars": 1200, "budget_chars": 6000})
     monkeypatch.setenv("AI_GATEWAY_L2_ALWAYS", "true")
     monkeypatch.setenv("AI_GATEWAY_L2_HISTORY_SHADOW", "true")
-    body = {"model": "gpt-4o-mini", "messages": [
+    body = {"model": "deepseek-flash", "messages": [
         {"role": "user", "content": "这份薪酬表核对一下"},
         {"role": "assistant", "content": "好的"},
         {"role": "user", "content": "把第三列改成 24055"}]}
@@ -1288,12 +1366,12 @@ def test_text_l2_hit_sticks_session_local(monkeypatch):
     sid = "pytest-sticky-%d" % int(_time.time() * 1000)
     h = {**H, "X-Session-ID": sid}
     r1 = client.post("/v1/chat/completions", headers=h, json={
-        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "工资表核对一下"}]})
+        "model": "deepseek-flash", "messages": [{"role": "user", "content": "工资表核对一下"}]})
     assert r1.json()["gateway"]["action"] == "route_local"
     assert get_session_store().is_confidential(sid) is True, "纯文本判密必须标会话"
     # 第二轮无害短句：L1 会话规则直接转本地，不再送 L2
     r2 = client.post("/v1/chat/completions", headers=h, json={
-        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "今天天气如何"}]})
+        "model": "deepseek-flash", "messages": [{"role": "user", "content": "今天天气如何"}]})
     g2 = r2.json()["gateway"]
     assert g2["action"] == "route_local"
     assert g2.get("policy_rule") == "session_route_local"
@@ -1314,11 +1392,11 @@ def test_l2_unavailable_does_not_stick_session(monkeypatch):
     sid = "pytest-nostick-%d" % int(_time.time() * 1000)
     h = {**H, "X-Session-ID": sid}
     r1 = client.post("/v1/chat/completions", headers=h, json={
-        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "工资表核对一下"}]})
+        "model": "deepseek-flash", "messages": [{"role": "user", "content": "工资表核对一下"}]})
     assert r1.json()["gateway"]["action"] == "route_local"  # fail-safe 转本地
     assert get_session_store().is_confidential(sid) is False, "l2_unavailable 不得标会话"
     r2 = client.post("/v1/chat/completions", headers=h, json={
-        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "今天天气如何"}]})
+        "model": "deepseek-flash", "messages": [{"role": "user", "content": "今天天气如何"}]})
     assert r2.json()["gateway"]["action"] == "allow"
 
 
@@ -1333,7 +1411,7 @@ def test_l2_degraded_not_attributed_to_first_block(monkeypatch):
 
     monkeypatch.setattr(_m, "small_classify", _fake)
     r = client.post("/v1/chat/completions", headers=H, json={
-        "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "工资表核对一下"}]})
+        "model": "deepseek-flash", "messages": [{"role": "user", "content": "工资表核对一下"}]})
     g = r.json()["gateway"]
     assert g["action"] == "route_local"
     l2 = g.get("l2") or {}
@@ -1668,7 +1746,7 @@ def test_billing_daily_split(tmp_path, monkeypatch):
 def test_audit_entries_show_key_name():
     # 审计列表调用方显示登记名：token=名称也能过滤命中
     from src.gateway.admin_store import mask_key
-    r = client.post("/v1/chat/completions", headers=H, json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "审计名称回归"}]})
+    r = client.post("/v1/chat/completions", headers=H, json={"model": "deepseek-flash", "messages": [{"role": "user", "content": "审计名称回归"}]})
     assert r.status_code == 200
     d = client.get("/admin/audit/entries", params={"token": "pytest"}).json()
     assert d["entries"], "token=pytest 应按调用方名称命中"
@@ -1736,6 +1814,87 @@ def test_audit_csv_hot_path_applies_filters():
         with store._mem_lock:
             store._mem[:] = [e for e in store._mem
                              if e.get("text_preview") not in ("CSV样本-本地路由", "CSV样本-放行")]
+
+
+def test_audit_entries_model_provider_filter_and_facets():
+    # 审计页模型/Provider/IP 下拉：精确匹配（IP 后端为子串匹配，整值选中等价）+ AND 叠加；
+    # model 列 = 实际应答模型（别名写时已解析）；facets = 热窗 distinct 供下拉
+    import time
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    rows = [
+        {"time": now, "ts": now, "type": "chat", "action": "allow", "rule": "default_allow",
+         "provider": "deepseek", "model": "deepseek-flash", "client_ip": "203.0.113.7",
+         "text_preview": "MP筛选样本-A"},
+        {"time": now, "ts": now, "type": "chat", "action": "route_local", "rule": "l2_confidential",
+         "provider": "vllm_local", "model": "qwen2.5:7b", "client_ip": "203.0.113.8",
+         "text_preview": "MP筛选样本-B"},
+    ]
+    for e in rows:
+        store.append(e)
+    try:
+        d = client.get("/admin/audit/entries", params={"model": "qwen2.5:7b"}).json()
+        items = d.get("entries") or []
+        assert items and all(e["model"] == "qwen2.5:7b" for e in items), items[:2]
+        assert not any(e.get("text_preview") == "MP筛选样本-A" for e in items), items
+        d2 = client.get("/admin/audit/entries", params={"provider": "vllm_local"}).json()
+        items2 = d2.get("entries") or []
+        assert items2 and all(e["provider"] == "vllm_local" for e in items2), items2[:2]
+        # IP 过滤（子串匹配；选中整值即精确）
+        d_ip = client.get("/admin/audit/entries", params={"ip": "203.0.113.7"}).json()
+        items_ip = d_ip.get("entries") or []
+        assert items_ip and all("203.0.113.7" in (e.get("client_ip") or "")
+                                for e in items_ip), items_ip[:2]
+        assert any(e.get("text_preview") == "MP筛选样本-A" for e in items_ip), items_ip
+        assert not any(e.get("text_preview") == "MP筛选样本-B" for e in items_ip), items_ip
+        # AND 叠加：model + provider
+        d3 = client.get("/admin/audit/entries",
+                        params={"model": "qwen2.5:7b", "provider": "vllm_local"}).json()
+        items3 = d3.get("entries") or []
+        assert items3 and all(e["model"] == "qwen2.5:7b" and e["provider"] == "vllm_local"
+                              for e in items3), items3[:2]
+        # facets 含两行的 model/provider/client_ip（窗口 distinct，空值不出现）
+        assert "qwen2.5:7b" in d["facets"]["model"] and "deepseek-flash" in d["facets"]["model"]
+        assert "deepseek" in d["facets"]["provider"] and "vllm_local" in d["facets"]["provider"]
+        assert "203.0.113.7" in d["facets"]["client_ip"]
+        assert "203.0.113.8" in d["facets"]["client_ip"]
+    finally:
+        with store._mem_lock:
+            store._mem[:] = [e for e in store._mem
+                             if e.get("text_preview") not in ("MP筛选样本-A", "MP筛选样本-B")]
+
+
+def test_audit_csv_model_provider_filter():
+    # CSV 导出与列表同口径：model/provider 参数在热窗路径必须真过滤（早前 CSV 连
+    # provider 都漏传 → 页面筛选后导出仍是全量）
+    import time
+    from src.gateway.audit_store import get_audit_store
+    store = get_audit_store()
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    rows = [
+        {"time": now, "ts": now, "type": "chat", "action": "allow", "rule": "default_allow",
+         "provider": "deepseek", "model": "deepseek-flash", "text_preview": "CSV-MP样本-A"},
+        {"time": now, "ts": now, "type": "chat", "action": "route_local", "rule": "l2_confidential",
+         "provider": "vllm_local", "model": "qwen2.5:7b", "text_preview": "CSV-MP样本-B"},
+    ]
+    for e in rows:
+        store.append(e)
+    try:
+        r = client.get("/admin/csv", params={"model": "qwen2.5:7b"})
+        assert r.status_code == 200, r.status_code
+        lines = [ln for ln in r.text.splitlines()[1:] if ln.strip()]
+        assert lines, r.text[:500]
+        assert any("CSV-MP样本-B" in ln for ln in lines), lines[:3]
+        assert not any("CSV-MP样本-A" in ln for ln in lines), lines[:3]
+        r2 = client.get("/admin/csv", params={"provider": "deepseek", "model": "deepseek-flash"})
+        lines2 = [ln for ln in r2.text.splitlines()[1:] if ln.strip()]
+        assert any("CSV-MP样本-A" in ln for ln in lines2), lines2[:3]
+        assert not any("CSV-MP样本-B" in ln for ln in lines2), lines2[:3]
+    finally:
+        with store._mem_lock:
+            store._mem[:] = [e for e in store._mem
+                             if e.get("text_preview") not in ("CSV-MP样本-A", "CSV-MP样本-B")]
 
 
 def test_audit_entries_kpi_from_mysql(monkeypatch):
@@ -2063,6 +2222,28 @@ def test_logs_list_filter_and_cleanup():
     assert all(row["key_name"] != "pytest-logs-old" for row in d["items"])
 
 
+def test_logs_blocked_reason_filter_and_facets():
+    # 明细页拦截原因下拉：blocked_reason 精确过滤 + 窗口 distinct 进 facets（空值丢弃）
+    from src.gateway.admin_store import get_admin_store
+    st = get_admin_store()
+    st.insert_request_log({"key_name": "pytest-breason", "model": "m-br1", "provider": "p",
+                           "action": "route_local", "client_ip": "8.8.8.9", "status_code": 200,
+                           "blocked_reason": "l1:financial_local_only"})
+    st.insert_request_log({"key_name": "pytest-breason", "model": "m-br1", "provider": "p",
+                           "action": "allow", "client_ip": "8.8.8.9", "status_code": 200})
+    d = client.get("/admin/api/logs",
+                   params={"hours": 720, "key_name": "pytest-breason",
+                           "blocked_reason": "l1:financial_local_only"}).json()
+    assert d["total"] == 1 and d["items"][0]["action"] == "route_local", d
+    # 反向：不存在的原因 → 0 行
+    d2 = client.get("/admin/api/logs",
+                    params={"hours": 720, "key_name": "pytest-breason",
+                            "blocked_reason": "l1:不存在的规则"}).json()
+    assert d2["total"] == 0, d2
+    f = client.get("/admin/api/logs/facets", params={"hours": 720}).json()
+    assert "l1:financial_local_only" in f["blocked_reason"], f.get("blocked_reason", [])[:5]
+
+
 def test_l2_divergences_label_roundtrip():
     from src.gateway.admin_store import get_admin_store
     st = get_admin_store()
@@ -2310,7 +2491,8 @@ def test_rule_hits_shape():
 
 def test_rule_hits_excludes_l2_decisions(monkeypatch):
     # 规则命中榜 = 审计页同一集合：L2 判决与系统内置判定都计入（界面由 ruleZh 标
-    # 「（系统内置）」），只排除「default_allow」
+    # 「（系统内置）」），排除「default_allow」与「全内网别名放行」（路由直通，非内容规则；
+    # local_alias_bypass 给 3 条验证高流量也不会挤进 Top）
     from src.gateway.audit_store import get_audit_store
     rows = [
         {"rule": "l2_confidential", "action": "route_local", "ts": "2026-10-20 01:00:00"},
@@ -2319,11 +2501,14 @@ def test_rule_hits_excludes_l2_decisions(monkeypatch):
         {"rule": "review_text_overflow", "action": "route_local", "ts": "2026-10-20 02:20:00"},
         {"rule": "first_chunk_fallback", "action": "route_local", "ts": "2026-10-20 02:30:00"},
         {"rule": "default_allow", "action": "allow", "ts": "2026-10-20 03:00:00"},
+        {"rule": "local_alias_bypass", "action": "allow", "ts": "2026-10-20 03:10:00"},
+        {"rule": "local_alias_bypass", "action": "allow", "ts": "2026-10-20 03:20:00"},
+        {"rule": "local_alias_bypass", "action": "allow", "ts": "2026-10-20 03:30:00"},
         {"rule": "financial_local_only", "action": "route_local", "ts": "2026-10-20 04:00:00"},
     ]
     monkeypatch.setattr(get_audit_store(), "query_mysql", lambda **kw: rows)
     d = client.get("/admin/api/rule-hits", params={"hours": 168}).json()
-    assert d["total"] == 6, d
+    assert d["total"] == 6, d  # local_alias_bypass/default_allow 不进 total（占比凑满 100%）
     assert {it["rule"] for it in d["items"]} == {
         "l2_confidential", "l2_unavailable", "encoded_keyword", "review_text_overflow",
         "first_chunk_fallback", "financial_local_only"}
@@ -2586,6 +2771,55 @@ def test_l2_retrain_diff_reports():
     assert l2_retrain._diff_reports(None, cur)["new"] == ["probe:c", "real:a"]
 
 
+def test_l2_retrain_diff_baseline_is_active_version(tmp_path, monkeypatch):
+    """回归基线 = 当前生效影子版本（var/laya-l2.env），不是 ver-1；缺报告不回退更早报告。"""
+    import json
+    from src.gateway import l2_retrain
+    monkeypatch.setattr(l2_retrain, "REPORTS_DIR", str(tmp_path))
+    env = tmp_path / "laya-l2.env"
+    env.write_text("LAYA_MODEL_PATH=/m/laya-finetuned-confidential-v33\n")
+    monkeypatch.setattr(l2_retrain, "ENV_FILE", str(env))
+    monkeypatch.setitem(l2_retrain.JOB, "report", {"battery": {"wrong": [{"name": "x"}]}})
+    (tmp_path / "v33.json").write_text(json.dumps({"version": 33, "report": {"battery": {"wrong": []}}}))
+    (tmp_path / "v34.json").write_text(
+        json.dumps({"version": 34, "report": {"battery": {"wrong": [{"name": "x"}]}}}))
+    # 生效版本是 v33（v34 未晋升）→ 基线必须是 v33，而不是 v34
+    l2_retrain._attach_regression_diff("/m/laya-finetuned-confidential-v35")
+    assert l2_retrain.JOB["report"]["regressions"]["against"] == 33
+    # 切到 v34 生效后，下一版基线随之变成 v34
+    env.write_text("LAYA_MODEL_PATH=/m/laya-finetuned-confidential-v34\n")
+    l2_retrain.JOB["report"].pop("regressions", None)
+    l2_retrain._attach_regression_diff("/m/laya-finetuned-confidential-v36")
+    assert l2_retrain.JOB["report"]["regressions"]["against"] == 34
+    # 生效版本无报告 → 不做 diff（不许回退到更早的 v33 报告）
+    (tmp_path / "v34.json").unlink()
+    l2_retrain.JOB["report"].pop("regressions", None)
+    l2_retrain._attach_regression_diff("/m/laya-finetuned-confidential-v36")
+    assert "regressions" not in l2_retrain.JOB["report"]
+
+
+def test_l2_retrain_versions_marks_incomplete(tmp_path, monkeypatch):
+    """残缺 checkpoint（训练中断只有 checkpoint_latest/）在版本列表里标 incomplete，晋升下拉禁选。"""
+    from src.gateway import l2_retrain
+    models = tmp_path / "models"
+    for v in (34, 35):
+        d = models / f"laya-finetuned-confidential-v{v}"
+        d.mkdir(parents=True)
+        if v == 34:  # 只有完整权重才算可晋升
+            for f in ("rl_agent_config.json", "model.safetensors"):
+                (d / f).write_text("{}")
+            (d / "encoder").mkdir()
+            (d / "tokenizer").mkdir()
+    env = tmp_path / "laya-l2.env"
+    env.write_text("LAYA_MODEL_PATH=/x/laya-finetuned-confidential-v34\n")
+    monkeypatch.setattr(l2_retrain, "MODELS", str(models))
+    monkeypatch.setattr(l2_retrain, "ENV_FILE", str(env))
+    d = l2_retrain.versions()
+    assert d["versions"] == [35, 34]
+    assert d["current"] == 34
+    assert d["incomplete"] == [35]
+
+
 def test_l2_propose_apply_patch_dedup():
     # 补丁拼接：追加一次有效，重复追加不再叠加，空补丁原样返回
     from src.gateway import l2_retrain
@@ -2707,7 +2941,7 @@ def test_l1_match_types_new_ops():
     from src.gateway import policy_admin
 
     ctx = {
-        "model": "AB-flash",
+        "model": "deepseek-flash",
         "client": {"key": "workbuddy"},
         "time": {"hour": 23},
         "session": {"confidential": False},
@@ -2715,8 +2949,8 @@ def test_l1_match_types_new_ops():
     }
     # 枚举任一 / 枚举皆非（大小写与空格不敏感）：引擎保留运算符，
     # 构造器下拉已精简不提供 model/client 组合，直接手写 when 测
-    assert _match_when({"model in": ["ab-flash", "qwen3"]}, ctx)
-    assert not _match_when({"model not_in": ["AB-flash", "qwen3"]}, ctx)
+    assert _match_when({"model in": ["DeepSeek-Flash", "qwen3"]}, ctx)
+    assert not _match_when({"model not_in": ["DeepSeek-Flash", "qwen3"]}, ctx)
     assert _match_when({"client.key not_in": ["ccswitch", "codex"]}, ctx)
     # 布尔开关（文本别名 1/true/是 皆真，其余假）
     assert _match_when(policy_admin.build_when("parse_failed", "bool", "是"), ctx)
@@ -2726,9 +2960,9 @@ def test_l1_match_types_new_ops():
     assert not _match_when(policy_admin.build_when("prompt", "hour_range", "9-18"), ctx)
     # 引擎 != （只可手写 when，构造器无等价运算符）
     assert _match_when({"model !=": "ccswitch"}, ctx)
-    assert not _match_when({"model !=": "AB-flash"}, ctx)
+    assert not _match_when({"model !=": "deepseek-flash"}, ctx)
     # 老运算符不受影响（!= 插入不得抢 ==/>=/contains_any 的匹配）
-    assert _match_when({"model ==": "AB-flash"}, ctx)
+    assert _match_when({"model ==": "deepseek-flash"}, ctx)
     assert _match_when({"time.hour >=": 22}, ctx)
     assert _match_when({"model contains_any": ["flash"]}, ctx)
     # 非法输入要报出来，不能静默产出永不命中的规则
@@ -3103,7 +3337,7 @@ def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
     pol.write_text(
         "policies:\n"
         "  - name: dryrun-model\n    priority: 5\n    action: block\n"
-        "    when:\n      any:\n      - model in: [AB-flash]\n"
+        "    when:\n      any:\n      - model in: [deepseek-flash]\n"
         "  - name: dryrun-hour\n    priority: 6\n    action: block\n"
         # 注意必须写 ">=: 22"：裸的 "- time.hour >= 22" 会被 YAML 解析成字符串
         # 列表元素，_eval_cond 拿到 str 会 AttributeError（生产 policy.yaml 同理）
@@ -3114,7 +3348,7 @@ def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
     invalidate_policy_cache()
 
     r = client.post("/admin/api/policies/test",
-                    json={"text": "无关内容", "model": "AB-flash"})
+                    json={"text": "无关内容", "model": "deepseek-flash"})
     assert r.status_code == 200, r.text
     assert r.json()["rule"] == "dryrun-model", r.text
 
@@ -3158,3 +3392,65 @@ def test_policy_test_dryrun_carries_findings(tmp_path, monkeypatch):
                     json={"text": "我的 AKIAIOSFODNN7EXAMPLE 泄露了"})
     assert r.status_code == 200, r.text
     assert r.json()["rule"] == "pii-score-rule", r.text
+
+
+def test_request_log_by_req_ids_lookup():
+    # 审计页行级联查：按 req_id 批量取延迟/token 分解；未命中/空 id 静默忽略
+    from src.gateway.admin_store import get_admin_store
+    st = get_admin_store()
+    st.insert_request_log({"key_name": "pytest-reqid", "req_id": "reqid-a1", "action": "allow",
+                           "duration_ms": 123, "gateway_internal_ms": 10, "upstream_ms": 113,
+                           "prompt_tokens": 7, "completion_tokens": 9, "cached_tokens": 2})
+    st.insert_request_log({"key_name": "pytest-reqid", "req_id": "reqid-a2", "action": "allow"})
+    try:
+        out = st.request_log_by_req_ids(["reqid-a1", "reqid-a2", "reqid-miss", "", None])
+        assert set(out) == {"reqid-a1", "reqid-a2"}
+        assert out["reqid-a1"]["duration_ms"] == 123 and out["reqid-a1"]["cached_tokens"] == 2
+        assert out["reqid-a2"]["prompt_tokens"] == 0
+        assert st.request_log_by_req_ids([]) == {}
+    finally:
+        with st._mem_lock:  # 清掉本用例写入的明细行（共享 memory store）
+            st._logs[:] = [x for x in st._logs if x.get("key_name") != "pytest-reqid"]
+
+
+def test_audit_entry_joins_request_log_usage():
+    # 同一请求的审计行 id 与明细行 req_id 同源（中间件 ContextVar）：
+    # /v1 请求后审计 entries[].usage = 该请求的延迟/token 分解
+    import time as _time
+    from src.gateway.admin_store import get_admin_store
+    from src.gateway.audit_store import get_audit_store
+    store = get_admin_store()
+    plain = "sk_reqid_%d" % int(_time.time() * 1000)
+    name = "pytest-reqid-e2e"
+    kid = store.create_api_key(plain, name, "", "pytest req id join")["id"]
+    try:
+        probe = "reqid-join-probe-%d" % int(_time.time() * 1000)
+        r = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {plain}"},
+                        json={"model": "vllm_local/qwen2.5:7b",
+                              "messages": [{"role": "user", "content": probe}]})
+        assert r.status_code == 200, r.text[:200]
+        # log_request_async 是线程池 fire-and-forget：轮询等带 req_id 的行落库（上限 2s）
+        row = None
+        for _ in range(40):
+            with store._mem_lock:
+                row = next((x for x in store._logs
+                            if x.get("key_name") == name and x.get("req_id")), None)
+            if row:
+                break
+            _time.sleep(0.05)
+        assert row, "request_log 行缺 req_id"
+        rid = row["req_id"]
+        # 审计行 id 必须与明细行 req_id 相同（handler 内 log_entry 读中间件的 ContextVar）
+        aent = next((e for e in get_audit_store().all()
+                     if probe in str(e.get("text_preview") or "")), None)
+        assert aent, "审计行缺失"
+        assert aent.get("id") == rid, (aent.get("id"), rid)
+        # 列表接口把明细分解挂到 entries[].usage
+        d = client.get("/admin/audit/entries").json()
+        hit = next((e for e in d["entries"] if probe in str(e.get("text_preview") or "")), None)
+        assert hit and hit.get("usage"), "entries[].usage 缺失"
+        assert hit["usage"]["duration_ms"] == row["duration_ms"]
+    finally:
+        store.delete_api_key(kid)
+        with store._mem_lock:  # 清掉本用例写入的明细行（共享 memory store）
+            store._logs[:] = [x for x in store._logs if x.get("key_name") != name]

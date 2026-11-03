@@ -82,12 +82,13 @@ key_rule = Table(
     "key_rule",
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("kind", String(8), nullable=False),  # 'black' | 'white'
+    Column("kind", String(8), nullable=False),  # 'black' | 'white' | 'middle'
     Column("key_value", String(256), nullable=False),
     Column("note", Text, nullable=False, default=""),
     Column("source", String(16), nullable=False, default="manual"),  # manual|auto
     Column("created_at", DateTime, nullable=False),
-    # (kind, key_value) 唯一由应用层保证（内存后端）；PG 侧加唯一索引见 ensure_schema
+    # key_value 全局唯一（一个 key 只能归属一个名单）：应用层保证（内存后端），
+    # DB 侧见 ensure_schema 的 ux_key_rule_key_value
 )
 
 request_log = Table(
@@ -98,6 +99,7 @@ request_log = Table(
     Column("client_ip", String(64), nullable=False, default=""),
     Column("key_name", String(128), nullable=False, default=""),  # key 映射名称（人员，快照/回退）
     Column("key_id", Integer, nullable=True),  # api_key_map.id 稳定身份；改名不改它，读时 join 当前名
+    Column("req_id", String(32), nullable=True),  # audit_logs.req_id：审计页行级联查延迟/token 分解
     Column("model", String(128), nullable=False, default=""),
     Column("provider", String(64), nullable=False, default=""),
     Column("action", String(32), nullable=False, default=""),  # allow|block|route_local|...
@@ -113,6 +115,8 @@ request_log = Table(
     # ts 是时间窗查询/清理的唯一过滤列（P99 tick 每 10s、_log_rows、purge），
     # 无索引 = 全表扫 + filesort（EXPLAIN type=ALL）
     Index("idx_request_log_ts", "ts"),
+    # req_id 供审计页行级 IN 联查（每页 ≤50 个 id），随 90 天明细涨量后无索引即全表扫
+    Index("idx_request_log_req_id", "req_id"),
 )
 
 
@@ -375,10 +379,18 @@ class AdminStore:
             "CREATE UNIQUE INDEX ux_key_rule_kind_key ON key_rule (kind, key_value)"
             if dialect == "mysql"
             else "CREATE UNIQUE INDEX IF NOT EXISTS ux_key_rule_kind_key ON key_rule (kind, key_value)",
+            # 一个 key 只能归属一个名单：key_value 全局唯一（与上面 (kind,key_value) 并存，
+            # 旧索引保留无害；新写入多档会在这里被 DB 拒绝）
+            "CREATE UNIQUE INDEX ux_key_rule_key_value ON key_rule (key_value)"
+            if dialect == "mysql"
+            else "CREATE UNIQUE INDEX IF NOT EXISTS ux_key_rule_key_value ON key_rule (key_value)",
             # 已存在表补 ts 索引（create_all 不给已存表加索引）
             "CREATE INDEX idx_request_log_ts ON request_log (ts)"
             if dialect == "mysql"
             else "CREATE INDEX IF NOT EXISTS idx_request_log_ts ON request_log (ts)",
+            "CREATE INDEX idx_request_log_req_id ON request_log (req_id)"
+            if dialect == "mysql"
+            else "CREATE INDEX IF NOT EXISTS idx_request_log_req_id ON request_log (req_id)",
         ):
             try:
                 with self._engine.begin() as conn:
@@ -1087,20 +1099,19 @@ class AdminStore:
     def add_key_rule(self, kind: str, key_value: str, note: str = "", source: str = "manual") -> dict:
         kind = (kind or "").strip().lower()
         key_value = (key_value or "").strip()
-        if kind not in ("black", "white"):
-            raise ValueError("kind 只能是 black 或 white")
+        if kind not in ("black", "white", "middle"):
+            raise ValueError("kind 只能是 black/white/middle")
         if not (8 <= len(key_value) <= 256):
             raise ValueError("key 长度需在 8-256 字符之间")
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         if self._backend != "memory":
             with self._engine.begin() as conn:
                 exists = conn.execute(
-                    select(key_rule.c.id).where(
-                        (key_rule.c.kind == kind) & (key_rule.c.key_value == key_value)
-                    )
+                    select(key_rule.c.kind).where(key_rule.c.key_value == key_value)
                 ).first()
                 if exists:
-                    raise ValueError("该黑/白名单规则已存在")
+                    raise ValueError(
+                        f"该 key 已在名单中（{exists[0]}），一个 key 只能归属一个名单；请先移除原规则")
                 rid = conn.execute(
                     insert(key_rule).values(
                         kind=kind, key_value=key_value, note=note, source=source, created_at=now
@@ -1108,8 +1119,10 @@ class AdminStore:
                 ).inserted_primary_key[0]
         else:
             with self._mem_lock:
-                if any(v["kind"] == kind and v["key_value"] == key_value for v in self._key_rules.values()):
-                    raise ValueError("该黑/白名单规则已存在")
+                exist = next((v for v in self._key_rules.values() if v["key_value"] == key_value), None)
+                if exist:
+                    raise ValueError(
+                        f"该 key 已在名单中（{exist['kind']}），一个 key 只能归属一个名单；请先移除原规则")
                 rid = self._key_seq
                 self._key_seq += 1
                 self._key_rules[rid] = {
@@ -1129,7 +1142,7 @@ class AdminStore:
         self._invalidate_key_cache()
 
     def lookup_key(self, key_value: str) -> Optional[str]:
-        """返回 'white' | 'black' | None。白名单优先。带 TTL 缓存。"""
+        """返回 'white' | 'black' | 'middle' | None。带 TTL 缓存。"""
         key_value = (key_value or "").strip()
         if not key_value:
             return None
@@ -1140,10 +1153,12 @@ class AdminStore:
         verdict: Optional[str] = None
         rules = self.list_key_rules()
         kinds = [r["kind"] for r in rules if r["key_value"] == key_value]
-        # deny-overrides：white/black 共存时 black 优先。旧实现 white 优先，
-        # 已加白 key 一键拉黑后两条规则共存 → 拉黑静默失效（2026-09-18 修）
+        # 一个 key 只能归属一个名单（写入侧已强制），这里仍保留优先级兜底以兼容
+        # 历史重复数据：black > middle > white（取最严，不因加白放过必须内网/拉黑的 key）。
         if "black" in kinds:
             verdict = "black"
+        elif "middle" in kinds:
+            verdict = "middle"
         elif "white" in kinds:
             verdict = "white"
         self._key_cache[key_value] = (verdict, now)
@@ -1187,6 +1202,7 @@ class AdminStore:
             "client_ip": entry.get("client_ip", "") or "",
             "key_name": entry.get("key_name", "") or "",
             "key_id": _kid,
+            "req_id": str(entry.get("req_id") or "")[:32] or None,
             "model": entry.get("model", "") or "",
             "provider": entry.get("provider", "") or "",
             "action": entry.get("action", "") or "",
@@ -1835,6 +1851,7 @@ class AdminStore:
         action: str = "",
         provider: str = "",
         status_code: int = 0,
+        blocked_reason: str = "",
         since: str = "",
         until: str = "",
     ) -> dict:
@@ -1852,6 +1869,8 @@ class AdminStore:
             rows = [r for r in rows if r.get("provider") == provider]
         if status_code:
             rows = [r for r in rows if r.get("status_code") == status_code]
+        if blocked_reason:
+            rows = [r for r in rows if r.get("blocked_reason") == blocked_reason]
         for r in rows:
             r["ts"] = _ts_str(r.get("ts"))
         rows.sort(key=lambda r: r.get("ts", ""), reverse=True)
@@ -1862,15 +1881,49 @@ class AdminStore:
         return {"items": items, "total": total}
 
     def request_log_facets(self, since: str = "", until: str = "") -> dict:
-        """明细筛选字段的窗内 distinct 值（key_name/model/provider/client_ip），供前端下拉。
+        """明细筛选字段的窗内 distinct 值（key_name/model/provider/client_ip/blocked_reason），供前端下拉。
 
         走 _log_rows 同一条缓存路径，成本与一次明细分页查询相当；空值丢弃。"""
         rows = self._log_rows(since, until)
         out = {}
-        for f in ("key_name", "model", "provider", "client_ip"):
+        for f in ("key_name", "model", "provider", "client_ip", "blocked_reason"):
             vals = {r.get(f) or "" for r in rows}
             vals.discard("")
             out[f] = sorted(vals)
+        return out
+
+    def request_log_by_req_ids(self, req_ids) -> dict:
+        """req_id → 延迟/token 分解行：审计页按当前页 req_id 批量联查（每页 ≤50 个）。
+
+        未命中 = 该请求无明细行（401 不落明细 / req_id 上线前的老数据 / 非请求行），
+        调用方按缺失渲染即可。走 req_id 索引，与 _log_rows 的窗内全量缓存无关。"""
+        ids = [str(x)[:32] for x in (req_ids or []) if str(x or "").strip()][:200]
+        out: dict = {}
+        if not ids:
+            return out
+        if self._backend != "memory":
+            try:
+                with self._engine.connect() as conn:
+                    rows = conn.execute(
+                        select(request_log.c.req_id, request_log.c.duration_ms,
+                               request_log.c.gateway_internal_ms, request_log.c.upstream_ms,
+                               request_log.c.prompt_tokens, request_log.c.completion_tokens,
+                               request_log.c.cached_tokens, request_log.c.cache_creation_tokens)
+                        .where(request_log.c.req_id.in_(ids))
+                    ).mappings().all()
+                for r in rows:
+                    out[r["req_id"]] = dict(r)
+            except Exception:
+                pass  # 联查失败不影响审计列表主体（usage 缺省不显示）
+        else:
+            s = set(ids)
+            with self._mem_lock:
+                for r in self._logs:
+                    _rid = r.get("req_id")
+                    if _rid in s:
+                        out[_rid] = {k: r.get(k) for k in (
+                            "req_id", "duration_ms", "gateway_internal_ms", "upstream_ms",
+                            "prompt_tokens", "completion_tokens", "cached_tokens", "cache_creation_tokens")}
         return out
 
     def purge_request_logs(self, before: str) -> int:

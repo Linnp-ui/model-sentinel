@@ -100,7 +100,7 @@ def chat_payload(data_urls, prompt="看下这张图"):
     for u in data_urls if isinstance(data_urls, list) else [data_urls]:
         if u:
             content.append({"type": "image_url", "image_url": {"url": u}})
-    return {"model": "AB-flash", "messages": [{"role": "user", "content": content}]}
+    return {"model": "deepseek/deepseek-flash", "messages": [{"role": "user", "content": content}]}
 
 
 def durl(raw, mime):
@@ -114,7 +114,7 @@ def responses_payload(text, files):
         if raw is not None:
             blk["file_data"] = durl(raw, mime)
         content.append(blk)
-    return {"model": "AB-flash", "input": [{"role": "user", "content": content}]}
+    return {"model": "deepseek/deepseek-flash", "input": [{"role": "user", "content": content}]}
 
 
 # id, 类别, 说明, 期望("local"=不出境 / "allow"), 请求方式
@@ -232,11 +232,13 @@ def main():
                               status=r.status_code, gw=r.json().get("gateway", {}),
                               ms=round(ms, 3), file=cid + ".png"))
 
+        # 首条 user 文本必须逐例唯一：workbuddy 无会话头，靠首问指纹 chat-<sha16> 认会话，
+        # 撞文案会被前序判密粘住（实测误报 1/9），评测样本也就不再独立
         for cid, desc, text, exp in CHAT:
             png = _png(text)
             t0 = time.perf_counter()
             r = client.post("/v1/chat/completions", headers=H,
-                            json=chat_payload(data_url(png)))
+                            json=chat_payload(data_url(png), prompt=f"看下这张图（{cid}）"))
             ms = (time.perf_counter() - t0) * 1000
             cases.append(dict(id=cid, kind="chat_image", desc=desc, expected=exp,
                               status=r.status_code, gw=r.json().get("gateway", {}),
@@ -269,7 +271,7 @@ def main():
         for cid, desc, pngs, exp in multi:
             t0 = time.perf_counter()
             r = client.post("/v1/chat/completions", headers=H,
-                            json=chat_payload([data_url(x) for x in pngs]))
+                            json=chat_payload([data_url(x) for x in pngs], prompt=f"看下这两张图（{cid}）"))
             ms = (time.perf_counter() - t0) * 1000
             cases.append(dict(id=cid, kind="workbuddy", desc=desc, expected=exp,
                               status=r.status_code, gw=r.json().get("gateway", {}),

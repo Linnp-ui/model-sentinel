@@ -341,7 +341,7 @@ export default function KeyRulesPage() {
       const k = await api('/keys');
       const items = k.items || [];
       setKeyOpts(items.filter((x) => !x.disabled)
-        .map((x) => ({ value: x.name, label: `${x.name}（${x.key_masked || ''}）` })));
+        .map((x) => ({ value: x.name, mask: x.key_masked, label: `${x.name}（${x.key_masked || ''}）` })));
       setNameByMask(Object.fromEntries(items.map((x) => [x.key_masked, x.name])));
     } catch (e) { message.error(errText(e)); }
   }, []);
@@ -369,8 +369,10 @@ export default function KeyRulesPage() {
   /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配；备注/操作原先无宽（auto
      布局弹性列），现在固定占比 */
   const cols = [
-    { title: <>{'类型'}<Tip text="黑名单 = 命中即不服务（403）；白名单 = 可信，少走甚至跳过 L2 审查。" /></>, dataIndex: 'kind', width: '10%',
-      render: (v) => (v === 'black' ? <Tag color="black">黑名单</Tag> : <Tag color="green">白名单</Tag>) },
+    { title: <>{'类型'}<Tip text="黑名单 = 命中即不服务（403）；中间状态 = 强制转内网、跳过 L1+L2（内容不出境）；白名单 = 可信，少走甚至跳过 L2 审查。" /></>, dataIndex: 'kind', width: '10%',
+      render: (v) => (v === 'black' ? <Tag color="black">黑名单</Tag>
+        : v === 'middle' ? <Tag color="orange">中间状态</Tag>
+        : <Tag color="green">白名单</Tag>) },
     { title: '名称', dataIndex: 'key_masked', width: '14%',
       render: (m) => (nameByMask[m] || <Text type="secondary">—</Text>) },
     { title: 'KEY', dataIndex: 'key_masked', width: '18%', render: (v) => <Text code>{v}</Text> },
@@ -389,7 +391,7 @@ export default function KeyRulesPage() {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="middle">
       <Alert type="info" showIcon
-        message="默认放行所有 KEY；黑名单命中即拦截（403），且黑名单优先于白名单（同 KEY 双规则时拉黑即时生效）。按 Bearer key 原文精确匹配。" />
+        message="默认放行所有 KEY；黑名单命中即拦截（403）；中间状态强制转内网并跳过 L1+L2。一个 KEY 只能归属一个名单（三选一），换档请先移除原规则。按 Bearer key 原文精确匹配。" />
       <Card title={<>KEY 规则<Tip text="按 KEY（按登记名单里的 key 原文精确匹配）设的黑名单/白名单。" /></>} extra={<Button type="primary" icon={<StopOutlined />} onClick={() => setModalOpen(true)}>添加规则</Button>}>
       <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small" sticky={wideSticky()} tableLayout="fixed"
         pagination={{ pageSize: 50, showSizeChanger: false }} />
@@ -398,12 +400,14 @@ export default function KeyRulesPage() {
         <Form form={form} layout="vertical" initialValues={{ kind: 'black' }}>
           <Form.Item name="kind" label="类型" rules={[{ required: true }]}>
             <Select options={[
-              { value: 'black', label: '黑名单（拦截，优先于白名单）' },
+              { value: 'black', label: '黑名单（拦截）' },
+              { value: 'middle', label: '中间状态（强制转内网，跳过 L1+L2）' },
               { value: 'white', label: '白名单（放行）' },
             ]} />
           </Form.Item>
           <Form.Item name="key_name" label="KEY（登记名单选择）" rules={[{ required: true, message: '请选择登记 KEY' }]}>
-            <Select showSearch optionFilterProp="label" placeholder="选择人员/KEY" options={keyOpts} />
+            <Select showSearch optionFilterProp="label" placeholder="选择人员/KEY"
+              options={keyOpts.filter((o) => !items.some((r) => r.key_masked === o.mask))} />
           </Form.Item>
           <Form.Item name="note" label="备注"><Input /></Form.Item>
         </Form>

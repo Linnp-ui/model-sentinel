@@ -646,7 +646,7 @@ export default function RulesPage() {
                 { value: 'block', label: 'block 拦截' },
                ]} />
             </Form.Item>
-            <Form.Item name="priority_locked" label="锁定优先级" valuePropName="checked">
+            <Form.Item name="priority_locked" label={<>{'锁定优先级'}<Tip term="priority_locked" /></>} valuePropName="checked">
               <Switch />
             </Form.Item>
           </Space>

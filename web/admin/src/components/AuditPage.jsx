@@ -1,9 +1,20 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip } from 'antd';
+import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { Table, Button, Input, Select, Tag, Space, message, Typography, Card, Statistic, Tooltip, Tabs, Spin } from 'antd';
 import { SearchOutlined, DownloadOutlined, DownOutlined } from '@ant-design/icons';
 import { api, errText, fetchJson, usePoll, RANGES } from '../api.js';
-import { wideSticky } from '../utils.js';
+import { wideSticky, patchHashQuery } from '../utils.js';
 import { Tip } from '../terms.jsx';
+
+// 请求明细页签（2026-11 由独立 #/logs 菜单并入本页：单一入口）：懒加载，切到才下 chunk
+const LogsTab = lazy(() => import('./LogsPage.jsx'));
+
+// 页签态入 URL（#/audit?tab=logs，默认 audit）；兼容老 #/logs 链接
+// （App 路由已把它落到本页，首屏 hash 段仍是 logs）
+const readTab = () => {
+  const seg = window.location.hash.replace(/^#\/?/, '').split('?')[0];
+  const q = new URLSearchParams(window.location.hash.split('?')[1] || '');
+  return seg === 'logs' || q.get('tab') === 'logs' ? 'logs' : 'audit';
+};
 
 const { Text } = Typography;
 import { ruleZh, RULE_FILTER_NAMES, ACTION_INFO, RuleZh, SystemBuiltinLegend } from '../ruleNames.jsx';
@@ -131,15 +142,31 @@ export default function AuditPage() {
   const [f, setF] = useState(() => {
     const p = new URLSearchParams(window.location.hash.split('?')[1] || '');
     return { action: p.get('action') || '', since: p.get('since') || '',
-             rule: p.get('rule') || '', q: p.get('q') || '', shadow: p.get('shadow') || '',
-             status: p.get('status') || '' };
+             rule: p.get('rule') || '', q: p.get('q') || '', model: p.get('model') || '',
+             ip: p.get('ip') || '' };
   });
   const [pageNo, setPageNo] = useState(1);
+  const [tab, setTab] = useState(readTab);
+  // 明细表卡片的落位槽（item 2）：恒挂载（审计页签 display:none 而非卸载）——
+  // 若随页签卸载/重挂，切页那次 render 里 ref 未赋值，LogsPage 同帧同步渲染
+  // （lazy chunk 已缓存）会拿到 null 而把表渲染回外框里
+  const logsTableSlotRef = useRef(null);
+  useEffect(() => {
+    // 外部改 hash（侧栏点「审计日志」、明细页签的「切回审计」链接）⇒ 重读页签
+    const onHash = () => setTab(readTab());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  const switchTab = (k) => {
+    patchHashQuery((p) => { if (k === 'logs') p.set('tab', 'logs'); else p.delete('tab'); });
+    setTab(k);
+  };
   const writeUrl = (next) => {
-    const p = new URLSearchParams();
-    Object.entries(next).forEach(([k, v]) => { if (v) p.set(k, v); });
-    const qs = p.toString();
-    history.replaceState(null, '', '#/audit' + (qs ? '?' + qs : ''));
+    // 只写审计页签参数，保留明细页签的 l_* 参数（两页签共用一条 URL，互不覆盖）
+    patchHashQuery((p) => {
+      ['action', 'since', 'rule', 'q', 'model', 'ip', 'tab'].forEach((k) => p.delete(k));
+      Object.entries(next).forEach(([k, v]) => { if (v) p.set(k, v); });
+    });
   };
   // 规则名下拉来源：与「规则管理」页同源（/admin/api/policies），避免前端硬编码漂移
   const [ruleNames, setRuleNames] = useState([]);
@@ -147,7 +174,7 @@ export default function AuditPage() {
   // silent=true：30s 轮询用（不点 loading 不闪 Spin、后台失败不弹错）
   // f 走 ref：load 身份只随 pageNo 变。若 f 进 deps，搜索框每个键入都换 load 身份
   // → effect 重跑 → 半截关键词就发一次请求 + 每键闪一次 Spin（实测）。
-  // 下拉筛选（since/action/rule/shadow）是离散选择，仍在 effect 依赖里"选完即查"；
+  // 下拉筛选（since/action/rule/model/ip）是离散选择，仍在 effect 依赖里"选完即查"；
   // 全文 q 只在「查询」按钮/回车（search()）时触发。
   const fRef = useRef(f);
   fRef.current = f;
@@ -162,8 +189,9 @@ export default function AuditPage() {
     finally { if (!silent) setLoading(false); }
   }, [pageNo]);
 
-  useEffect(() => { load(); }, [load, f.since, f.action, f.rule, f.shadow, f.status]);
-  usePoll(() => load(pageNo, true)); // 替代原刷新按钮
+  useEffect(() => { load(); }, [load, f.since, f.action, f.rule, f.model, f.ip]);
+  // 替代原刷新按钮；明细页签不轮询审计（KPI/列表已隐藏，空转无意义）
+  usePoll(() => { if (tab === 'audit') load(pageNo, true); });
 
   // 规则名清单拉取：失败时静默回退到内置映射（RULE_FILTER_NAMES），不影响筛选可用性
   useEffect(() => {
@@ -233,7 +261,16 @@ export default function AuditPage() {
   ];
 
   return (
-    <Space direction="vertical" style={{ width: '100%' }} size="middle">
+    /* 两个 item（2026-11）：item1 = 页签栏 +「其他」（筛选/KPI；明细页签 = 筛选）——
+       .audit-tabmerge 外框承接卡片边框/圆角，内部 Card 去边框；item2 =「审计日志」表/
+       明细表 = 独立普通卡片。明细表在 LogsPage 内，portal 进 logsTableSlot（外框外） */
+    <>
+    <div className="audit-tabmerge">
+      <Tabs className="audit-tabs" activeKey={tab} onChange={switchTab} size="small"
+        items={[{ key: 'audit', label: <><span style={{ marginInlineEnd: 2 }}>审计日志（热窗）</span><Tip term="audit" /></> },
+                { key: 'logs', label: <><span style={{ marginInlineEnd: 2 }}>请求明细（90 天）</span><Tip text="数据源是 MySQL 明细库，与「审计日志」页签的热窗是两套存储；仅调用元数据，行不可展开。" /></> }]} />
+      <Space direction="vertical" style={{ width: '100%' }} size={0}>
+      {tab === 'audit' ? (<>
       <Card>
         <Space wrap>
           <Select style={{ width: 140 }} value={f.since} options={AUDIT_RANGES}
@@ -245,20 +282,18 @@ export default function AuditPage() {
             /* 下拉项显示系统内置标记（label 仍是纯字符串，搜索按名字匹配不受影响） */
             optionRender={(opt) => <RuleZh name={opt.value} />}
             onChange={(v) => { const next = { ...f, rule: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Select style={{ width: 150 }} value={f.shadow || undefined} allowClear placeholder="影子"
-            options={[{ value: 'mismatch', label: '主影不一致' }]}
-            onChange={(v) => { const next = { ...f, shadow: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
-          <Select style={{ width: 130 }} value={f.status || undefined} allowClear placeholder="状态码"
-            options={[
-              { value: '2xx', label: '2xx 成功' },
-              { value: '4xx', label: '4xx 客户端' },
-              { value: '5xx', label: '5xx 错误' },
-              { value: '403', label: '403 拒绝' },
-              { value: '429', label: '429 限流' },
-              { value: '502', label: '502 上游' },
-              { value: '503', label: '503 不可用' },
-            ]}
-            onChange={(v) => { const next = { ...f, status: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
+          {/* 筛选行 = 表头列（时间/动作规则/模型/客户端IP）：无列的条件（影子/状态码/Provider）
+              不占位，仍可由全文搜索与 API 参数触达 */}
+          <Select style={{ width: 170 }} value={f.model || undefined} allowClear showSearch optionFilterProp="label"
+            placeholder="模型"
+            options={((data?.facets?.model) || []).map((v) => ({ value: v, label: v }))}
+            onChange={(v) => { const next = { ...f, model: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
+          <Select style={{ width: 150 }} value={f.ip || undefined} allowClear showSearch optionFilterProp="label"
+            placeholder="客户端 IP"
+            options={((data?.facets?.client_ip) || []).map((v) => ({ value: v, label: v }))}
+            onChange={(v) => { const next = { ...f, ip: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
+          {/* 筛选行 = 表头列（时间/动作规则/模型）：无列的条件（影子/状态码/Provider）不占位，
+              仍可由全文搜索与 API 参数触达 */}
           <Input style={{ width: 210 }} placeholder="全文搜索（内容/IP/调用方/模型/provider/L2/影子…）" allowClear value={f.q} onChange={setFld('q')} onPressEnter={search} />
           <Button type="primary" icon={<SearchOutlined />} onClick={search}>查询</Button>
            <Button type="primary" icon={<DownloadOutlined />} onClick={exportCsv}>导出 CSV</Button>
@@ -276,8 +311,17 @@ export default function AuditPage() {
           </Card>
         </>
       )}
-      <Card title={<>审计日志<Tip term="audit" /></>}
-        extra={<Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>查为什么拦/转内网（规则 / L2 判定）；查耗时和 token 去 <a onClick={() => { window.location.hash = '/logs'; }}>请求明细</a></Text>}>
+      </>) : (
+        <Suspense fallback={<div style={{ padding: 64, textAlign: 'center' }}><Spin /></div>}>
+          <LogsTab tableSlotRef={logsTableSlotRef} />
+        </Suspense>
+      )}
+      </Space>
+    </div>
+    {/* item 2：「审计日志」表（独立卡片；明细页签时是 LogsPage portal 进来的表） */}
+    {tab === 'audit' && (
+    <Card title="审计日志"
+        extra={<Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>查为什么拦/转内网（规则 / L2 判定）；展开行带该请求耗时 / token，90 天全量明细 <a onClick={() => switchTab('logs')}>切「请求明细」页签</a></Text>}>
       <Table className="audit-table" rowKey={(_, i) => i} columns={cols} dataSource={data?.entries || []} loading={loading} size="small"
         sticky={wideSticky()}
         tableLayout="fixed"
@@ -291,6 +335,11 @@ export default function AuditPage() {
           <Space className="audit-l2detail" direction="vertical" size={6} style={{ fontSize: 'var(--gw-fs-12)', maxWidth: 880, margin: '0 auto' }}>
             <Space wrap size={12}>
               <Text><Text strong>状态码：</Text>{rec.status_code || '—'}</Text>
+              {/* 行级联查（req_id → request_log）：401/非请求行/req_id 上线前的老行无明细，不渲染 */}
+              {rec.usage && <Text title="数据源：请求明细库（req_id 联查）"><Text strong>耗时：</Text>{rec.usage.duration_ms ?? 0}ms<Text type="secondary">（网关 {rec.usage.gateway_internal_ms ?? 0} / 上游 {rec.usage.upstream_ms ?? 0}）</Text></Text>}
+              {rec.usage && (rec.usage.prompt_tokens || rec.usage.completion_tokens)
+                ? <Text><Text strong>Token：</Text>{rec.usage.prompt_tokens || 0} / {rec.usage.completion_tokens || 0}{rec.usage.cached_tokens ? <Text type="secondary"> / {rec.usage.cached_tokens}</Text> : null}</Text>
+                : null}
               {rec.risk_score != null && <Text><Text strong>风险分：</Text>{rec.risk_score}</Text>}
               {rec.layer && <Text><Text strong>层级：</Text>{rec.layer}</Text>}
               {rec.session_id
@@ -313,7 +362,10 @@ export default function AuditPage() {
         }} />
         <SystemBuiltinLegend />
       </Card>
-    </Space>
+    )}
+    {/* 明细表落位槽：恒挂载（审计页签隐藏），portal 目标在 render 时恒可用 */}
+    <div ref={logsTableSlotRef} style={{ display: tab === 'logs' ? undefined : 'none' }} />
+    </>
   );
 }
 

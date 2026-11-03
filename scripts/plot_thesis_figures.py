@@ -1,11 +1,12 @@
-"""生成第 6 章的三张实验图（数据取自 docs/thesis/*.json，不手填数字）
+"""生成第 6 章的四张实验图（数据取自 docs/thesis/*.json，不手填数字）
 
 用法（隔离环境，勿装进生产 .venv）：
   /tmp/opencode/presidio-venv/bin/python scripts/plot_thesis_figures.py
 输出：
-  docs/thesis/figures/fig6-1-latency.png    图 6-1 各方案 P95 延迟
-  docs/thesis/figures/fig6-2-metrics.png    图 6-2 各方案召回/误报
-  docs/thesis/figures/fig6-3-ablation.png   图 6-3 L1 消融
+  docs/thesis/figures/fig6-1-latency.png       图 6-1 各方案 P95 延迟
+  docs/thesis/figures/fig6-2-concurrency.png   图 6-2 并发压测吞吐与 P99（需 perf-concurrency.json）
+  docs/thesis/figures/fig6-3-metrics.png       图 6-3 各方案召回/误报
+  docs/thesis/figures/fig6-4-ablation.png      图 6-4 L1 消融
 """
 import json
 import os
@@ -32,6 +33,8 @@ CASCADE = json.load(open(os.path.join(D, "cascade-baseline.json"), encoding="utf
 P_DEF = json.load(open(os.path.join(D, "presidio-baseline-default.json"), encoding="utf-8"))
 P_CN = json.load(open(os.path.join(D, "presidio-baseline-cn.json"), encoding="utf-8"))
 ABL = json.load(open(os.path.join(D, "ablation-l1.json"), encoding="utf-8"))["results"]
+_perf_path = os.path.join(D, "perf-concurrency.json")
+PERF = json.load(open(_perf_path, encoding="utf-8")) if os.path.exists(_perf_path) else None
 
 A, B, C = CASCADE["A_l1_only"], CASCADE["B_l2_only"], CASCADE["C_cascade"]
 METHODS = ["仅 L1", "仅 L2", "级联", "Presidio默认", "Presidio中文"]
@@ -67,7 +70,26 @@ bar_labels(ax, bars, "{:.2f}")
 ax.grid(axis="y", alpha=0.3)
 save(fig, "fig6-1-latency.png")
 
-# ---- 图 6-2 召回 / 误报
+# ---- 图 6-2 并发压测：吞吐与 P99（双轴；perf-concurrency.json 缺失时跳过）
+if PERF:
+    _conc = [int(k) for k in PERF["concurrency"]]
+    _qps = [PERF["concurrency"][str(k)]["qps"] for k in _conc]
+    _p99 = [PERF["concurrency"][str(k)]["p99_ms"] for k in _conc]
+    fig, ax1 = plt.subplots(figsize=(7, 3.6))
+    ax1.plot(_conc, _qps, "o-", color="#4C78A8", label="吞吐 (QPS)")
+    ax1.set_xlabel("并发数")
+    ax1.set_ylabel("吞吐 (QPS)")
+    ax2 = ax1.twinx()
+    ax2.plot(_conc, _p99, "s--", color="#E45756", label="P99 延迟 (ms)")
+    ax2.set_ylabel("P99 延迟 (ms)")
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="center right")
+    ax1.set_title("并发压测：吞吐与 P99 延迟（L2=qwen，每档 n=300，3 次中位数）")
+    ax1.grid(alpha=0.3)
+    save(fig, "fig6-2-concurrency.png")
+
+# ---- 图 6-3 召回 / 误报
 fig, ax = plt.subplots(figsize=(7, 3.6))
 x = range(len(METHODS))
 w = 0.38
@@ -82,9 +104,9 @@ bar_labels(ax, b1, "{:.1f}")
 bar_labels(ax, b2, "{:.1f}")
 ax.legend()
 ax.grid(axis="y", alpha=0.3)
-save(fig, "fig6-2-metrics.png")
+save(fig, "fig6-3-metrics.png")
 
-# ---- 图 6-3 消融
+# ---- 图 6-4 消融
 NAMES = {"Full": "全量", "-regular": "-正则", "-checksum": "-校验位",
          "-keyword": "-关键词", "-darkrule": "-暗语规则", "-piiweight": "-PII加权"}
 keys = list(NAMES)
@@ -102,4 +124,4 @@ bar_labels(ax, b1, "{:.1f}")
 bar_labels(ax, b2, "{:.2f}")
 ax.legend()
 ax.grid(axis="y", alpha=0.3)
-save(fig, "fig6-3-ablation.png")
+save(fig, "fig6-4-ablation.png")

@@ -44,34 +44,52 @@ JOB: dict = {"state": "idle", "stage": "", "started_at": 0.0, "log": [],
 _LOCK = threading.Lock()
 
 
-def versions() -> dict:
-    """盘上可用 checkpoint 版本（降序）+ 当前影子版本（读 var/laya-l2.env）。"""
-    vs = []
-    try:
-        for name in os.listdir(MODELS):
-            m = re.fullmatch(r"laya-finetuned-confidential-v(\d+)", name)
-            if m and os.path.isdir(os.path.join(MODELS, name)):
-                vs.append(int(m.group(1)))
-    except OSError:
-        pass
-    cur = None
+def _checkpoint_complete(d: str) -> bool:
+    """完整权重 = 扁平权重+配置（训练中断只有 checkpoint_latest/，缺 rl_agent_config.json）。"""
+    return all(os.path.exists(os.path.join(d, f)) for f in
+               ("rl_agent_config.json", "model.safetensors", "encoder", "tokenizer"))
+
+
+def _current_version() -> int | None:
+    """当前生效影子版本（var/laya-l2.env 指针）——回归 diff 的基线。"""
     try:
         with open(ENV_FILE, encoding="utf-8") as f:
             for line in f:
                 if line.startswith("LAYA_MODEL_PATH="):
                     m = re.search(r"v(\d+)\s*$", line.strip())
                     if m:
-                        cur = int(m.group(1))
+                        return int(m.group(1))
     except OSError:
         pass
-    return {"versions": sorted(vs, reverse=True), "current": cur}
+    return None
+
+
+def versions() -> dict:
+    """盘上可用 checkpoint 版本（降序）+ 当前影子版本（读 var/laya-l2.env）+ 残缺版本。
+
+    incomplete = 训练没跑完/没打包的目录（v35 事故形态）：不能晋升，评估卡标注。
+    """
+    vs = []
+    incomplete = []
+    try:
+        for name in os.listdir(MODELS):
+            m = re.fullmatch(r"laya-finetuned-confidential-v(\d+)", name)
+            if m and os.path.isdir(os.path.join(MODELS, name)):
+                n = int(m.group(1))
+                vs.append(n)
+                if not _checkpoint_complete(os.path.join(MODELS, name)):
+                    incomplete.append(n)
+    except OSError:
+        pass
+    return {"versions": sorted(vs, reverse=True), "current": _current_version(),
+            "incomplete": sorted(incomplete, reverse=True)}
 
 
 def list_reports() -> dict:
     """盘上评估报告（vN.json，版本升序）：管理台「版本评估」查看路径。
 
     job.done 的候选报告只在内存里（网关重启即失）；盘上报告是每版三门
-    （battery/现影子对照/标注回归/分歧回归）+ 相对上一版 diff 的持久历史。"""
+    （battery/现影子对照/标注回归/分歧回归）+ 相对现役版本 diff 的持久历史。"""
     out = []
     try:
         for n in os.listdir(REPORTS_DIR):
@@ -704,23 +722,29 @@ def _diff_reports(prev: dict, cur: dict) -> dict:
 
 
 def _attach_regression_diff(candidate: str) -> None:
-    """本版报告落盘 + 与上一版报告 diff。无历史版则跳过。"""
+    """本版报告落盘 + 与当前生效影子版本（var/laya-l2.env）的报告 diff；该版本无报告则不做。
+
+    基线 = 晋升时要替换的那个版本（当前 active），**不是单纯 ver-1**：中间有跳过/未晋升
+    的版本时，也要拿线上真正的对照口径比。**不许静默回退到更早的报告**（v35 显示
+    「相对上一版 v33」的旧坑）。"""
     m = re.search(r"v(\d+)$", candidate or "")
     ver = int(m.group(1)) if m else 0
+    base_ver = _current_version()
     prev = None
+    if base_ver is not None and base_ver != ver:
+        try:
+            path = os.path.join(REPORTS_DIR, f"v{base_ver}.json")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    prev = json.load(f).get("report")
+        except Exception as e:
+            _log("eval", f"生效版本报告读取失败（跳过回归diff）: {e!r}")
+    if prev is not None:
+        JOB["report"]["regressions"] = {"against": base_ver, **_diff_reports(prev, JOB["report"])}
+    else:
+        _log("eval", f"当前生效版本 v{base_ver} 无评估报告，跳过回归 diff")
     try:
         os.makedirs(REPORTS_DIR, exist_ok=True)
-        ids = sorted(int(n[1:-5]) for n in os.listdir(REPORTS_DIR)
-                     if re.fullmatch(r"v\d+\.json", n))
-        ids = [i for i in ids if i < ver]
-        if ids:
-            with open(os.path.join(REPORTS_DIR, f"v{ids[-1]}.json"), encoding="utf-8") as f:
-                prev = json.load(f).get("report")
-    except Exception as e:
-        _log("eval", f"历史报告读取失败（跳过回归diff）: {e!r}")
-    if prev is not None:
-        JOB["report"]["regressions"] = {"against": ids[-1], **_diff_reports(prev, JOB["report"])}
-    try:
         with open(os.path.join(REPORTS_DIR, f"v{ver}.json"), "w", encoding="utf-8") as f:
             json.dump({"version": ver, "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
                        "report": JOB["report"]}, f, ensure_ascii=False)
@@ -728,8 +752,21 @@ def _attach_regression_diff(candidate: str) -> None:
         _log("eval", f"报告落盘失败（不影响本次结果）: {e!r}")
 
 
+def _restore_env(old: str | None) -> None:
+    """晋升失败回滚指针（旧内容原样写回；没有旧内容则不动）。"""
+    if old is None:
+        return
+    tmp = ENV_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(old)
+    os.replace(tmp, ENV_FILE)
+
+
 def promote(version: int) -> dict:
-    """候选 checkpoint 晋升为影子模型：写 env 文件 + 无密重启 laya-l2 + 身份核对。"""
+    """候选 checkpoint 晋升为影子模型：预检 → 写 env 文件 → 无密重启 laya-l2 → 身份核对。
+
+    预检拦残缺权重（v35 事故形态），失败自动回滚指针并重启旧版——别让 UI 路径
+    再复现「指针写坏 + 崩溃循环」。"""
     with _LOCK:
         if JOB["state"] == "running":
             raise RuntimeError("优化任务在跑，稍后再晋升")
@@ -737,7 +774,15 @@ def promote(version: int) -> dict:
     candidate = os.path.join(MODELS, name)
     if not re.fullmatch(r"laya-finetuned-confidential-v\d+", name) or not os.path.isdir(candidate):
         raise FileNotFoundError(f"checkpoint 不存在：{candidate}")
+    if not _checkpoint_complete(candidate):
+        raise ValueError(f"{name} 缺完整权重（训练未完成/未打包），不能晋升")
     os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
+    old = None
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            old = f.read()
+    except OSError:
+        pass
     tmp = ENV_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(f"LAYA_MODEL_PATH={candidate}\n")
@@ -745,9 +790,16 @@ def promote(version: int) -> dict:
     r = subprocess.run(["sudo", "-n", "systemctl", "restart", "laya-l2.service"],
                        capture_output=True, text=True, timeout=180)
     if r.returncode != 0:
+        _restore_env(old)
         raise RuntimeError(f"laya-l2 重启失败: {r.stderr.strip()[-300:]}")
-    _wait_health(LIVE_URL, 180)
-    h = json.load(urllib.request.urlopen(LIVE_URL + "/health", timeout=5))
-    if h.get("model") != name:
-        raise RuntimeError(f"身份核对失败：服务跑的是 {h.get('model')}，期望 {name}")
+    try:
+        _wait_health(LIVE_URL, 180)
+        h = json.load(urllib.request.urlopen(LIVE_URL + "/health", timeout=5))
+        if h.get("model") != name:
+            raise RuntimeError(f"身份核对失败：服务跑的是 {h.get('model')}，期望 {name}")
+    except Exception:
+        _restore_env(old)
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "laya-l2.service"],
+                       capture_output=True, text=True, timeout=180)
+        raise
     return {"ok": True, "model": name, "env_file": ENV_FILE}

@@ -3,7 +3,8 @@
 用法: .venv/bin/python scripts/build_thesis_docx.py
 输出: docs/thesis/毕业论文-企业大模型数据防泄漏系统.docx
 
-目录与页码是 Word 域；首次打开若未自动刷新，Ctrl+A 后 F9 更新。
+目录条目带超链接（锚定标题 _Toc 书签），打开即可点击跳转；页码是域，
+updateFields=true 已设，Word/WPS 打开时自动刷新；若未刷新，Ctrl+A 后 F9。
 """
 import os
 import re
@@ -30,6 +31,28 @@ MONO = "Consolas"
 TEXT_WIDTH = Cm(15.5)
 MAX_FIG_H = Cm(18.0)
 INLINE = re.compile(r"(\*\*.+?\*\*|`[^`]+`)")
+
+
+# 正文标题段落（文档序）与 TOC 条目（同为文档序），保存前断言一一对应
+heading_paras = []
+toc_heads = []
+_BM_ID = [100]
+
+
+def _add_bookmark(p, name):
+    _BM_ID[0] += 1
+    bid = str(_BM_ID[0])
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), bid)
+    start.set(qn("w:name"), name)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), bid)
+    ppr = p._p.find(qn("w:pPr"))
+    if ppr is not None:
+        ppr.addnext(start)
+    else:
+        p._p.insert(0, start)
+    p._p.append(end)
 
 
 def set_run_font(run, size=12, bold=None, latin=LATIN, east=SERIF, color=None):
@@ -88,6 +111,7 @@ def heading(text, level, page_break=False):
     if page_break:
         p.paragraph_format.page_break_before = True
     add_inline(p, text, {1: 16, 2: 14, 3: 12}[level], east=SANS)
+    heading_paras.append(p)
     return p
 
 
@@ -517,6 +541,7 @@ def collect_toc_headings():
 
 def add_toc():
     heads = collect_toc_headings()
+    toc_heads[:] = heads
     for i, (lvl, text) in enumerate(heads):
         p = doc.add_paragraph(style=f"TOC {lvl}")
         pf = p.paragraph_format
@@ -539,9 +564,18 @@ def add_toc():
             el.set(qn("w:fldCharType"), "separate")
             r._r.append(el)
         size = 12 if lvl <= 2 else 10.5
-        set_run_font(p.add_run(text), size)
+        # 条目包在超链接里锚定 _Toc{i+1} 书签（保存时打到对应标题上），
+        # 与 Word 更新 TOC 域后生成的结构一致，打开即可点击跳转
+        hl = OxmlElement("w:hyperlink")
+        hl.set(qn("w:anchor"), f"_Toc{i + 1}")
+        hl.set(qn("w:history"), "1")
+        r = p.add_run(text)
+        set_run_font(r, size)
+        hl.append(r._r)
         r = p.add_run("\t")
         set_run_font(r, size)
+        hl.append(r._r)
+        p._p.append(hl)
         if i == len(heads) - 1:
             r = p.add_run()
             set_run_font(r, 12)
@@ -659,6 +693,14 @@ def main():
     body("（致谢内容待补充：导师、同学与家人。）", indent=True)
 
     render_file("16-appendix.md", {"skip_meta": True, "first_h1": False, "en": False})
+
+    # TOC 条目与正文标题一一对应，否则锚点会错位——直接失败，别生成坏文档
+    assert len(heading_paras) == len(toc_heads), \
+        f"TOC 条目 {len(toc_heads)} 与正文标题 {len(heading_paras)} 不一致"
+    for (lvl, t), p in zip(toc_heads, heading_paras):
+        assert p.text.strip() == t, f"TOC 与标题不一致: {t!r} != {p.text.strip()!r}"
+    for i, p in enumerate(heading_paras, 1):
+        _add_bookmark(p, f"_Toc{i}")
 
     page_setup()
     add_page_field(doc.sections[1], "lowerRoman", 1)

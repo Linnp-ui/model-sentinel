@@ -18,3 +18,12 @@ export const avg = (vs) => {
     shortcut: 非响应式读取（无 hook），拖窗跨 1200 时下一次渲染/轮询（各页 ≤30s）才生效。 */
 const _wideMq = typeof window === 'undefined' ? null : window.matchMedia('(min-width: 1200px)');
 export const wideSticky = () => (_wideMq ? _wideMq.matches : true);
+
+// 页内多页签共用一条 URL：只改自己负责的参数，保留其余（审计/明细两页签的筛选互不覆盖）。
+// 返回新 URLSearchParams 前先改，replaceState 不触发 hashchange（同页内写态的既有口径）。
+export const patchHashQuery = (mutate, path = '/audit') => {
+  const p = new URLSearchParams(window.location.hash.split('?')[1] || '');
+  mutate(p);
+  const qs = p.toString();
+  history.replaceState(null, '', '#' + path + (qs ? '?' + qs : ''));
+};

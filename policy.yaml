@@ -1,11 +1,3 @@
-# L1 规则集：按 priority 升序匹配，命中即停（数字小者优先，default_allow 恒垫底）。
-# 热重载（按文件 mtime 自动重读，不用重启）；但写错 action/priority 越界/缺 name 时
-# Pydantic 强校验会让每个请求都报 ValidationError，改对前网关不可用。
-# action: allow=放行外网 | route_local=降级内网模型 | block=拦截（实际行为看 routing.yaml 的 on_block）
-# target: 仅 route_local 用，省略时走 routing.yaml 的 default_local。
-# when 支持 ==/!=/in/contains_any/matches_regex/>=/<=，any/all 可嵌套；
-# 数值比较必须写成 "- 字段 >=: 值"（裸 "- 字段 >= 值" 会被 YAML 解析成字符串）。
-# 完整规则语义见 README「策略说明」；管理台规则页可增删改并干跑测试。
 policies:
 - name: block_secrets
   priority: 3
@@ -39,6 +31,30 @@ policies:
     - content_type: prompt
       match_type: contains
       match_value: sk-ant-, ghp_, aws_secret
+  locked: true
+  locked_priority: true
+  pinned: true
+  fixed_priority: true
+- name: session_route_local
+  priority: 4
+  action: route_local
+  description: 会话级路由本地：会话内出现机密判定（机密文件 / 纯文本 L1 命中 / L2 判密）后，同会话 chat/messages/responses
+    请求自动走本地模型；TTL 随 AI_GATEWAY_SESSION_TTL（默认 30 分钟，生产 .env 为 7 天），可用性兜底转本地不标记
+  when:
+    any:
+    - session.confidential == true: true
+  target:
+    provider: vllm_local
+    model: qwen2.5:7b
+  priority_locked: true
+  match:
+    content_type: session_confidential
+    match_type: bool
+    match_value: 'true'
+  locked: true
+  locked_priority: true
+  pinned: true
+  fixed_priority: true
 - name: tainted_file_ref
   priority: 5
   action: route_local
@@ -49,11 +65,15 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
-  priority_locked: true
+  priority_locked: false
   match:
     content_type: tainted_file
     match_type: bool
     match_value: 'true'
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: financial_local_only
   priority: 10
   action: route_local
@@ -96,17 +116,26 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
-- name: session_route_local
-  priority: 12
-  action: route_local
-  description: 会话级路由本地：会话内出现机密判定（机密文件 / 纯文本 L1 命中 / L2 判密）后，同会话 chat/messages/responses
-    请求自动走本地模型；TTL 随 AI_GATEWAY_SESSION_TTL（默认 30 分钟，生产 .env 为 7 天），可用性兜底转本地不标记
-  when:
-    any:
-    - session.confidential == true: true
-  target:
-    provider: vllm_local
-    model: qwen2.5:7b
+  priority_locked: false
+  match:
+    combiner: any
+    rows:
+    - content_type: sheet_names
+      match_type: contains
+      match_value: 工资, 薪资, 财务, 预算, 决算, 成本, 营收, 利润, 资产负债
+    - content_type: headers
+      match_type: contains
+      match_value: 姓名, 身份证, 工资, 薪资, 银行账号, 银行卡, 金额, 成本, 利润, 营收
+    - content_type: filename
+      match_type: contains
+      match_value: 工资, 薪资, 财务, 预算, salary, financial, cost
+    - content_type: prompt
+      match_type: contains
+      match_value: 财务报表, 资产负债, 利润表
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: unparsed_binary_route_local
   priority: 13
   description: 'P0-3b fix: 扩展名伪装 / 未知或损坏二进制（magic 嗅探失败或富格式分支解析失败） -> fail-CLOSED route_local，取代旧的「把二进制
@@ -119,10 +148,15 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
+  priority_locked: false
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: remote_attachment_route_local
   priority: 14
-  description: 远端 URL 附件（image_url / file.url / document source.type=url，字节不过网关）⇒ 内容不可检 ⇒
-    fail-closed 转内网，不 fail-open 放行（与未解析二进制同口径：看不见的内容不出境）
+  description: 远端 URL 附件（image_url / file.url / document source.type=url，字节不过网关）⇒
+    内容不可检 ⇒ fail-closed 转内网，不 fail-open 放行（与未解析二进制同口径：看不见的内容不出境）
   when:
     any:
     - findings.remote_attachment == true: true
@@ -130,6 +164,11 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
+  priority_locked: false
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: pii_weighted_route_local
   priority: 20
   action: route_local
@@ -140,6 +179,11 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
+  priority_locked: false
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: ocr_empty_image_route_local
   priority: 30
   action: route_local
@@ -151,6 +195,11 @@ policies:
   target:
     provider: vllm_local
     model: qwen2.5:7b
+  priority_locked: false
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: drawing_local_only
   priority: 40
   action: route_local
@@ -216,8 +265,18 @@ policies:
       match_type: contains
       match_value: 机密, 保密, confidential, secret, 图纸, 施工图, 结构图, 竣工图, 图号, blueprint,
         CAD, BIM
+  priority_locked: false
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false
 - name: default_allow
   priority: 100
   description: 默认外网（provider 留空 = 用 routing.yaml 的 default_external）
   when: always
   action: allow
+  priority_locked: false
+  locked: false
+  locked_priority: false
+  pinned: false
+  fixed_priority: false

@@ -170,7 +170,7 @@ class ApiKeyUpdateReq(BaseModel):
 
 
 class KeyRuleCreateReq(BaseModel):
-    kind: str = Field(pattern="^(black|white)$")
+    kind: str = Field(pattern="^(black|white|middle)$")
     key_value: str = Field(default="", max_length=256)
     key_name: str = Field(default="", max_length=128)
     note: str = Field(default="", max_length=512)
@@ -307,8 +307,8 @@ def delete_key(kid: int):
 
 @router.get("/keyrules")
 def list_keyrules(kind: Optional[str] = None):
-    if kind and kind not in ("black", "white"):
-        raise HTTPException(422, "kind 只能是 black 或 white")
+    if kind and kind not in ("black", "white", "middle"):
+        raise HTTPException(422, "kind 只能是 black/white/middle")
     items = get_admin_store().list_key_rules(kind)
     for it in items:
         it["key_masked"] = mask_key(it.pop("key_value", ""))
@@ -397,6 +397,7 @@ def list_logs_api(
     action: str = "",
     provider: str = "",
     status_code: int = 0,
+    blocked_reason: str = "",
     hours: float = 168.0,
 ):
     """请求明细分页（新→旧）。"""
@@ -405,7 +406,7 @@ def list_logs_api(
     return store.list_request_logs(
         limit=limit, offset=offset, ip=ip, key_name=key_name,
         model=model, action=action, provider=provider, status_code=status_code,
-        since=since, until=until,
+        blocked_reason=blocked_reason, since=since, until=until,
     )
 
 
@@ -2066,8 +2067,11 @@ def events_api(hours: int = 24):
 
 @router.get("/rule-hits")
 def rule_hits_api(hours: int = 168):
-    """规则命中统计：audit_logs 窗口按 rule 聚合（排除 默认放行，含改名前旧名 default_allow
-    的历史行）。L2 判决（l2_confidential/l2_unavailable）与系统内置 fail-safe 判定
+    """规则命中统计：audit_logs 窗口按 rule 聚合（排除 默认放行 与 全内网别名放行，
+    含改名前旧名 default_allow 的历史行）。local_alias_bypass 是路由直通、不是
+    内容规则命中，全内网别名组流量大时会占满 Top 10，故与 默认放行 同口径排除
+    （items 与 total 都排除，占比才凑得满 100%）。
+    L2 判决（l2_confidential/l2_unavailable）与系统内置 fail-safe 判定
     （encoded_keyword/review_text_overflow/first_chunk_fallback/prompt_too_long_fallback）
     都计入——审计页要显示，规则命中榜保持同一集合，界面上由 ruleZh 标「（系统内置）」，
     用户一眼能看出它不是可配置规则。带 action 分布 + 最后命中（UTC）。
@@ -2086,7 +2090,8 @@ def rule_hits_api(hours: int = 168):
     total = 0
     for r in rows:
         name = r.get("rule") or ""
-        if not name or name in ("default_allow", "默认放行"):
+        # 默认放行 / 全内网别名放行：路由口径而非内容规则命中，不进榜（total 同口径）
+        if not name or name in ("default_allow", "默认放行", "local_alias_bypass"):
             continue
         total += 1
         a = agg.setdefault(name, {"rule": name, "count": 0, "actions": {}, "last_seen": ""})

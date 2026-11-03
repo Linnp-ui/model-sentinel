@@ -167,7 +167,6 @@ export default function L2Page() {
     try {
       const d = await api('/l2/retrain/reports');
       setReports(d.reports || []);
-      setRepVer((cur) => cur || String((d.reports || []).slice(-1)[0]?.version ?? ''));
       setRepErr('');
     } catch (e) { setRepErr(errText(e)); }  // 报错与「盘上无报告」区分，别给假阴性
   }, []);
@@ -254,7 +253,7 @@ export default function L2Page() {
               )}
               {job.report?.regressions && (
                 <div style={{ fontSize: 'var(--gw-fs-13)', width: '100%' }}>
-                  <Text>相对 v{job.report.regressions.against}：</Text>
+                  <Text>相对现役版本 v{job.report.regressions.against}：</Text>
                   {job.report.regressions.new.length > 0
                     ? <Text type="danger">新错 {job.report.regressions.new.length} 条：{job.report.regressions.new.join('；')}</Text>
                     : <Text type="success">零新错</Text>}
@@ -310,9 +309,11 @@ export default function L2Page() {
         {job?.state !== 'running' && (
           <Space size={4}>
             <Select size="small" placeholder="版本" value={promVer || undefined}
-              onChange={setPromVer} style={{ width: 130 }}
+              onChange={setPromVer} style={{ width: 170 }}
               options={vers.versions.map((v) => ({
-                value: String(v), label: `v${v}${v === vers.current ? '（现影子）' : ''}`,
+                value: String(v),
+                label: `v${v}${v === vers.current ? '（现影子）' : ''}${(vers.incomplete || []).includes(v) ? '（训练未完成）' : ''}`,
+                disabled: (vers.incomplete || []).includes(v),
               }))} />
             <Popconfirm title={isLaya
               ? `已切 laya 权威、影子管道不适用（backend=laya 时 laya 即主判，无独立影子可晋升）`
@@ -334,21 +335,29 @@ export default function L2Page() {
   );
 
   // 版本评估：盘上报告的持久历史（上面优化管道卡只挂最近一轮的内存报告，重启即失）
+  // 版本下拉以**模型版本**为准（不是报告为准）：v35 这类没报告的版本也要能看到并标注
+  // 「无报告」；已晋升为当前影子的版本不展示评估内容（晋升后评估已失去决策意义）。
   const ReportCard = () => {
-    const sel = reports.find((r) => String(r.version) === repVer) || null;
+    const repValue = repVer || (vers.versions.length ? String(vers.versions[0]) : '');
+    const sel = reports.find((r) => String(r.version) === repValue) || null;
+    const isCurrent = sel && vers.current != null && sel.version === vers.current;
     return (
-      <Card title={<>{'版本评估'}<Tip text="各影子版本的评估报告（训练完生成、重启不丢）：三门检查 + 相对上一版的回归 diff。晋升前先核对。" /></>}
+      <Card title={<>{'版本评估'}<Tip text="各影子版本的评估报告（训练完生成、重启不丢）：三门检查 + 相对现役版本的回归 diff。晋升前先核对；已晋升版本只留版本记录。" /></>}
         style={{ marginBottom: 'var(--gw-sp-12)' }}
-        extra={reports.length > 0 && (
-          <Select size="small" value={repVer || undefined} onChange={setRepVer} style={{ width: 150 }}
-            options={[...reports].reverse().map((r) => ({
-              value: String(r.version),
-              label: `v${r.version}${r.version === vers.current ? '（现影子）' : ''}`,
+        extra={vers.versions.length > 0 && (
+          <Select size="small" value={repValue || undefined} onChange={setRepVer} style={{ width: 190 }}
+            options={vers.versions.map((v) => ({
+              value: String(v),
+              label: `v${v}${v === vers.current ? '（现影子）' : ''}${reports.some((r) => r.version === v) ? '' : '（无报告）'}`,
             }))} />
         )}>
-        {!sel ? (repErr
+        {!repValue ? (repErr
           ? <Text type="danger">评估报告加载失败：{repErr}</Text>
-          : <Text type="secondary">盘上暂无评估报告（优化管道训练完成后生成）。</Text>) : (() => {
+          : <Text type="secondary">盘上暂无评估报告（优化管道训练完成后生成）。</Text>) : !sel ? (
+          <Text type="secondary">v{repValue} 暂无评估报告（训练未完成或未评测）。</Text>
+        ) : isCurrent ? (
+          <Text type="secondary">v{sel.version} 已是当前影子（已晋升），不再展示评估内容。</Text>
+        ) : (() => {
           const b = sel.report?.battery || {};
           const base = sel.report?.baseline;
           const lb = sel.report?.labeled || {};
@@ -366,7 +375,7 @@ export default function L2Page() {
               </Space>
               {rg && (
                 <Space wrap size={6}>
-                  <Text><Text strong>相对上一版 v{rg.against}：</Text></Text>
+                  <Text><Text strong>相对现役版本 v{rg.against}：</Text></Text>
                   {rg.new.length > 0
                     ? <Text type="danger">新错 {rg.new.length} 条：{rg.new.join('；')}</Text>
                     : <Text type="success">零新错</Text>}

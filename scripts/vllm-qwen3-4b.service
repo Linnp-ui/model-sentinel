@@ -32,8 +32,8 @@ RestartSec=5
 StartLimitBurst=10
 StartLimitIntervalSec=60
 
-StandardOutput=append:/home/your-user/gateway/qwen3_4b.log
-StandardError=append:/home/your-user/gateway/qwen3_4b.log
+StandardOutput=append:/home/your-user/gateway/logs/qwen3_4b.log
+StandardError=append:/home/your-user/gateway/logs/qwen3_4b.log
 
 [Install]
 WantedBy=multi-user.target

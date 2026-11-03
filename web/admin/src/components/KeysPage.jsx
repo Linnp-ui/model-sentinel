@@ -106,8 +106,8 @@ export default function KeysPage() {
           <Dropdown menu={{ items: [{
             key: 'logs',
             label: '调用明细',
-            title: '跳请求明细：按该 KEY 名称过滤的调用记录（含延迟 / token 分解）',
-            onClick: () => { window.location.hash = `/logs?key_name=${encodeURIComponent(rec.name || '')}`; },
+            title: '跳审计日志·请求明细页签：按该 KEY 名称过滤的调用记录（含延迟 / token 分解）',
+            onClick: () => { window.location.hash = `/audit?tab=logs&l_key=${encodeURIComponent(rec.name || '')}`; },
           }] }}>
             <Button type="text" aria-label="更多操作" icon={<MoreOutlined />} />
           </Dropdown>
