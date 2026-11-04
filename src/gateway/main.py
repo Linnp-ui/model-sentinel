@@ -1116,12 +1116,46 @@ def _system_text_anthropic(body) -> str:
 
 
 def _system_text_responses(body) -> str:
-    """OpenAI Responses instructions 字段（str；codex 在此携带客户端指令）。"""
+    """Responses 端点 system 区 = 顶层 instructions 字段 + input 里 system/developer
+    角色消息 item（换行拼接）。
+
+    两个都是协议合法 system 通道（instructions ≡ input 头部 developer 消息）。
+    codex 实测走后者（2026-11-04 审计：instructions_len=0、input_sys_items=3）——
+    只读 instructions 会把 codex 的 developer prompt 整个漏出 L2 语义视野
+    （L1 全文正则仍覆盖，但无语义判密；Auto-AB 可路由外网 ⇒ 结构性盲区复现）。"""
+    parts = []
     try:
         s = (body or {}).get("instructions")
-        return s.strip() if isinstance(s, str) else ""
+        if isinstance(s, str) and s.strip():
+            parts.append(s.strip())
+        inp = (body or {}).get("input")
+        if isinstance(inp, list):
+            for it in inp:
+                if isinstance(it, dict) and it.get("role") in ("system", "developer"):
+                    t = _msg_content_to_str(it.get("content")).strip()
+                    if t:
+                        parts.append(t)
     except Exception:
-        return ""
+        pass
+    return "\n".join(parts)
+
+
+def _responses_system_items(body) -> int:
+    """input 里 system/developer 角色消息 item 的计数（协议第二个 system 通道）。
+
+    只计数不落内容；审计用它回答"客户端有没有把 system 塞进 input"
+    （instructions_len=0 时的第二种藏身处排查）。"""
+    inp = (body or {}).get("input")
+    if not isinstance(inp, list):
+        return 0
+    n = 0
+    try:
+        for it in inp:
+            if isinstance(it, dict) and it.get("role") in ("system", "developer"):
+                n += 1
+    except Exception:
+        pass
+    return n
 
 
 # ---- L2 scope 名（docs/l2-scope-extension-plan-2026-09-16.md §3.1）----
@@ -1948,11 +1982,13 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
             _l2_scope_warn("无有效判定块，已回退 last_user")
         # system diff 触发：变化（含首见）⇒ 在 last_user 基线之后插 system 块。5 槽上限溢出时
         # tool/history/long_text 掉在最后（下次请求 system 未变、恢复全槽），基线不挤。
+        # 截断必须显式做在这里：classify_chunks 内部 chunks[:5] 会静默砍队尾块，但审计
+        # scopes_run 按 _dec_blocks 记 ⇒ 不截断 = 虚报「判了 6 块」（2026-11-04 生产实测）。
         _sys = []
         if system_text:
             _sys = await _system_diff_chunks(system_text, request)
             if _sys:
-                _dec_blocks = _dec_blocks[:1] + _sys + _dec_blocks[1:]
+                _dec_blocks = (_dec_blocks[:1] + _sys + _dec_blocks[1:])[:_L2_SCOPE_MAX_BLOCKS]
         _hit = _dec_blocks[0][0]
         if len(_dec_blocks) == 1:
             # 单块（默认档 scopes=["last_user"]）仍走 classify —— 与历史逐字节等价
@@ -3299,10 +3335,12 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
         _media_extra["ocr_empty_and_image"] = True
     if inline_remote:
         _media_extra["remote_attachment"] = True
+    _sys_text = _system_text_responses(body)
+    _sys_items = _responses_system_items(body)
     decision, text_findings, l2_result = await _review_text(
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""),
-        session_hint=session_id, system_text=_system_text_responses(body))
+        session_hint=session_id, system_text=_sys_text)
     # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
     _note_file_findings(inline_findings)
 
@@ -3321,7 +3359,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     if decision.get("action") == "block":
 
         await run_in_threadpool(log_entry, {"l2": l2_result, "client_ip": _resolve_client_ip(request), "requested_model": str(body.get("model") or ""), "type": "responses", "action": "block", "rule": decision.get("name"), "text_preview": audit_preview,
-        "session_id": session_id,})
+        "instructions_len": len(_sys_text), "input_sys_items": _sys_items, "session_id": session_id,})
         raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"),
 
                                          "message": "请求因机密策略被拦截，未转发至外网"})
@@ -3373,6 +3411,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
                                 "type": "responses", "action": "route_local", "rule": "first_chunk_fallback",
 
                                 "provider": lp.name, "local": True, "text_preview": audit_preview,
+                                "instructions_len": len(_sys_text), "input_sys_items": _sys_items,
 
                                 "downgraded_from": "upstream_error", "stream": True, "session_id": session_id})
 
@@ -3405,7 +3444,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
             "type": "responses", "action": decision.get("action"), "rule": decision.get("name"),
             "provider": prov.name, "local": prov.local, "model": model,
             "text_preview": audit_preview, "downgraded_from": downgraded, "stream": True, "filename": file_ctx.get("filename") or "",
-            "session_id": session_id,
+            "instructions_len": len(_sys_text), "input_sys_items": _sys_items, "session_id": session_id,
 
         })
         return StreamingResponse(gen(), media_type="text/event-stream", headers={
@@ -3442,6 +3481,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
         "type": "responses", "action": decision.get("action"), "rule": decision.get("name"),
         "provider": gw["provider"], "local": gw["local"], "model": model,
         "text_preview": audit_preview, "downgraded_from": downgraded, "session_id": session_id, "filename": file_ctx.get("filename") or "",
+        "instructions_len": len(_sys_text), "input_sys_items": _sys_items,
 
     })
     return JSONResponse(result)

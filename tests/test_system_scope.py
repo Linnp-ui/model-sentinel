@@ -178,6 +178,32 @@ def test_huge_system_judged_but_not_stored(monkeypatch):
     assert calls[-1][1].count("system") == 4
 
 
+def test_system_overflow_trims_tail_scopes(monkeypatch):
+    # 5 槽硬上限：last_user + history(2 槽) + 首见 4 system 块 ⇒ history 掉队尾，
+    # 送判恰 5 块且 scopes 与实判一致（回归：不显式截断时 classify_chunks 内部
+    # chunks[:5] 静默砍第 6 块，审计 scopes_run 虚报——2026-11-04 生产实测 6 块）
+    store = get_session_store()
+    with store._mem_lock:
+        store._mem["__system_text__"] = {}          # 清掉前序用例的存储 ⇒ 强制首见
+    monkeypatch.setattr(_m, "_l2_scope_cfg",
+                        lambda: {"scopes": [_m._L2_SCOPE_LAST_USER, _m._L2_SCOPE_HISTORY],
+                                 "chunk_chars": 1200, "budget_chars": 6000})
+    fake, calls = _fake_multi([])
+    monkeypatch.setattr(_m, "classify_chunks", fake)
+    monkeypatch.setenv("AI_GATEWAY_L2_ALWAYS", "true")
+    body = {"model": "deepseek-flash",
+            "messages": [{"role": "system", "content": "系" * 5000},   # 首见 ⇒ 均匀抽 4 块
+                         {"role": "user", "content": "第一问 历史甲"},
+                         {"role": "user", "content": "第二问 历史乙"},
+                         {"role": "user", "content": "第三问"}]}
+    r = client.post("/v1/chat/completions", headers=H, json=body)
+    assert r.json()["gateway"]["action"] == "allow"
+    chunks, scopes = calls[-1]
+    assert len(chunks) == 5, f"5 槽硬上限被突破: {scopes}"
+    assert scopes == ["last_user", "system", "system", "system", "system"], \
+        f"溢出应砍队尾 history（不判的块不得进 scopes_run）: {scopes}"
+
+
 def test_system_extractors():
     assert _m._system_text_chat([{"role": "system", "content": "A"},
                                   {"role": "user", "content": "q"},
@@ -189,3 +215,12 @@ def test_system_extractors():
     assert _m._system_text_anthropic({"messages": []}) == ""
     assert _m._system_text_responses({"instructions": "I"}) == "I"
     assert _m._system_text_responses({"input": []}) == ""
+    # 第二个 system 通道：input 里 system/developer item（codex 实测走这个，2026-11-04）
+    assert _m._system_text_responses({"input": [
+        {"role": "system", "content": "S1"},
+        {"role": "user", "content": "q"},
+        {"role": "developer", "content": [{"type": "input_text", "text": "S2"}]},
+    ]}) == "S1\nS2"
+    # 两通道并存：instructions 在前、input item 在后
+    assert _m._system_text_responses({"instructions": "I", "input": [
+        {"role": "system", "content": "S1"}, {"role": "user", "content": "q"}]}) == "I\nS1"

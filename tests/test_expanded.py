@@ -684,6 +684,46 @@ def test_responses_audit_preview_codex_slim():
     assert _audit_preview_responses({"input": [{"role": "user", "content": title}]}, "") == "把这段代码改成 Rust"
     assert _audit_preview_responses({"input": "总结一下 CAP 定理"}, "") == "总结一下 CAP 定理"
 
+def test_responses_audit_records_instructions_len():
+    """审计记 instructions 长度（不落内容，DLP 不把客户端指令原文持久化）：0 = 客户端没发。"""
+    from src.gateway.audit_store import get_audit_store
+
+    def _last_responses(marker):
+        store = get_audit_store()
+        with store._mem_lock:
+            rows = list(store._mem)
+        for r in reversed(rows):
+            if r.get("type") == "responses" and marker in str(r.get("text_preview", "")):
+                return r
+        return None
+
+    instr = "custom developer prompt 12345"
+    r = client.post("/v1/responses", headers=H,
+                    json={"model": "deepseek-flash", "instructions": instr,
+                          "input": "instrlen-带instructions的请求"})
+    assert r.status_code == 200
+    e = _last_responses("instrlen-带instructions")
+    assert e is not None and e.get("instructions_len") == len(instr)
+    assert e.get("input_sys_items") == 0
+
+    r2 = client.post("/v1/responses", headers=H,
+                     json={"model": "deepseek-flash", "input": "instrlen-不带instructions"})
+    assert r2.status_code == 200
+    e2 = _last_responses("instrlen-不带instructions")
+    assert e2 is not None and e2.get("instructions_len") == 0
+    assert e2.get("input_sys_items") == 0
+
+    # 协议第二个 system 通道：system/developer 角色 item 塞在 input 里 ⇒ 计数 2
+    r3 = client.post("/v1/responses", headers=H,
+                     json={"model": "deepseek-flash", "input": [
+                         {"role": "system", "content": "sys item in input"},
+                         {"role": "developer", "content": "dev item in input"},
+                         {"role": "user", "content": "instrlen-带system-item"}]})
+    assert r3.status_code == 200
+    e3 = _last_responses("instrlen-带system-item")
+    assert e3 is not None and e3.get("input_sys_items") == 2
+
+
 # ---------- 8b. 2026-10-14 红队修复回归：tools 免审通道 / 审查文本总量预算 ----------
 
 def test_tools_description_is_reviewed_responses():
