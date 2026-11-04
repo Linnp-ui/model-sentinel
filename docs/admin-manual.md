@@ -50,8 +50,8 @@
 落盘 `model_policy.yaml`，热重载生效。L2 提示词（system + user 模板）可在线改，
 空串=还原默认，占位符 `{filename} {sheet_names} {headers} {preview}`。
 另有代码驱动的 **system diff 触发**（非配置项，无开关）：客户端自写的 system/instructions
-内容变化（含首见）时，L2 自动补判其尾部内容一次，审计 scope 列会出现 `system`；
-判定不可用时不落指纹，下个灰区请求自动重判。
+内容变化（含首见）时，L2 按与上次已判内容的差异自动补判**改动区**（首见或改动过大时退
+均匀抽样），审计 scope 列会出现 `system`；判定不可用时不记录上次内容，下个灰区请求自动重判。
 
 ### 3.3 测试区
 

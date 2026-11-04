@@ -29,7 +29,7 @@ DEFAULT_TTL_SECONDS = int(os.getenv("AI_GATEWAY_SESSION_TTL", "1800"))  # 30 min
 KEY_PREFIX = "gateway:session:"
 TAINT_PREFIX = "gateway:taint:"
 STICKY_PREFIX = "gateway:stickytier:"
-SYSFP_PREFIX = "gateway:sysfp:"
+SYSTEXT_PREFIX = "gateway:systext:"
 # 粘性档位键的 Redis TTL：调用方窗口（env）+ 余量；过期即惰性失效，不依赖它判窗口
 _STICKY_KEY_TTL = 90 * 60
 
@@ -299,15 +299,16 @@ class SessionStore:
                 return None
             return (int(d.get("tier") or 0), int(d.get("ts") or 0))
 
-    # ---- system diff 指纹（2026-11-04，见 main._system_diff_chunks）----
-    # 独立键：按 key 身份记「最后一次真正过了 L2 语义判定的 system/instructions 指纹」。
-    # TTL 用会话口径：过期后未变内容也会在下个灰区请求重判一次（保守重验，成本 = 一次 L2 调用）。
+    # ---- system diff 上次文本（2026-11-04，见 main._system_diff_chunks）----
+    # 独立键：按 key 身份存「最后一次真正过了 L2 语义判定的 system/instructions 全文」——
+    # diff 定位改动区需要旧文本身（只存指纹无法定位改动位置）。
+    # TTL 用会话口径：过期后按首见处理（均匀抽样重判一次，保守重验）。
 
-    def get_system_fp(self, key_id: str) -> str:
-        """最后一次已判定的 system 指纹；'' = 从未判定/已过期（调用方视''为「已变化」）。"""
+    def get_system_text(self, key_id: str) -> str:
+        """上一次已判定的 system 全文；'' = 从未判定/已过期（调用方视''为首见）。"""
         if not key_id:
             return ""
-        k = f"{SYSFP_PREFIX}{hashlib.sha256(key_id.encode('utf-8')).hexdigest()[:16]}"
+        k = f"{SYSTEXT_PREFIX}{hashlib.sha256(key_id.encode('utf-8')).hexdigest()[:16]}"
         if self._r is not None:
             try:
                 raw = self._r.get(k)
@@ -318,30 +319,30 @@ class SessionStore:
                 self._r = None
                 self._r_disabled = True
         with self._mem_lock:
-            v = (self._mem.get("__system_fp__") or {}).get(k)
+            v = (self._mem.get("__system_text__") or {}).get(k)
             if not v:
                 return ""
             if time.time() - v.get("ts", 0) > DEFAULT_TTL_SECONDS:
-                (self._mem.get("__system_fp__") or {}).pop(k, None)
+                (self._mem.get("__system_text__") or {}).pop(k, None)
                 return ""
-            return str(v.get("fp") or "")
+            return str(v.get("text") or "")
 
-    def set_system_fp(self, key_id: str, fp: str) -> None:
-        """记已判定的 system 指纹；任何失败静默跳过（绝不影响主链路）。"""
-        if not key_id or not fp:
+    def set_system_text(self, key_id: str, text: str) -> None:
+        """存已判定的 system 全文；任何失败静默跳过（绝不影响主链路）。"""
+        if not key_id or not text:
             return
-        k = f"{SYSFP_PREFIX}{hashlib.sha256(key_id.encode('utf-8')).hexdigest()[:16]}"
+        k = f"{SYSTEXT_PREFIX}{hashlib.sha256(key_id.encode('utf-8')).hexdigest()[:16]}"
         now = int(time.time())
         try:
             if self._r is not None:
-                self._r.set(k, fp, ex=DEFAULT_TTL_SECONDS)
+                self._r.set(k, text, ex=DEFAULT_TTL_SECONDS)
                 return
         except Exception:
             self._r = None
             self._r_disabled = True
         with self._mem_lock:
-            d = self._mem.setdefault("__system_fp__", {})
-            d[k] = {"fp": fp, "ts": now}
+            d = self._mem.setdefault("__system_text__", {})
+            d[k] = {"text": text, "ts": now}
             if len(d) > 500:
                 for k2 in sorted(d, key=lambda k2: d[k2].get("ts", 0))[:len(d) - 500]:
                     d.pop(k2, None)

@@ -1244,38 +1244,80 @@ def _l2_long_windows(src: str, cc: int, limit: int, start: int = 0) -> list:
     return [rest[i * cc:(i + 1) * cc] for i in idx]
 
 
-# ---- L2 system diff 触发（2026-11-04）----
+# ---- L2 system diff 触发（2026-11-04；v2 同日：尾部取向 → 改动区判定）----
 # 无 L1 模式的机密 payload 可搭客户端可写的 system/instructions 出境（last_user 无害、
 # L2 其他视野全从用户消息流派生 ⇒ 结构性看不见该字段）。内容「变化」（含首见，未知≠可信）
-# 时在判定块前部插入 1~2 块送语义判定；指纹只在拿到可信判定后由调用方记录——
-# degraded/L2 disabled 不记 ⇒ 未判状态不失效，下个灰区请求重判。
-_SYSFP_MAX_BLOCKS = 2   # 2×chunk_chars（默认 2400 字），尾部取向：样板前缀恒定、粘贴内容落尾部
+# 时插入至多 _SYS_MAX_BLOCKS 个 system 块送语义判定。各客户端 system 结构不同、改动位置
+# 不定（v1 尾部取向是错误的位置假设），故存上次全文（store）、diff 定位改动区判那里；
+# 首见（无旧文可 diff）/ 改动区超预算 / 超长守卫 ⇒ 退均匀抽样（与 long_text 同口径，
+# 无位置偏置；抽样缝隙的 payload 靠 L1 全文正则兜底）。
+# 上次全文只在拿到可信判定后由调用方落写 —— degraded/L2 disabled 不记 ⇒ 未判状态不失效，
+# 下个灰区请求重判。
+_SYS_MAX_BLOCKS = 4             # system 判定窗上限（4×chunk_chars，默认 4800 字）
+_SYS_DIFF_CTX = 100             # 改动区两侧各扩 100 字作判定上下文
+_SYS_DIFF_MAX_INPUT = 300_000   # difflib 输入守卫：超限直接退抽样（防对抗长文本拖慢 diff）
 
 
-def _system_fp(system_text: str) -> str:
-    """指纹按全文算（任何位置变化都算变化；判的是尾部窗，保守）。"""
-    return hashlib.sha256((system_text or "").encode("utf-8", "replace")).hexdigest()[:32]
+def _system_diff_spans(old: str, new: str) -> Optional[list]:
+    """new 中改动区（两侧各扩 _SYS_DIFF_CTX 上下文、重叠合并）。
+
+    输入超守卫返回 None（调用方退均匀抽样）；old==new 返回 []。
+    精度边界：autojunk 对重复样板（同一字符 >1%）匹配变粗，改动区会膨胀超预算
+    ⇒ 自然退抽样（与 long_text 同口径）；多样文本（真实指令段）各尺寸均精确定位
+    （实测 2KB 1ms / 150KB 64ms）。不要试 autojunk=False 重试：100KB 随机文本
+    实测分钟级（O(n²) 无 junk 剪枝），会把变更请求拖死。
+    """
+    if len(old) + len(new) > _SYS_DIFF_MAX_INPUT:
+        return None
+    import difflib
+    spans = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old, new).get_opcodes():
+        if tag == "equal":
+            continue
+        spans.append((max(0, j1 - _SYS_DIFF_CTX), min(len(new), j2 + _SYS_DIFF_CTX)))
+    if not spans:
+        return []
+    spans.sort()
+    merged = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
 
 
 async def _system_diff_chunks(system_text: str, request) -> list:
     """system/instructions 变化（含首见）⇒ 返回 [(system, chunk), ...]；未变/无身份 ⇒ []。
 
-    尾部截 2×chunk_chars 再切块（shortcut: 只判尾部窗，payload 藏在超长 system 中段时靠
-    L1 全文正则兜；要全量覆盖再升级成分块全判）。无身份绑定键（干跑/匿名）不判不记。
+    判定窗 = 改动区（与 store 中上次已判定文本 diff，定位客户端真正改的位置）；改动区合计
+    ≤ 4×cc 全判，超限/首见/守卫 ⇒ 均匀抽 4×cc。无身份绑定键（干跑/匿名）不判不记。
     """
     if not system_text or request is None:
         return []
     kid = _identity_bind_key(request)
     if not kid:
         return []
-    cur = _system_fp(system_text)
-    prev = await run_in_threadpool(get_session_store().get_system_fp, kid)
-    if prev == cur:
+    prev = await run_in_threadpool(get_session_store().get_system_text, kid)
+    if prev == system_text:
         return []
     cc = max(1, int(_l2_scope_cfg().get("chunk_chars") or 1200))
-    tail = system_text.strip()[-(_SYSFP_MAX_BLOCKS * cc):]
-    return [("system", tail[i * cc:(i + 1) * cc]) for i in range(_SYSFP_MAX_BLOCKS)
-            if tail[i * cc:(i + 1) * cc]]
+    cap = _SYS_MAX_BLOCKS * cc
+
+    def _plan():
+        if prev:
+            spans = _system_diff_spans(prev, system_text)
+            if spans is not None and sum(e - s for s, e in spans) <= cap:
+                return [system_text[s:e] for s, e in spans]
+        return _l2_long_windows(system_text, cc, _SYS_MAX_BLOCKS, 0)
+    pieces = await run_in_threadpool(_plan)
+    out = []
+    for p in pieces:
+        for i in range(0, len(p), cc):
+            if len(out) >= _SYS_MAX_BLOCKS:
+                return out
+            out.append(("system", p[i:i + cc]))
+    return out
 
 
 def _select_l2_scopes(kind: str, payload, merged_text: str) -> list:
@@ -1823,7 +1865,8 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
     全本地别名组（_all_local_alias，候选全内网）跳过 L1/L2 直接 allow。
 
     system_text：客户端可写的 system/instructions 原文（各端点提取后传入）。变化（含首见）
-    时在 L2 判定块前部插入 system 块做语义判定，指纹可信判定后记录（见 _system_diff_chunks）。
+    时按 diff 改动区（首见/超限退均匀抽样）插入 system 块做语义判定，上次全文在可信判定后
+    落写（见 _system_diff_chunks）。
 
     返回 (decision, text_findings, l2_result)
 
@@ -1903,13 +1946,13 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
         if not l2_chunks:
             _l2_scope_warn("无有效判定块，已回退 last_user")
-        # system diff 触发：变化（含首见）⇒ 前插 system 块。5 槽上限溢出时 long_text 尾部
-        # 抽样先掉，last_user 判定基线不会被挤掉（system 块最多占 2 槽）。
+        # system diff 触发：变化（含首见）⇒ 在 last_user 基线之后插 system 块。5 槽上限溢出时
+        # tool/history/long_text 掉在最后（下次请求 system 未变、恢复全槽），基线不挤。
         _sys = []
         if system_text:
             _sys = await _system_diff_chunks(system_text, request)
             if _sys:
-                _dec_blocks = _sys + _dec_blocks
+                _dec_blocks = _dec_blocks[:1] + _sys + _dec_blocks[1:]
         _hit = _dec_blocks[0][0]
         if len(_dec_blocks) == 1:
             # 单块（默认档 scopes=["last_user"]）仍走 classify —— 与历史逐字节等价
@@ -1929,13 +1972,15 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
                 l2_result["scope"] = _hit
             l2_result["scopes_run"] = [s for s, _ in _dec_blocks]
             l2_result.setdefault("degraded_scopes", [])
-        # system diff 指纹：system 块真拿到可信判定才记（degraded=没判、disabled=恒 NORMAL
-        # 都不算判过）——不记则未判状态不失效，下个灰区请求重判。
+        # system diff 上次全文：system 块真拿到可信判定才落写（degraded=没判、disabled=恒
+        # NORMAL 都不算判过）——不落写则未判状态不失效，下个灰区请求重判。超 difflib 守卫的
+        # 超长文本不落写：diff 用不上（必退抽样），只会在 Redis 里按 key 囤 body 级体积。
         if _sys and isinstance(l2_result, dict) and not is_degraded(l2_result) \
-                and not l2_result.get("disabled"):
+                and not l2_result.get("disabled") \
+                and len(system_text) <= _SYS_DIFF_MAX_INPUT:
             try:
-                await run_in_threadpool(get_session_store().set_system_fp,
-                                        _identity_bind_key(request), _system_fp(system_text))
+                await run_in_threadpool(get_session_store().set_system_text,
+                                        _identity_bind_key(request), system_text)
             except Exception:
                 pass
 
