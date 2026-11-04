@@ -36,9 +36,9 @@ function EventStreamCard({ events, go }) {
     /* 列宽用 % 自适应（灌数轮次表口径）；时间为纯文本，窄列溢出需 ellipsis 裁切 */
     { title: '时间', dataIndex: 'ts', width: '16%', ellipsis: true, render: (v) => bj(v),
       align: 'center', className: 'cell-center' },
-    /* 与审计页同款「动作 / 规则」列：Tag 底色按 action、文字是规则名；
+    /* 与审计页同款「规则」列：Tag 底色按 action、文字是规则名；
        降级来源/模型（原「明细」列内容）收进 title，不再单占一列 */
-    { title: '动作 / 规则', width: '22%', align: 'center', ellipsis: true, className: 'cell-center',
+    { title: '规则', width: '22%', align: 'center', ellipsis: true, className: 'cell-center',
       render: (_, r) => {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
         const extra = [r.downgraded_from ? `降级来源：${r.downgraded_from}` : '',

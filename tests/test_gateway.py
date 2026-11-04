@@ -162,6 +162,54 @@ def test_rule_priority_reorder_respects_locked(tmp_path, monkeypatch):
     finally:
         _pol.invalidate_policy_cache()
 
+def test_corrupt_policy_file_keeps_last_good(tmp_path, monkeypatch, caplog):
+    # 带外改坏 policy.yaml（写错 action/越界 priority/缺 name 任一）后，热重载不得
+    # 让每个请求 500：沿用最后一次有效规则 + 告警，文件修好后自动恢复。
+    # 管理台保存路径本身有 _validate_doc 前置校验，此缺陷只对直接编辑文件的通道敞开。
+    import yaml
+    from src.gateway import policy as _pol
+    p = tmp_path / "policy.yaml"
+    p.write_text(yaml.safe_dump({"policies": [
+        {"name": "good_rule", "priority": 10, "action": "route_local",
+         "when": {"any": [{"text contains_any": ["hitme"]}]},
+         "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+    ]}, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(p))
+    _pol.invalidate_policy_cache()
+    try:
+        r = client.post("/v1/chat/completions", headers=H, json={"model": "deepseek-flash",
+                         "messages": [{"role": "user", "content": "hitme"}]})
+        assert r.status_code == 200
+        assert r.json()["gateway"]["action"] == "route_local"
+        # 写坏文件：action 非法（priority 越界/缺 name 同走此路径）
+        p.write_text(yaml.safe_dump({"policies": [
+            {"name": "bad", "priority": 10, "action": "explode"},
+        ]}, allow_unicode=True), encoding="utf-8")
+        _pol.invalidate_policy_cache()
+        r = client.post("/v1/chat/completions", headers=H, json={"model": "deepseek-flash",
+                         "messages": [{"role": "user", "content": "hitme"}]})
+        assert r.status_code == 200, f"坏 policy 文件不得全站 500: {r.status_code} {r.text[:200]}"
+        assert r.json()["gateway"]["action"] == "route_local", "应沿用最后一次有效规则"
+        # 再打一次：同一坏文件版本告警只发一次（不去重会每请求刷一条）
+        r = client.post("/v1/chat/completions", headers=H, json={"model": "deepseek-flash",
+                         "messages": [{"role": "user", "content": "hitme"}]})
+        assert r.status_code == 200
+        assert caplog.text.count("policy.yaml 校验失败") == 1, "每版坏文件只告警一次"
+        # 文件修好 ⇒ 自动恢复新规则（mtime 变化触发重载）
+        p.write_text(yaml.safe_dump({"policies": [
+            {"name": "fixed_rule", "priority": 10, "action": "route_local",
+             "when": {"any": [{"text contains_any": ["fixed"]}]},
+             "target": {"provider": "vllm_local", "model": "qwen2.5:7b"}},
+        ]}, allow_unicode=True), encoding="utf-8")
+        _pol.invalidate_policy_cache()
+        r = client.post("/v1/chat/completions", headers=H, json={"model": "deepseek-flash",
+                         "messages": [{"role": "user", "content": "fixed"}]})
+        assert r.status_code == 200
+        assert r.json()["gateway"]["action"] == "route_local"
+        assert r.json()["gateway"].get("policy_rule") == "fixed_rule", "修好后应加载新规则"
+    finally:
+        _pol.invalidate_policy_cache()
+
 def test_silent_rule_suggests_removal(tmp_path, monkeypatch):
     # 规则5：长窗口零触发的规则建议删除；一键删除后建议消失
     import yaml
@@ -897,6 +945,9 @@ def test_key_middle_forces_local_skips_l1_l2(monkeypatch):
     monkeypatch.setattr(_m, "inspect_text", _boom)       # L1 入口
     monkeypatch.setattr(_m, "small_classify", _boom)     # L2 单块
     monkeypatch.setattr(_m, "classify_chunks", _boom)    # L2 分块
+    async def _no_scan(*a, **k):
+        raise AssertionError("中间档不应执行文件预检（2026-11-03 前移回归）")
+    monkeypatch.setattr(_m, "_inline_media_scan", _no_scan)
     try:
         # 内容本身会触发 block（密钥类），中间档跳审 → 仍是 route_local 不 403
         r = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {plain}"},

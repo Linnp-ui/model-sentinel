@@ -131,7 +131,7 @@ const AUDIT_ACTIONS = [
 ];
 // 时间窗选项与总览页共用 RANGES（同一 since 值），避免两处窗口口径漂移
 const AUDIT_RANGES = [
-  { value: '', label: '全部留存（热窗 5000 条）' },
+  { value: '', label: '全部留存（列表仅最近 5000 条）' },
   ...RANGES.map((r) => ({ value: r.since, label: r.label })),
 ];
 
@@ -238,7 +238,7 @@ export default function AuditPage() {
     /* 时间加 ellipsis 防溢出；cell-center 必需——theme.css 把 ellipsis 列强制
        左对齐，align:center 会被压掉（同模型/动作列） */
     { title: '时间', dataIndex: 'time', width: '11%', align: 'center', ellipsis: true, className: 'cell-center' },
-    { title: '动作 / 规则', width: '12%', align: 'center', ellipsis: true, className: 'cell-center',
+    { title: '规则', width: '12%', align: 'center', ellipsis: true, className: 'cell-center',
       render: (_, r) => {
         const [name, color] = ACTION_INFO[r.action] || [r.action || '—', undefined];
         return (
@@ -249,7 +249,7 @@ export default function AuditPage() {
         );
       } },
     { title: '模型', dataIndex: 'model', width: '11%', align: 'center', ellipsis: true, className: 'cell-center', render: (v) => v || '—' },
-    { title: <>{'调用方名称'}<Tip term="caller" /></>, dataIndex: 'key_name', width: '11%', align: 'center',
+    { title: <>{'调用方名称'}<Tip term="caller" /></>, dataIndex: 'key_name', width: '11%', align: 'center', ellipsis: true,
       render: (v, r) => { const name = v || r.token_masked || ''; return name ? <Text code title={r.token_masked || name}>{name}</Text> : '—'; } },
     { title: <>{'客户端 IP'}<Tip term="client_ip" /></>, dataIndex: 'client_ip', width: '9%', align: 'center', render: (v) => v || '—' },
     { title: '文件名', dataIndex: 'filename', width: '12%', ellipsis: true, render: (v) => v || '—' },
@@ -303,7 +303,7 @@ export default function AuditPage() {
         <>
           <Card>
             <Space wrap style={{ marginLeft: 'var(--gw-sp-16)', columnGap: 60, rowGap: 'var(--gw-sp-12)' }}>
-              <Statistic data-testid="audit-stat-total" title={<>命中总数<Tip text="审计记录条数（流式失败会补一行；含模型登记/注销行）。" /><span style={{ color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)' }}>（{data.kpi.source === 'window' ? '热窗' : '审计库'}）</span></>} value={data.kpi.total} />
+              <Statistic data-testid="audit-stat-total" title={<>命中总数<Tip text="审计库＝MySQL 90 天全留存（不受热窗限制）；列表＝Redis 热窗最近 5000 条（更老记录见「请求明细」或 CSV）。流式失败补一行，含模型登记/注销行。" /><span style={{ color: 'var(--gw-muted)', fontSize: 'var(--gw-fs-12)' }}>（{data.kpi.source === 'window' ? '热窗' : '审计库'}）</span></>} value={data.kpi.total} />
               <Statistic data-testid="audit-stat-allow" title={<>放行<Tip term="allow" /></>} value={data.kpi.c_allow} valueStyle={{ color: '#389e0d' }} />
               <Statistic data-testid="audit-stat-route" title={<>本地路由<Tip term="route_local" /></>} value={data.kpi.c_route} valueStyle={{ color: '#d46b08' }} />
               <Statistic data-testid="audit-stat-block" title={<>阻断<Tip term="block" /></>} value={data.kpi.c_block} valueStyle={{ color: '#cf1322' }} />

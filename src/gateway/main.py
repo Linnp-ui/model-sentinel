@@ -237,11 +237,15 @@ async def _startup_validate():
         errs.append("ADMIN_DB_URL/DATABASE_URL 未配置：审计/明细将落内存后端，重启即丢")
     if not (os.getenv("AUDIT_MYSQL_URL") or os.getenv("AUDIT_DATABASE_URL")):
         errs.append("AUDIT_MYSQL_URL/AUDIT_DATABASE_URL 未配置：审计落内存后端")
-    if (os.getenv("AI_GATEWAY_L2_FAIL_MODE", "") or "").strip().lower() == "open":
-        errs.append("AI_GATEWAY_L2_FAIL_MODE=open：L2 不可用时放行，可能泄密，生产应为 route_local")
     dev_key = (os.getenv("AI_GATEWAY_DEV_API_KEY", "") or "").strip()
     if dev_key == "pk_live_dev_changeme" or not dev_key:
         errs.append("AI_GATEWAY_DEV_API_KEY 未设置或仍为默认弱值")
+    # 坏 policy.yaml 首载 fail-fast（运行期被改坏有 load_policy 沿用旧规则兜底，首载没有）：
+    # 不拦就是开机后每个 /v1/* 请求 500，比拒启更糟
+    try:
+        load_policy()
+    except Exception as e:
+        errs.append(f"policy.yaml 校验失败：{str(e).splitlines()[0][:200]}")
     if errs:
         raise RuntimeError("生产启动校验失败：\n- " + "\n- ".join(errs))
 
@@ -1642,6 +1646,16 @@ def _all_local_alias(model: str) -> bool:
     return all(getattr(cfg.get(c["provider"]), "local", False) for c in cands)
 
 
+def _precheck_skippable(model: str, request: Optional[Request]) -> bool:
+    """全内网别名组 / KEY 中间档：审查判定已定（allow / route_local），文件预检
+    （OCR/解析，最贵的请求前处理）的结果只进审计明细、不影响判定 → handler 跳过
+    本轮预检。判定本身仍由 _review_text 入口复核返回（单一真源）。
+    2026-11-03 前移：此前两个旁路都在 _review_text 入口，内联附件 OCR 白跑一轮。"""
+    if _key_tier_middle(request):
+        return True
+    return bool(model) and _all_local_alias(model)
+
+
 # F1（2026-10-14 红队实测）：审查文本总量无预算——每 input item 截 4000 字但
 # item 数无限、instructions 不截 ⇒ 2 万条 item × 4000 字 = 76MB 审查串，
 # 单请求把 inspect_text/NFKC/正则全跑一遍（阻塞事件循环，别的用户一起停；
@@ -1913,10 +1927,8 @@ def _l2_decision(l2_result: dict | None) -> dict | None:
 
     - 判密（label=CONFIDENTIAL 且 confidence >= 阈值）-> route_local
     - L2 判定不可用（超时 / 坏 JSON / 非法 label / 熔断，见 small_model.is_degraded）
-      -> 默认同样 route_local：P0-2 修复。安全防线不得在故障时静默消失，
+      -> route_local：P0-2 修复。安全防线不得在故障时静默消失，
          而 route_local 既守住「内容不出境」，又不牺牲可用性（本地模型承接）。
-    - AI_GATEWAY_L2_FAIL_MODE=open 时退回旧行为（当作 NORMAL 放行），
-      但 classify 侧仍计 l2_degraded_total、审计里仍带 degraded 标记，留痕可查。
     """
     if not l2_result:
         return None
@@ -1929,8 +1941,6 @@ def _l2_decision(l2_result: dict | None) -> dict | None:
         return _route_local_decision("l2_injection", l2_result.get("reason") or "prompt injection detected",
                                      confidence=l2_result.get("injection_confidence") or 0.0)
     if is_degraded(l2_result):
-        if (os.getenv("AI_GATEWAY_L2_FAIL_MODE", "local") or "local").strip().lower() == "open":
-            return None
         return _route_local_decision(
             "l2_unavailable", f"L2 不可用（{l2_result.get('degraded_reason') or 'unknown'}），已降级到本地",
             confidence=0.0)
@@ -2528,7 +2538,8 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
         req = await run_in_threadpool(ChatReq.model_validate, payload)
     except ValidationError as e:
         raise HTTPException(422, detail=e.errors()[:10])
-    # workbuddy 约 6 成会话不发 X-Session-ID：回落首条消息指纹（见 _chat_session_id）
+    # 实际客户端（workbuddy 等）均不发 X-Session-ID（生产头派生流量全是测试构造）：
+    # 首条消息指纹当会话 key（见 _chat_session_id）
     session_id = extract_session_id(request.headers) or _chat_session_id(req.messages)
     _bundle = _extract_chat_bundle(req.messages)
     text = _bundle["text"]
@@ -2537,7 +2548,11 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
     if _tt:
         text = text + "\n" + _tt
     audit_preview = _bundle["audit_preview"]
-    inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("chat", req.messages)
+    # 旁路前移：全内网别名组 / KEY 中间档判定已定，跳过内联附件预检（OCR）
+    if _precheck_skippable(str(req.model or ""), request):
+        inline_text, inline_bad, inline_findings, inline_remote = "", False, {}, False
+    else:
+        inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("chat", req.messages)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("chat", req.messages, text)
@@ -2899,7 +2914,11 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
     body = await _json_body(request)
     text = anthropic_text(body)
     audit_preview = _audit_preview_anthropic(body, text)
-    inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("anthropic", body)
+    # 旁路前移：全内网别名组 / KEY 中间档判定已定，跳过内联附件预检（OCR）
+    if _precheck_skippable(str((body or {}).get("model") or ""), request):
+        inline_text, inline_bad, inline_findings, inline_remote = "", False, {}, False
+    else:
+        inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("anthropic", body)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("anthropic", body, text)
@@ -3120,7 +3139,11 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     session_id = extract_session_id(request.headers) or _codex_session_id(body)
     text = responses_text(body)
     audit_preview = _audit_preview_responses(body, text)
-    inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("responses", body)
+    # 旁路前移：全内网别名组 / KEY 中间档判定已定，跳过内联附件预检（OCR）
+    if _precheck_skippable(str(body.get("model") or ""), request):
+        inline_text, inline_bad, inline_findings, inline_remote = "", False, {}, False
+    else:
+        inline_text, inline_bad, inline_findings, inline_remote = await _inline_media_scan("responses", body)
     if inline_text:
         text = text + "\n" + inline_text
     l2_blocks = _select_l2_scopes("responses", body, text)

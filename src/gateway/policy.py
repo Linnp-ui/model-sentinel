@@ -14,6 +14,7 @@ src/gateway/policy.py
   - 用户在 policy.yaml 写的字段名 / 优先级 / 运算符 typo 立刻抛 ValidationError。
 """
 from __future__ import annotations
+import logging
 import os
 import re
 import yaml
@@ -135,6 +136,10 @@ def _default_allow() -> Policy:
 
 
 _POLICY_CACHE: Dict[str, Any] = {"key": None, "policies": None}
+# 最后一次成功解析的结果：只随新一次成功解析更新，不被 invalidate_policy_cache() 清
+# （失效只表达「下次要重新读文件」，不能连兜底依据一起丢）
+_POLICY_LAST_GOOD: Dict[str, Any] = {"path": None, "policies": None}
+_POLICY_LAST_BAD_KEY: Any = None  # 坏文件告警去重键（每次坏文件版本只告警一次）
 
 
 def invalidate_policy_cache() -> None:
@@ -149,7 +154,10 @@ def load_policy(path: str | Path | None = None) -> List[Policy]:
     - path 缺省时读 AI_GATEWAY_POLICY_PATH（未设则仓库根 policy.yaml）
       —— 管理后台规则 CRUD 与请求链路必须读写同一份文件
     - 文件不存在 → [default_allow()] (保持向后兼容: 早期部署靠这避免 crash)
-    - 存在但 schema 错 → raise ValidationError (P2 改 fail-fast)
+    - 存在但坏（schema 错 / YAML 坏）：本进程已有有效规则（运行中被带外改坏）→
+      沿用最后一次有效规则 + 每坏文件版本告警一次，不让请求链全站 500；
+      文件修好后 mtime 变化自动恢复。无有效缓存（首载）→ raise（fail-fast，
+      生产由启动校验 _startup_validate 在开机时拦下）。
     - 任何 rules 解析错误 → 抛错, 由调用方决定重试 / 走 fallback
     """
     p = Path(path or os.getenv("AI_GATEWAY_POLICY_PATH", "") or DEFAULT_POLICY)
@@ -163,19 +171,35 @@ def load_policy(path: str | Path | None = None) -> List[Policy]:
     hit = _POLICY_CACHE["policies"]
     if hit is not None and _POLICY_CACHE["key"] == key:
         return hit
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    if isinstance(data, dict) and "policies" in data:
-        doc = PolicyDoc.model_validate(data)
-    elif isinstance(data, list):
-        doc = PolicyDoc.model_validate({"policies": data})
-    else:
-        raise ValidationError.from_exception_data(
-            "policy.yaml", [
-                {"type": "missing", "loc": ("policies",), "input": data, "msg": "missing 'policies' key"},
-            ]
-        )
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if isinstance(data, dict) and "policies" in data:
+            doc = PolicyDoc.model_validate(data)
+        elif isinstance(data, list):
+            doc = PolicyDoc.model_validate({"policies": data})
+        else:
+            raise ValidationError.from_exception_data(
+                "policy.yaml", [
+                    {"type": "missing", "loc": ("policies",), "input": data, "msg": "missing 'policies' key"},
+                ]
+            )
+    except (ValidationError, yaml.YAMLError) as e:
+        if _POLICY_LAST_GOOD["path"] != str(p) or _POLICY_LAST_GOOD["policies"] is None:
+            raise
+        # 热重载读到坏文件（写错 action / 越界 priority / 缺 name / YAML 断裂）：沿用
+        # 同路径最后一次有效规则。若让异常冒泡，_review_text / files/check 等每个请求
+        # 都 500，一次带外误编辑就能打全站；管理台保存路径有 _validate_doc 前置校验，
+        # 此路只对直接编辑文件敞开。按文件版本去重，每版坏文件只告警一次，修好自动恢复。
+        global _POLICY_LAST_BAD_KEY
+        if _POLICY_LAST_BAD_KEY != key:
+            _POLICY_LAST_BAD_KEY = key
+            logging.getLogger("gateway").warning(
+                "policy.yaml 校验失败（%s），沿用最后一次有效规则: %s",
+                p, str(e).splitlines()[0][:300])
+        return _POLICY_LAST_GOOD["policies"]
     result = sorted(doc.policies, key=lambda x: x.priority)
     _POLICY_CACHE.update(key=key, policies=result)
+    _POLICY_LAST_GOOD.update(path=str(p), policies=result)
     return result
 
 

@@ -4,11 +4,12 @@
 输出: docs/thesis/laya-version-compare.json
 口径: render/Q/THRESH 与 laya_l2_server /classify 及 eval_laya_confidential 逐字节一致
 （render 空字段不渲染、noul 英文题、阈值 0.7），结果与服务侧 pilot 评测可比。
-数据集: real_eval.jsonl = 2026-11-02 更新后的真实留出集（32 条，11 密/21 放行）；
+数据集: real_eval.jsonl = 真实留出集（2026-11-03 扩至 103 条，37 密/66 放行；
+原 32 条口径见 11-02 记录，扩充协议见 scripts/expand_real_eval.py）；
 pilot = tests/fixtures/pilot_dataset.jsonl（184 条，标签未动）。
 cascade 按 C = A_l1 ∨ (risk≥20 ∧ p≥0.7) ∨ 会话粘性 逐模型重算（A/risk 取自
 cascade-baseline.json，L1 为确定性规则，跨 L2 后端一致）。
-注: v35 训练停在 epoch 3/4、缺 final save，补完前不参评（见 MODELS 注释）。
+注: v35 训练停在 epoch 3/4、缺 final save，其补完训练 v36 参评（见 MODELS 注释）。
 """
 import datetime, json, os, sys
 
@@ -49,9 +50,9 @@ Q2 = {
 MODELS = [
     ("v33（10-29 论文基线期）", "/home/your-user/models/laya-finetuned-confidential-v33"),
     ("v34（现役）", "/home/your-user/models/laya-finetuned-confidential-v34"),
-    # v35 训练停在 epoch 3/4（checkpoint_meta），缺顶层 final save（rl_agent_config.json
-    # 含拟合温度）——补完 final save 后加入：
-    # ("v35（11-02 新数据重训）", "/home/your-user/models/laya-finetuned-confidential-v35"),
+    # v35 训练停在 epoch 3/4（checkpoint_meta），缺顶层 final save——其补完训练即 v36
+    # （epoch 4/4，11-03），参评的是 v36。
+    ("v36（11-02 新数据重训补完）", "/home/your-user/models/laya-finetuned-confidential-v36"),
 ]
 
 def render(text, filename=""):

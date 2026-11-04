@@ -517,6 +517,32 @@ def test_all_local_alias_skips_l1_l2():
         except ValueError:
             pass
 
+def test_all_local_alias_skips_file_precheck(monkeypatch):
+    # 旁路前移（2026-11-03）：全内网别名组 → 连 L1/L2 之前的文件预检（OCR）也跳过
+    from src.gateway import main as _m
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+
+    async def _no_scan(*a, **k):
+        raise AssertionError("全内网别名组不应执行文件预检（2026-11-03 前移回归）")
+
+    monkeypatch.setattr(_m, "_inline_media_scan", _no_scan)
+    assert client.put("/admin/api/aliases/rt-local2",
+                      json={"members": [{"provider": "vllm_local", "model": "qwen2.5:7b",
+                                         "priority": 10, "enabled": True}]}).status_code == 200
+    try:
+        r = client.post("/v1/chat/completions", headers=H,
+                        json={"model": "rt-local2", "messages": [{"role": "user", "content": "hello"}]})
+        assert r.status_code == 200, r.text[:300]
+        gw = r.json()["gateway"]
+        assert gw["action"] == "allow", gw
+        assert gw["policy_rule"] == "local_alias_bypass", gw
+    finally:
+        try:
+            store.delete_alias_group("rt-local2")
+        except ValueError:
+            pass
+
 def test_model_prefix_routing():
     r = client.post("/v1/chat/completions", headers=H, json={"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}]})
     assert r.status_code == 200

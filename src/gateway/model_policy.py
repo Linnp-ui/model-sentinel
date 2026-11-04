@@ -184,7 +184,8 @@ def save_model_policy(data: Dict[str, Any]) -> ModelPolicy:
 # ---------------------------------------------------------------------------
 
 def external_candidates() -> List[Dict[str, Any]]:
-    """启用的外部候选，按 (rank, price_per_1m_in) 升序 —— 即"最便宜优先"。"""
+    """启用的外部候选，按 (rank, price_per_1m_in) 升序：rank 为主键（配置优先级），
+    价格仅同 rank 内破平局。"""
     pol = load_model_policy()
     cands = [c.model_dump() for c in pol.external_candidates if c.enabled]
     cands.sort(key=lambda c: (c.get("rank", 100), c.get("price_per_1m_in", 0.0)))

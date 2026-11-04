@@ -28,7 +28,7 @@ PUP = os.environ.get("PUPPETEER_CFG", "/tmp/opencode/mermaid/puppeteer.json")
 FILES = ["12-ch4-design.md", "08-ch5-implementation.md"]
 SLUG = {
     "4-1": "architecture", "4-2": "sequence", "4-3": "deploy",
-    "5-1": "l1-flow", "5-2": "l2-flow",
+    "5-1": "pipeline", "5-2": "l1-flow", "5-3": "l2-flow",
 }
 SIZE = {"4-2": 1800}
 
