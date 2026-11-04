@@ -1080,6 +1080,50 @@ def _prev_user_text_responses(body, limit: int = 2) -> str:
     return "\n".join(texts[-(limit + 1):-1])
 
 
+# ---- system/instructions 提取（L2 system diff 块用；L1 审全文早已覆盖，这里只补语义层）----
+
+def _system_text_chat(messages) -> str:
+    """system/developer 消息正文（多条换行拼接）：客户端可写指令区，
+    无 L1 模式机密 payload 的承载面（last_user 无害时 L2 其他视野都看不见它）。"""
+    parts = []
+    try:
+        for m in messages or []:
+            d = m if isinstance(m, dict) else None
+            role = (d.get("role") if d else getattr(m, "role", ""))
+            if role not in ("system", "developer"):
+                continue
+            c = (d.get("content") if d else getattr(m, "content", ""))
+            s = _msg_content_to_str(c).strip()
+            if s:
+                parts.append(s)
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
+def _system_text_anthropic(body) -> str:
+    """Anthropic system 字段：str 或 [{type:"text", text:...}] 块数组。"""
+    try:
+        s = (body or {}).get("system")
+        if isinstance(s, str):
+            return s.strip()
+        if isinstance(s, list):
+            return "\n".join(str(b.get("text") or "").strip()
+                             for b in s if isinstance(b, dict) and b.get("text")).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _system_text_responses(body) -> str:
+    """OpenAI Responses instructions 字段（str；codex 在此携带客户端指令）。"""
+    try:
+        s = (body or {}).get("instructions")
+        return s.strip() if isinstance(s, str) else ""
+    except Exception:
+        return ""
+
+
 # ---- L2 scope 名（docs/l2-scope-extension-plan-2026-09-16.md §3.1）----
 _L2_SCOPE_LAST_USER = "last_user"
 _L2_SCOPE_TOOL = "tool"
@@ -1198,6 +1242,40 @@ def _l2_long_windows(src: str, cc: int, limit: int, start: int = 0) -> list:
     else:
         idx = sorted({round(i * (n - 1) / (limit - 1)) for i in range(limit)})
     return [rest[i * cc:(i + 1) * cc] for i in idx]
+
+
+# ---- L2 system diff 触发（2026-11-04）----
+# 无 L1 模式的机密 payload 可搭客户端可写的 system/instructions 出境（last_user 无害、
+# L2 其他视野全从用户消息流派生 ⇒ 结构性看不见该字段）。内容「变化」（含首见，未知≠可信）
+# 时在判定块前部插入 1~2 块送语义判定；指纹只在拿到可信判定后由调用方记录——
+# degraded/L2 disabled 不记 ⇒ 未判状态不失效，下个灰区请求重判。
+_SYSFP_MAX_BLOCKS = 2   # 2×chunk_chars（默认 2400 字），尾部取向：样板前缀恒定、粘贴内容落尾部
+
+
+def _system_fp(system_text: str) -> str:
+    """指纹按全文算（任何位置变化都算变化；判的是尾部窗，保守）。"""
+    return hashlib.sha256((system_text or "").encode("utf-8", "replace")).hexdigest()[:32]
+
+
+async def _system_diff_chunks(system_text: str, request) -> list:
+    """system/instructions 变化（含首见）⇒ 返回 [(system, chunk), ...]；未变/无身份 ⇒ []。
+
+    尾部截 2×chunk_chars 再切块（shortcut: 只判尾部窗，payload 藏在超长 system 中段时靠
+    L1 全文正则兜；要全量覆盖再升级成分块全判）。无身份绑定键（干跑/匿名）不判不记。
+    """
+    if not system_text or request is None:
+        return []
+    kid = _identity_bind_key(request)
+    if not kid:
+        return []
+    cur = _system_fp(system_text)
+    prev = await run_in_threadpool(get_session_store().get_system_fp, kid)
+    if prev == cur:
+        return []
+    cc = max(1, int(_l2_scope_cfg().get("chunk_chars") or 1200))
+    tail = system_text.strip()[-(_SYSFP_MAX_BLOCKS * cc):]
+    return [("system", tail[i * cc:(i + 1) * cc]) for i in range(_SYSFP_MAX_BLOCKS)
+            if tail[i * cc:(i + 1) * cc]]
 
 
 def _select_l2_scopes(kind: str, payload, merged_text: str) -> list:
@@ -1734,7 +1812,7 @@ def _intent_source(l2_chunks, l2_text, text) -> str:
     return l2_text or text
 
 
-async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "", session_hint: Optional[str] = None) -> tuple[dict, dict, dict | None]:
+async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "", session_hint: Optional[str] = None, system_text: str = "") -> tuple[dict, dict, dict | None]:
     """
 
     纯文本审查（chat / messages / responses 共用）：
@@ -1743,6 +1821,9 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
     （2026-09-23 起取消字数触发；2026-09-30 起灰区无上界，关键词堆到 risk_score>=60 也转内网）。
 
     全本地别名组（_all_local_alias，候选全内网）跳过 L1/L2 直接 allow。
+
+    system_text：客户端可写的 system/instructions 原文（各端点提取后传入）。变化（含首见）
+    时在 L2 判定块前部插入 system 块做语义判定，指纹可信判定后记录（见 _system_diff_chunks）。
 
     返回 (decision, text_findings, l2_result)
 
@@ -1822,6 +1903,13 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
         if not l2_chunks:
             _l2_scope_warn("无有效判定块，已回退 last_user")
+        # system diff 触发：变化（含首见）⇒ 前插 system 块。5 槽上限溢出时 long_text 尾部
+        # 抽样先掉，last_user 判定基线不会被挤掉（system 块最多占 2 槽）。
+        _sys = []
+        if system_text:
+            _sys = await _system_diff_chunks(system_text, request)
+            if _sys:
+                _dec_blocks = _sys + _dec_blocks
         _hit = _dec_blocks[0][0]
         if len(_dec_blocks) == 1:
             # 单块（默认档 scopes=["last_user"]）仍走 classify —— 与历史逐字节等价
@@ -1841,6 +1929,15 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
                 l2_result["scope"] = _hit
             l2_result["scopes_run"] = [s for s, _ in _dec_blocks]
             l2_result.setdefault("degraded_scopes", [])
+        # system diff 指纹：system 块真拿到可信判定才记（degraded=没判、disabled=恒 NORMAL
+        # 都不算判过）——不记则未判状态不失效，下个灰区请求重判。
+        if _sys and isinstance(l2_result, dict) and not is_degraded(l2_result) \
+                and not l2_result.get("disabled"):
+            try:
+                await run_in_threadpool(get_session_store().set_system_fp,
+                                        _identity_bind_key(request), _system_fp(system_text))
+            except Exception:
+                pass
 
         # A/B 影子（2026-10-26）：AI_GATEWAY_L2_HISTORY_SHADOW 开且本次真跑了 history 块时，
         # 再判一次「无 history」口径，只留痕（l2.history_shadow 进审计）不改判决。
@@ -2564,7 +2661,8 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
     decision, text_findings, l2_result = await _review_text(
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx={"text": inline_text} if inline_text else None,
-        model=str(req.model or ""), session_hint=session_id)
+        model=str(req.model or ""), session_hint=session_id,
+        system_text=_system_text_chat(req.messages))
     # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
     _note_file_findings(inline_findings)
 
@@ -2930,7 +3028,8 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
     decision, text_findings, l2_result = await _review_text(
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx={"text": inline_text} if inline_text else None,
-        model=str((body or {}).get("model") or ""))
+        model=str((body or {}).get("model") or ""),
+        system_text=_system_text_anthropic(body))
     # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
     _note_file_findings(inline_findings)
 
@@ -3158,7 +3257,7 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     decision, text_findings, l2_result = await _review_text(
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""),
-        session_hint=session_id)
+        session_hint=session_id, system_text=_system_text_responses(body))
     # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
     _note_file_findings(inline_findings)
 

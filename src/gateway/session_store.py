@@ -29,6 +29,7 @@ DEFAULT_TTL_SECONDS = int(os.getenv("AI_GATEWAY_SESSION_TTL", "1800"))  # 30 min
 KEY_PREFIX = "gateway:session:"
 TAINT_PREFIX = "gateway:taint:"
 STICKY_PREFIX = "gateway:stickytier:"
+SYSFP_PREFIX = "gateway:sysfp:"
 # 粘性档位键的 Redis TTL：调用方窗口（env）+ 余量；过期即惰性失效，不依赖它判窗口
 _STICKY_KEY_TTL = 90 * 60
 
@@ -297,6 +298,53 @@ class SessionStore:
                     (self._mem.get("__sticky_tier__") or {}).pop(sid, None)
                 return None
             return (int(d.get("tier") or 0), int(d.get("ts") or 0))
+
+    # ---- system diff 指纹（2026-11-04，见 main._system_diff_chunks）----
+    # 独立键：按 key 身份记「最后一次真正过了 L2 语义判定的 system/instructions 指纹」。
+    # TTL 用会话口径：过期后未变内容也会在下个灰区请求重判一次（保守重验，成本 = 一次 L2 调用）。
+
+    def get_system_fp(self, key_id: str) -> str:
+        """最后一次已判定的 system 指纹；'' = 从未判定/已过期（调用方视''为「已变化」）。"""
+        if not key_id:
+            return ""
+        k = f"{SYSFP_PREFIX}{hashlib.sha256(key_id.encode('utf-8')).hexdigest()[:16]}"
+        if self._r is not None:
+            try:
+                raw = self._r.get(k)
+                if raw is None:
+                    return ""
+                return raw.decode() if isinstance(raw, bytes) else str(raw)
+            except Exception:
+                self._r = None
+                self._r_disabled = True
+        with self._mem_lock:
+            v = (self._mem.get("__system_fp__") or {}).get(k)
+            if not v:
+                return ""
+            if time.time() - v.get("ts", 0) > DEFAULT_TTL_SECONDS:
+                (self._mem.get("__system_fp__") or {}).pop(k, None)
+                return ""
+            return str(v.get("fp") or "")
+
+    def set_system_fp(self, key_id: str, fp: str) -> None:
+        """记已判定的 system 指纹；任何失败静默跳过（绝不影响主链路）。"""
+        if not key_id or not fp:
+            return
+        k = f"{SYSFP_PREFIX}{hashlib.sha256(key_id.encode('utf-8')).hexdigest()[:16]}"
+        now = int(time.time())
+        try:
+            if self._r is not None:
+                self._r.set(k, fp, ex=DEFAULT_TTL_SECONDS)
+                return
+        except Exception:
+            self._r = None
+            self._r_disabled = True
+        with self._mem_lock:
+            d = self._mem.setdefault("__system_fp__", {})
+            d[k] = {"fp": fp, "ts": now}
+            if len(d) > 500:
+                for k2 in sorted(d, key=lambda k2: d[k2].get("ts", 0))[:len(d) - 500]:
+                    d.pop(k2, None)
 
 
 _store: Optional[SessionStore] = None
