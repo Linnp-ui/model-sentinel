@@ -78,67 +78,44 @@ def test_chat_short_gray_triggers_l2():
     gw = r.json()["gateway"]
     assert gw["action"] == "allow" and "l2" in gw
 
-# ---------- 2. 文件 L1 ----------
-@pytest.mark.parametrize("sheet,headers,rows,filename,exp_rule", [
-    ("工资表2024", ["姓名","身份证","工资"], [["张三","110101199001011234","30000"]], "salary.xlsx", "financial_local_only"),
-    ("Sheet1", ["姓名","工资"], [["李四","28000"]], "工资表.xlsx", "financial_local_only"),  # 文件名命中
-    ("预算表", ["姓名","工资"], [["王五","42000"]], "data.xlsx", "financial_local_only"),  # sheet名命中
-    ("Sheet1", ["姓名","工资"], [["赵六","5000"]], "cost_report.xlsx", "financial_local_only"),  # cost 命中
-    ("Sheet1", ["Name","Age"], [["Alice","30"]], "normal.xlsx", "default_allow"),
-    ("Sheet1", ["Product","Price"], [["A","100"]], "price.xlsx", "default_allow"),
-])
-def test_file_financial_matrix(sheet, headers, rows, filename, exp_rule):
-    buf, fn = _xlsx(sheet, headers, rows, filename)
-    r = client.post("/v1/files/check", headers=H, files={"file": (fn, buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
-    assert r.status_code == 200
-    gw = r.json()["gateway"]
-    if exp_rule == "default_allow":
-        assert gw["action"] == "allow"
-    else:
-        assert gw["action"] == "route_local"
-        assert gw["policy_rule"] == exp_rule
+# ---------- 2. 文件通道（codex input_file 真链；专用 /v1/files/check 端点 2026-11-04 下线，
+#           文件 L1/OCR 覆盖以本节 + tests/test_e2e_file_precheck.py 矩阵为准） ----------
+def _resp_file(fn, raw, mime):
+    import base64
+    data = raw.getvalue() if hasattr(raw, "getvalue") else raw
+    return {"model": "deepseek-flash", "input": [{"role": "user", "content": [
+        {"type": "input_text", "text": "看下附件"},
+        {"type": "input_file", "filename": fn,
+         "file_data": "data:" + mime + ";base64," + base64.b64encode(data).decode()}]}]}
 
 def test_file_drawing_confidential():
+    """PDF 文本层图纸词（fixture 静态 PDF）⇒ drawing_local_only"""
     pdf = _pdf("drawing_confidential.pdf")
-    r = client.post("/v1/files/check", headers=H, files={"file": ("drawing.pdf", pdf, "application/pdf")})
+    r = client.post("/v1/responses", headers=H, json=_resp_file("drawing.pdf", pdf, "application/pdf"))
     assert r.status_code == 200
-    assert r.json()["gateway"]["policy_rule"] == "drawing_local_only"
-    assert r.json()["gateway"]["action"] == "route_local"
-
-def test_file_drawing_normal():
-    pdf = _pdf("drawing_normal.pdf")
-    # 无 confidential 关键词，可能走 L2 或 allow，取决于实现
-    r = client.post("/v1/files/check", headers=H, files={"file": ("normal.pdf", pdf, "application/pdf")})
-    assert r.status_code == 200
-    # 不强制断言，仅确保不崩
-    assert "gateway" in r.json()
+    gw = r.json()["gateway"]
+    assert gw["policy_rule"] == "drawing_local_only"
+    assert gw["action"] == "route_local"
 
 def test_file_dwg_ext_local():
-    """CAD 扩展名无条件转内网（2026-10-27）：真 DWG（AC10 magic）ezdxf 读不了也不要有水印词"""
-    data = io.BytesIO(b"AC1032" + b"\x01" * 32)
-    r = client.post("/v1/files/check", headers=H, files={"file": ("plan.dwg", data, "application/octet-stream")})
+    """CAD 扩展名无条件转内网（2026-10-27）：仅文件名 .dwg（无字节）⇒ 扩展名规则命中"""
+    r = client.post("/v1/responses", headers=H, json={"model": "deepseek-flash", "input": [{"role": "user", "content": [
+        {"type": "input_text", "text": "看下附件"},
+        {"type": "input_file", "filename": "plan.dwg"}]}]})
     assert r.status_code == 200
     gw = r.json()["gateway"]
     assert gw["action"] == "route_local"
     assert gw["policy_rule"] == "drawing_local_only"
 
 def test_file_dwg_renamed_txt_local():
-    """改后缀的 CAD（DWG magic + .txt 声明）⇒ fail-closed 至少转内网"""
-    data = io.BytesIO(b"AC1032" + b"\x01" * 32)
-    r = client.post("/v1/files/check", headers=H, files={"file": ("notes.txt", data, "text/plain")})
+    """改后缀的 CAD（DWG magic + .txt 声明）⇒ fail-closed 至少转内网。
+    input_file 真链里不可解析字节并入 ocr_empty_and_image ⇒ 命中「ocr_empty_image_route_local」p30（同为 fail-closed）。"""
+    r = client.post("/v1/responses", headers=H,
+                    json=_resp_file("notes.txt", io.BytesIO(b"AC1032" + b"\x01" * 32), "text/plain"))
     assert r.status_code == 200
     gw = r.json()["gateway"]
     assert gw["action"] == "route_local"
-    assert gw["policy_rule"] in ("unparsed_binary_route_local", "drawing_local_only")
-
-def test_file_xlsx_drawing_kw_local():
-    """文件内容含图纸领域词（无机密水印）⇒ L1 直接转内网，不依赖 L2"""
-    buf, fn = _xlsx("Sheet1", ["图号", "名称"], [["A-101", "施工图"]], "plan.xlsx")
-    r = client.post("/v1/files/check", headers=H, files={"file": (fn, buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
-    assert r.status_code == 200
-    gw = r.json()["gateway"]
-    assert gw["action"] == "route_local"
-    assert gw["policy_rule"] == "drawing_local_only"
+    assert gw["policy_rule"] in ("ocr_empty_image_route_local", "unparsed_binary_route_local", "drawing_local_only")
 
 def test_chat_drawing_mention_still_allow():
     """钉死口径：纯文本只提「图纸」不带内容 ⇒ L1 放行（security_testset drawing_*_pass），
@@ -146,11 +123,6 @@ def test_chat_drawing_mention_still_allow():
     r = client.post("/v1/chat/completions", headers=H, json={"model":"deepseek-flash","messages":[{"role":"user","content":"图纸打印好了，在前台自取"}]})
     assert r.status_code == 200
     assert r.json()["gateway"]["action"] == "allow"
-
-def test_file_empty():
-    buf, fn = _xlsx("Sheet1", ["A"], [], "empty.xlsx")
-    r = client.post("/v1/files/check", headers=H, files={"file": (fn, buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
-    assert r.status_code == 200
 
 # ---------- 3. L2 小模型（mock） ----------
 # conftest 默认 SMALL_MODEL_ENABLED=false，这里 patch 为 true 并 mock classify
@@ -198,10 +170,11 @@ def test_l2_cache_hit():
 
 # ---------- 3b. 文件名污染（客户端无感会话替代：不依赖 session 头，按 key 隔离） ----------
 def test_tainted_filename_forces_local_no_session_header():
-    """传机密文件被拦后，同 key 无 session 头追问文件名即 route_local（tainted_file_ref）。"""
+    """传机密文件被拦后，同 key 无 session 头追问文件名即 route_local（tainted_file_ref）。
+    文件走 codex input_file 真链（2026-11-04 files/check 下线后同名同口径）。"""
     fn = "financial_taintprobe.xlsx"
     buf, _ = _xlsx("Sheet1", ["Name", "Amount"], [["Alice", "30"]], fn)
-    r1 = client.post("/v1/files/check", headers=H, files={"file": (fn, buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    r1 = client.post("/v1/responses", headers=H, json=_resp_file(fn, buf, "application/octet-stream"))
     assert r1.status_code == 200
     assert r1.json()["gateway"]["action"] == "route_local"  # 文件名命中 financial
     # 无 session 头、无关键词的追问（financial 非聊天关键词，risk 0）
@@ -218,7 +191,7 @@ def test_tainted_filename_forces_local_no_session_header():
 def test_session_rule_beats_tainted_filename_order():
     """钉 L1 顺序（2026-11-02 重排）：会话机密(p4, 锁定屏障) 先于 文件名污染(p5)。
 
-    files/check 判密会同时标会话机密 + 按 key 污染文件名；同会话后续轮提及该文件名
+    input_file 判密会同时标会话机密 + 按 key 污染文件名；同会话后续轮提及该文件名
     时归因「session_route_local」而非「tainted_file_ref」。重排前（会话机密 p12）同一场景
     归因文件名污染。各 route_local 规则同目标模型，本用例只钉归因口径，防未来
     一键重排把归因静默换回去（文件名污染已解锁，可被重排移动）。
@@ -227,11 +200,11 @@ def test_session_rule_beats_tainted_filename_order():
     h = {**H, "x-session-id": sid}
     fn = "financial_orderprobe.xlsx"
     buf, _ = _xlsx("Sheet1", ["Name", "Amount"], [["Alice", "30"]], fn)
-    r1 = client.post("/v1/files/check", headers=h, files={"file": (fn, buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    r1 = client.post("/v1/responses", headers=h, json=_resp_file(fn, buf, "application/octet-stream"))
     assert r1.status_code == 200
     assert r1.json()["gateway"]["action"] == "route_local"
     from src.gateway.session_store import get_session_store
-    assert get_session_store().is_confidential(sid) is True, "files/check 判密必须标会话"
+    assert get_session_store().is_confidential(sid) is True, "input_file 判密必须标会话"
     # 同会话追问：提及被污染文件名，无其他关键词（financial 非聊天关键词，risk 0）
     r2 = client.post("/v1/chat/completions", headers=h,
                      json={"model": "deepseek-flash", "messages": [{"role": "user", "content": f"帮我看看{fn}里的总数"}]})
@@ -776,26 +749,6 @@ def test_review_text_budget_overflow_fails_safe(monkeypatch):
     assert r_tail.status_code == 200
     assert r_tail.json()["gateway"]["action"] == "route_local", "尾部 PII 必须仍触发"
 
-def test_files_check_scans_beyond_5000_chars():
-    """M3（2026-10-19）：file.text 不再切前 5000 字符——长前置垫片不能把机密挤出审查。"""
-    body = "正常项目说明。" * 1000 + "绝对机密 财务报表"
-    r = client.post("/v1/files/check", headers=H,
-                    files={"file": ("notes.txt", body.encode(), "text/plain")})
-    assert r.status_code == 200, r.text
-    assert r.json()["gateway"]["action"] == "route_local"
-
-def test_files_check_encoded_keyword_route_local():
-    """M2 同口径（2026-10-19）：base64 编码的机密文件，预检必须与出站判决一致
-    （encoded_keyword ⇒ route_local），不得误报「审查通过：可走外网」。"""
-    import base64
-    secret = "财务部预算与营收明细，机密，不得外传"
-    body = base64.b64encode(secret.encode())   # bytes 直接当文件内容
-    r = client.post("/v1/files/check", headers=H,
-                    files={"file": ("notes.txt", body, "text/plain")})
-    assert r.status_code == 200, r.text
-    gw = r.json()["gateway"]
-    assert gw["action"] == "route_local" and gw["policy_rule"] == "encoded_keyword", gw
-
 def test_route_inspect_encoded_keyword_route_local():
     """route-inspect 干跑与线上门同口径：base64 编码关键词直接判 route_local。"""
     import base64
@@ -882,28 +835,13 @@ def test_file_docx_financial():
     buf = io.BytesIO()
     d.save(buf)
     buf.seek(0)
-    r = client.post("/v1/files/check", headers=H, files={"file": ("人员名册.docx", buf, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
+    r = client.post("/v1/responses", headers=H,
+                    json=_resp_file("人员名册.docx", buf, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
     assert r.status_code == 200
     gw = r.json()["gateway"]
     assert gw["action"] == "route_local"
+    # 隐私加权是文本 PII 规则：文件名/扩展名/魔数都触发不了它 ⇒ 命中即证明**内容**被解析
     assert gw["policy_rule"] == "pii_weighted_route_local"
-    # 证明是**内容**命中（身份证解析出来并计了 PII 分），不是文件名/魔数命中
-    assert r.json()["text_findings"].get("weighted_pii_score", 0) >= 60, r.json()["text_findings"]
-
-def test_file_image_ocr_phone():
-    """图片手机号经 OCR 读出 → pii_weighted_route_local（真 OCR：pytesseract + 系统 chi_sim；
-    缺 OCR 引擎时 fail-closed 走 ocr_empty_image 路由，同样 route_local 不出境）"""
-    from PIL import Image, ImageDraw
-    img = Image.new("RGB", (400, 100), "white")
-    ImageDraw.Draw(img).text((20, 30), "13800138000", fill="black")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    r = client.post("/v1/files/check", headers=H, files={"file": ("phone.png", buf, "image/png")})
-    assert r.status_code == 200
-    gw = r.json()["gateway"]
-    assert gw["action"] == "route_local"
-    assert gw["policy_rule"] in ("pii_weighted_route_local", "ocr_empty_image_route_local", "unparsed_binary_route_local")
 
 def _chat_image_url(data_url, text="看下这张图"):
     return {"model": "deepseek-flash", "messages": [{"role": "user", "content": [

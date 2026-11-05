@@ -11,7 +11,9 @@ responses(codex): R1 CSV  R2 xlsx  R3 PNG(input_file)  R4 手机号图(input_ima
                   R10 远端图URL(FC)  R11 远端file_data(FC)
 chat(workbuddy):  C1 PNG(image_url)  C2 http URL(FC)  C3 音频(FC)
 messages:         M1 PNG(base64)  M2 损坏PDF(document)  M3 document url(FC)  M4 未知source(FC)
-files/check:      F1 xlsx  F2 良性txt
+
+注：专用 /v1/files/check 预检端点已于 2026-11-04 下线（无真实客户端调用），
+文件预检只存在于各协议的内联附件字节（本矩阵 A/B/C 段）。
 
 每行首条用户文本唯一：codex/chat 会话指纹=首条 user 消息哈希，撞会话会被
 前序 route_local 标机密 ⇒ p12 抢在内容规则前，断言失真。
@@ -303,26 +305,3 @@ def test_m4_messages_unknown_source_fail_closed():
         {"type": "image", "source": {"type": "blob", "data": "AAAA"}}])))
     assert gw["action"] == "route_local", gw
     assert gw["policy_rule"] == "ocr_empty_image_route_local", gw
-
-
-# ---------- D. /v1/files/check（专用预检端点，恒检） ----------
-def test_f1_files_check_xlsx_prechecked():
-    """[预检] 上传 xlsx 恒预检：sheet 名命中 + findings 落返回体"""
-    raw = _xlsx("工资表", ["姓名", "身份证", "工资"], [["李四", "110101199001011238", "25000"]])
-    r = client.post("/v1/files/check", headers=H,
-                    files={"file": ("e2e_f1.xlsx", raw, "application/octet-stream")})
-    assert r.status_code == 200, r.text[:300]
-    d = r.json()
-    assert d["gateway"]["action"] == "route_local", d
-    assert d["findings"], "预检 findings 必须落返回体"
-    assert "工资表" in (d["findings"] or {}).get("sheet_names", []), d["findings"]
-
-
-def test_f2_files_check_benign_txt_prechecked():
-    """[预检] 良性 txt 也恒预检：放行且 findings/preview 非空（证明解析跑过）"""
-    r = client.post("/v1/files/check", headers=H,
-                    files={"file": ("e2e_f2.txt", b"hello world e2e-f2", "text/plain")})
-    assert r.status_code == 200, r.text[:300]
-    d = r.json()
-    assert d["gateway"]["action"] == "allow", d
-    assert d["findings"] and d["preview"].strip(), d

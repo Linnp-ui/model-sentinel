@@ -542,6 +542,20 @@ def resolve(
 
     final_model = model or prov.model_for(kind)
 
+    # 模态卡口（与别名选头 / 外网 fallback 对称）：审查不通过的带图请求强制转内网，
+    # 若目标内网模型未声明 image 输入 ⇒ 400 明示，不把图块原样转发
+    #（纯文本 vLLM 会 400，个别上游会静默忽略图 —— 静默降级比 fail-loud 更隐蔽）。
+    # needs_image 标记只在 chat/anthropic/responses 内联图扫描时置位，embedding 天然为 False。
+    if force_local and final_model:
+        from .alias_router import ctx_needs_image
+        if ctx_needs_image():
+            from .model_policy import model_inputs
+            if "image" not in model_inputs(prov.name, final_model):
+                raise RoutingError(
+                    f"请求含图片，但内网模型 {prov.name}/{final_model} 不支持图片输入"
+                    f"（VL 模型可在 model_policy.yaml internal_models 声明 input: [text, image]）",
+                    400, type_="model_no_image", provider=prov.name)
+
     # 模型限流（model_policy.model_limits）：最终目标的全局 RPM，超限 429。
     # 放在 resolve 出口 = 所有端点（chat/messages/responses/embeddings/兜底转发）
     # 共用同一卡口；按「最终落到的模型」计，别名/前缀重写后不逃限。

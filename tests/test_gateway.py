@@ -19,22 +19,6 @@ def test_chat_pii_route_local():
     assert r.status_code == 200
     assert r.json()["gateway"]["action"] == "route_local"
 
-def test_file_financial_route_local(tmp_path=None):
-    # 用内存生成 xlsx
-    import io, openpyxl
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "工资表"
-    ws.append(["姓名","身份证","工资"])
-    ws.append(["张三","110101199001011234", "30000"])
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    r = client.post("/v1/files/check", headers=H, files={"file": ("salary.xlsx", buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
-    assert r.status_code == 200
-    assert r.json()["gateway"]["action"] == "route_local"
-    assert r.json()["gateway"]["policy_rule"] == "financial_local_only"
-
 def test_model_rate_limit(tmp_path, monkeypatch):
     # 模型限流：model_policy.model_limits 全局 RPM，超限 429；其他模型不受影响
     import yaml
@@ -62,14 +46,6 @@ def test_model_rate_limit(tmp_path, monkeypatch):
     finally:
         mp.invalidate_model_policy_cache()
         get_limiter().reset()
-
-def test_file_drawing_route_local():
-    from pathlib import Path
-    # 静态 fixture PDF（须含 CJK 文本层；重新生成见 git 历史 reportlab 脚本）
-    buf = Path(__file__).parent / "fixtures" / "drawing_a01.pdf"
-    r = client.post("/v1/files/check", headers=H, files={"file": ("drawing_A01.pdf", open(buf, "rb"), "application/pdf")})
-    assert r.status_code == 200
-    assert r.json()["gateway"]["action"] == "route_local"
 
 def test_rule_priority_suggestion_and_reorder(tmp_path, monkeypatch):
     # 规则 4：按触发次数重排，但按 action 分组各排各的——block 组与 route_local 组
@@ -732,6 +708,20 @@ def test_weekly_cost_cap_enforced_when_rate_limiter_off(monkeypatch):
         assert r2.json()["detail"]["type"] == "quota_exceeded"
     finally:
         store.update_api_key(kid, weekly_cost_cap=0)
+
+
+def test_proxy_multipart_forwards_without_stream_error(monkeypatch):
+    """兜底代理 multipart：form() 消费流后转发不得再读流（files/check 下线后请求落
+    兜底暴露 RuntimeError('Stream consumed') → 500，2026-11-04 修为 body 只读一次）。"""
+    import httpx
+    class _Stub:
+        async def request(self, method, url, **kw):
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+    monkeypatch.setattr("src.gateway.main.get_proxy_client", lambda local: _Stub())
+    r = client.post("/v1/images/generations", headers=H, data={"prompt": "a benign sketch"},
+                    files={"image": ("benign.png", b"\x89PNG\r\n\x1a\n fake", "image/png")})
+    assert r.status_code == 200, (r.status_code, r.text[:200])
+    assert r.json() == {"ok": True}
 
 
 def test_cand_key_gates_per_candidate():

@@ -129,3 +129,40 @@ def test_chat_image_all_text_group_400(monkeypatch):
     r = client.post("/v1/chat/completions", headers=H, json=body)
     assert r.status_code == 400
     assert r.json()["detail"]["type"] == "model_no_image"
+
+
+# ---------- 单测：resolve() force_local 模态卡口（带图转内网 fail-loud） ----------
+
+def test_resolve_force_local_text_only_raises_400(monkeypatch):
+    """带图请求被审查转内网 + 目标内网模型纯文本 ⇒ 400 明示，不把图块原样转发"""
+    from src.gateway import model_policy, routing
+    monkeypatch.setattr(model_policy, "model_inputs", lambda p, m: ["text"])
+    alias_router.ctx_set_needs_image(True)
+    try:
+        with pytest.raises(RoutingError) as ei:
+            routing.resolve({"action": "route_local"}, {"model": ""}, None, kind="chat")
+        assert ei.value.status_code == 400
+        assert ei.value.type_ == "model_no_image"
+    finally:
+        alias_router.ctx_set_needs_image(False)
+
+
+def test_resolve_force_local_image_capable_passes(monkeypatch):
+    """同样带图转内网，内网模型声明 image ⇒ 正常落本地（VL 内网行为零变化）"""
+    from src.gateway import model_policy, routing
+    monkeypatch.setattr(model_policy, "model_inputs", lambda p, m: ["text", "image"])
+    alias_router.ctx_set_needs_image(True)
+    try:
+        prov, model, _notes = routing.resolve({"action": "route_local"}, {"model": ""}, None, kind="chat")
+        assert prov.name == "vllm_local"
+        assert prov.local
+    finally:
+        alias_router.ctx_set_needs_image(False)
+
+
+def test_resolve_force_local_no_image_unchanged(monkeypatch):
+    """不带图的转内网请求不受卡口影响（needs_image=False 零行为变化）"""
+    from src.gateway import model_policy, routing
+    monkeypatch.setattr(model_policy, "model_inputs", lambda p, m: ["text"])
+    prov, model, _notes = routing.resolve({"action": "route_local"}, {"model": ""}, None, kind="chat")
+    assert prov.name == "vllm_local"

@@ -3,8 +3,10 @@
 用法: .venv/bin/python scripts/build_thesis_docx.py
 输出: docs/thesis/毕业论文-企业大模型数据防泄漏系统.docx
 
-目录条目带超链接（锚定标题 _Toc 书签），打开即可点击跳转；页码是域，
-updateFields=true 已设，Word/WPS 打开时自动刷新；若未刷新，Ctrl+A 后 F9。
+目录条目带超链接（锚定标题 _Toc 书签），打开即可点击跳转；页码构建时预嵌入
+（soffice 渲染 PDF 定位标题页，PAGEREF 域保持活跃，Word 更新域会再修正；
+WPS 不自动更新域，预嵌入保证打开即有页码）。soffice 缺失时页码留空
+（Word 打开按提示更新域，或 Ctrl+A → F9）。
 """
 import os
 import re
@@ -539,7 +541,7 @@ def collect_toc_headings():
     return heads
 
 
-def add_toc():
+def add_toc(pages=None):
     heads = collect_toc_headings()
     toc_heads[:] = heads
     for i, (lvl, text) in enumerate(heads):
@@ -576,12 +578,92 @@ def add_toc():
         set_run_font(r, size)
         hl.append(r._r)
         p._p.append(hl)
+        if pages is not None:
+            # 预嵌入页码 = PAGEREF 域缓存结果：WPS 不刷新域也显示；
+            # Word 更新域时按真实分页重算
+            add_field(p, f" PAGEREF _Toc{i + 1} \\h ", pages[i], size=size)
         if i == len(heads) - 1:
             r = p.add_run()
             set_run_font(r, 12)
             el = OxmlElement("w:fldChar")
             el.set(qn("w:fldCharType"), "end")
             r._r.append(el)
+
+
+def _roman(n):
+    vals = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+            (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))
+    s = ""
+    for v, t in vals:
+        while n >= v:
+            s += t
+            n -= v
+    return s
+
+
+def toc_page_disp(pages_lines, heads):
+    """按 PDF 每页行文本定位各标题所在页，返回页码显示串（摘要节 lowerRoman、正文 decimal）。
+
+    只认「标题行」：整行恰为标题，或「编号前缀行（2.4 / 第1）+ 下一行恰好补全」
+    （渲染时拆行的标题，如「第 1 章」/「绪论」「2.4」/「内容分级与DLP/PII 检测」）。
+    目录条目行（带点线引导符）与正文交叉引用行（如「5.3 文件预检、5.4 L1
+    规则引擎…」）都是长行，一律不命中。搜索从上一标题所在页起，页序单调。
+    """
+    def norm(s):
+        return re.sub(r"\s+", "", s)
+
+    lines = [[norm(x) for x in page if norm(x)] for page in pages_lines]
+
+    def is_num_prefix(l):
+        # 标题编号前缀：纯节号（2.4 / 6.2.1）或「第N章」的「第N」
+        return bool(re.fullmatch(r"\d+(\.\d+)*", l)) or (l.startswith("第") and len(l) <= 3)
+
+    def find(h, start):
+        n = norm(h)
+        for p in range(start, len(lines)):
+            for i, l in enumerate(lines[p]):
+                if l == n:
+                    return p
+                if (2 <= len(l) < len(n) and n.startswith(l) and is_num_prefix(l)
+                        and i + 1 < len(lines[p]) and l + lines[p][i + 1] == n):
+                    return p
+        return None
+
+    phys, last = [], 0
+    for _lvl, t in heads:
+        p = find(t, last)
+        if p is None:
+            raise SystemExit(f"目录页码计算失败：PDF 中找不到标题 {t!r}")
+        phys.append(p)
+        last = p
+    p0, p1, pch1 = phys[:3]
+    if not p0 < p1 < pch1:
+        raise SystemExit(f"目录页码异常：摘要/Abstract/第 1 章 页序 {p0}, {p1}, {pch1}")
+    return [_roman(p - p0 + 1) if i < 2 else str(p - pch1 + 1)
+            for i, p in enumerate(phys)]
+
+
+def compute_toc_pages(docx_path):
+    """soffice 渲染 PDF 估算目录页码；soffice 缺失或渲染失败返回 None（页码留空）。"""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("soffice") is None:
+        return None
+    tmp = tempfile.mkdtemp(prefix="thesis-pdf-")
+    r = subprocess.run(
+        ["soffice", "--headless", f"-env:UserInstallation=file://{tmp}/prof",
+         "--convert-to", "pdf", "--outdir", tmp, docx_path],
+        capture_output=True, text=True, timeout=300)
+    pdf = os.path.join(tmp, os.path.basename(docx_path)[:-len(".docx")] + ".pdf")
+    if r.returncode != 0 or not os.path.exists(pdf):
+        print("PDF 渲染失败，目录页码留空:", r.stderr.strip()[-200:])
+        return None
+    import pymupdf
+    doc = pymupdf.open(pdf)
+    page_lines = [pg.get_text("text").splitlines() for pg in doc]
+    return toc_page_disp(page_lines, collect_toc_headings())
 
 
 def toc_styles():
@@ -647,7 +729,9 @@ def render_file(name, ctx):
     render(read(name), ctx)
 
 
-def main():
+def build(pages=None):
+    heading_paras.clear()
+    toc_heads.clear()
     setup_doc()
     cover()
     sec2 = doc.add_section(WD_SECTION.NEW_PAGE)
@@ -663,7 +747,7 @@ def main():
     heading("Abstract", 1, page_break=True)
     render(en.splitlines(), {"skip_meta": False, "first_h1": False, "en": True})
     toc_title()
-    add_toc()
+    add_toc(pages)
 
     doc.add_section(WD_SECTION.NEW_PAGE)
     ctx = {"skip_meta": True, "first_h1": True, "en": False}
@@ -690,7 +774,11 @@ def main():
         add_inline(p, ref, 10.5)
 
     heading("致谢", 1, page_break=True)
-    body("（致谢内容待补充：导师、同学与家人。）", indent=True)
+    ack = open(os.path.join(D, "21-acknowledgements.md"), encoding="utf-8").read()
+    for para in ack.split("\n\n"):
+        para = para.strip()
+        if para and not para.startswith("#"):
+            body(para, indent=True)
 
     render_file("16-appendix.md", {"skip_meta": True, "first_h1": False, "en": False})
 
@@ -719,6 +807,16 @@ def main():
     print("写入", OUT)
     print("段落", len(doc.paragraphs), "表格", len(doc.tables), "图片", len(doc.inline_shapes),
           "参考文献", len(refs))
+
+
+def main():
+    build()
+    pages = compute_toc_pages(OUT)
+    if pages:
+        build(pages)
+        print("目录页码已嵌入（LibreOffice 渲染估算），Word 更新域会按真实分页修正")
+    else:
+        print("目录页码留空（soffice 不可用）：Word 打开按提示更新域，或 Ctrl+A → F9")
 
 
 if __name__ == "__main__":

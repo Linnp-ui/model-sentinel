@@ -187,7 +187,7 @@ def load_policy(path: str | Path | None = None) -> List[Policy]:
         if _POLICY_LAST_GOOD["path"] != str(p) or _POLICY_LAST_GOOD["policies"] is None:
             raise
         # 热重载读到坏文件（写错 action / 越界 priority / 缺 name / YAML 断裂）：沿用
-        # 同路径最后一次有效规则。若让异常冒泡，_review_text / files/check 等每个请求
+        # 同路径最后一次有效规则。若让异常冒泡，_review_text 等每个请求
         # 都 500，一次带外误编辑就能打全站；管理台保存路径有 _validate_doc 前置校验，
         # 此路只对直接编辑文件敞开。按文件版本去重，每版坏文件只告警一次，修好自动恢复。
         global _POLICY_LAST_BAD_KEY

@@ -12,7 +12,7 @@ Gateway 主入口 — 公司内网大模型请求的统一出口。
     auth / admin_auth                /v1/* key 校验；/admin 登录（cookie 会话）
     _review_text / _review_file_ctx  L1+L2 审查调度，返回 allow/route_local/block 判定
     log_entry / log_upstream_failure 审计双写（Redis 热 + MySQL 持久，见 audit_store.py）
-    「# ---- 端点 ----」区段          /v1/* 转发端点、/v1/files/check、/admin* 页面
+    「# ---- 端点 ----」区段          /v1/* 转发端点、/admin* 页面
     admin_api.py（include 的 router） 管理面 REST：key/规则/模型/provider/审计/L2 影子
 
 改 src/*.py 后必须重启 gateway.service 并核对 MainPID 变更（用 scripts/deploy.sh）。
@@ -51,7 +51,7 @@ from typing import Any, Optional
 
 import httpx
 
-from fastapi import FastAPI, Header, UploadFile, File, Depends, HTTPException, Request
+from fastapi import FastAPI, Header, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 
@@ -68,7 +68,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from .inspection import inspect_text
 
-from .file_inspector import inspect_file, inspect_inline_bytes, collect_inline_blobs_chat, collect_inline_blobs_anthropic, collect_inline_blobs_responses
+from .file_inspector import inspect_inline_bytes, collect_inline_blobs_chat, collect_inline_blobs_anthropic, collect_inline_blobs_responses
 from .llms.bridges import clip_audit, clip_audit_url, sse as _sse, tools_text
 
 from .policy import load_policy, decide
@@ -425,7 +425,6 @@ def _make_rate_limit_dep(scope: str, rpm_env: str, rps_env: str = None):
 
 
 _rate_limit_chat = _make_rate_limit_dep("chat", "AI_GATEWAY_RATE_LIMIT_RPM", "AI_GATEWAY_RATE_LIMIT_RPS")
-_rate_limit_files = _make_rate_limit_dep("files", "AI_GATEWAY_RATE_LIMIT_FILES_RPM")
 _rate_limit_embed = _make_rate_limit_dep("embed", "AI_GATEWAY_RATE_LIMIT_RPM", "AI_GATEWAY_RATE_LIMIT_RPS")
 _rate_limit_messages = _make_rate_limit_dep("messages", "AI_GATEWAY_RATE_LIMIT_RPM", "AI_GATEWAY_RATE_LIMIT_RPS")
 
@@ -644,7 +643,7 @@ def _mark_hit_context(session_id, key_id, session_name, taint_name, decision):
 
 
 def _mark_session_hit(session_id, decision, name=""):
-    """命中（route_local/block）即标 session，后续同会话粘本地；与 files/check 同口径。
+    """命中（route_local/block）即标 session，后续同会话粘本地；与内联附件预检同口径。
 
     2026-10-26：纯文本机密判定也标（此前「无文件参与不标」约定作废）；
     可用性兜底（NON_CONFIDENTIAL_RULES）不标。标记失败绝不影响主链路。
@@ -1163,6 +1162,7 @@ _L2_SCOPE_LAST_USER = "last_user"
 _L2_SCOPE_TOOL = "tool"
 _L2_SCOPE_LONG = "long_text"
 _L2_SCOPE_HISTORY = "history"
+_L2_SCOPE_TOOLS = "tools"      # tools 定义（diff 触发，非配置档；与 tool=工具结果 区分）
 # 明确排除的 scope：system 见 §3.8。写进配置只留痕、不产块 —— 防止有人以为「配上就生效」。
 # history 曾在 §3.7 排除（「判决失忆，不是视野盲区」），2026-10-26 实测多轮追问
 # 「改成 24055 吧」单独判 NORMAL 出境、带上轮判密 ⇒ 恢复为可用档。
@@ -1278,22 +1278,24 @@ def _l2_long_windows(src: str, cc: int, limit: int, start: int = 0) -> list:
     return [rest[i * cc:(i + 1) * cc] for i in idx]
 
 
-# ---- L2 system diff 触发（2026-11-04；v2 同日：尾部取向 → 改动区判定）----
-# 无 L1 模式的机密 payload 可搭客户端可写的 system/instructions 出境（last_user 无害、
-# L2 其他视野全从用户消息流派生 ⇒ 结构性看不见该字段）。内容「变化」（含首见，未知≠可信）
-# 时插入至多 _SYS_MAX_BLOCKS 个 system 块送语义判定。各客户端 system 结构不同、改动位置
-# 不定（v1 尾部取向是错误的位置假设），故存上次全文（store）、diff 定位改动区判那里；
-# 首见（无旧文可 diff）/ 改动区超预算 / 超长守卫 ⇒ 退均匀抽样（与 long_text 同口径，
-# 无位置偏置；抽样缝隙的 payload 靠 L1 全文正则兜底）。
+# ---- L2 diff 触发（2026-11-04；v2 同日：尾部取向 → 改动区判定；同日扩展 tools 定义）----
+# 无 L1 模式的机密内容可搭客户端可写的字段出境（last_user 无害、L2 其他视野全从用户消息
+# 流派生 ⇒ 结构性看不见该字段）。适用字段：system/instructions（2026-11-04）与 tools 定义
+# （tools_text 全文，同机制）。内容「变化」（含首见，未知≠可信）时插入至多 _DIFF_MAX_BLOCKS
+# 个该字段块送语义判定。各客户端结构不同、改动位置不定（v1 尾部取向是错误的位置假设），
+# 故存上次全文（store）、diff 定位改动区判那里；首见（无旧文可 diff）/ 改动区超预算 / 超长
+# 守卫 ⇒ 退均匀抽样（与 long_text 同口径，无位置偏置；抽样缝隙的机密内容靠 L1 全文正则兜底）。
 # 上次全文只在拿到可信判定后由调用方落写 —— degraded/L2 disabled 不记 ⇒ 未判状态不失效，
 # 下个灰区请求重判。
-_SYS_MAX_BLOCKS = 4             # system 判定窗上限（4×chunk_chars，默认 4800 字）
-_SYS_DIFF_CTX = 100             # 改动区两侧各扩 100 字作判定上下文
-_SYS_DIFF_MAX_INPUT = 300_000   # difflib 输入守卫：超限直接退抽样（防对抗长文本拖慢 diff）
+# shortcut: tools_text 单条 4000 字截断，超长按条裁掉的后段 L1/L2 均不可见；
+# 需覆盖时先扩 bridges.tools_text 预算再回来改这里。
+_DIFF_MAX_BLOCKS = 4            # 判定窗上限（4×chunk_chars，默认 4800 字）
+_DIFF_CTX = 100                 # 改动区两侧各扩 100 字作判定上下文
+_DIFF_MAX_INPUT = 300_000       # difflib 输入守卫：超限直接退抽样（防对抗长文本拖慢 diff）
 
 
-def _system_diff_spans(old: str, new: str) -> Optional[list]:
-    """new 中改动区（两侧各扩 _SYS_DIFF_CTX 上下文、重叠合并）。
+def _diff_spans(old: str, new: str) -> Optional[list]:
+    """new 中改动区（两侧各扩 _DIFF_CTX 上下文、重叠合并）。
 
     输入超守卫返回 None（调用方退均匀抽样）；old==new 返回 []。
     精度边界：autojunk 对重复样板（同一字符 >1%）匹配变粗，改动区会膨胀超预算
@@ -1301,14 +1303,14 @@ def _system_diff_spans(old: str, new: str) -> Optional[list]:
     （实测 2KB 1ms / 150KB 64ms）。不要试 autojunk=False 重试：100KB 随机文本
     实测分钟级（O(n²) 无 junk 剪枝），会把变更请求拖死。
     """
-    if len(old) + len(new) > _SYS_DIFF_MAX_INPUT:
+    if len(old) + len(new) > _DIFF_MAX_INPUT:
         return None
     import difflib
     spans = []
     for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old, new).get_opcodes():
         if tag == "equal":
             continue
-        spans.append((max(0, j1 - _SYS_DIFF_CTX), min(len(new), j2 + _SYS_DIFF_CTX)))
+        spans.append((max(0, j1 - _DIFF_CTX), min(len(new), j2 + _DIFF_CTX)))
     if not spans:
         return []
     spans.sort()
@@ -1321,36 +1323,38 @@ def _system_diff_spans(old: str, new: str) -> Optional[list]:
     return [(s, e) for s, e in merged]
 
 
-async def _system_diff_chunks(system_text: str, request) -> list:
-    """system/instructions 变化（含首见）⇒ 返回 [(system, chunk), ...]；未变/无身份 ⇒ []。
+async def _diff_trigger_chunks(kind: str, text: str, request, get_prev) -> list:
+    """客户端可写字段（system/instructions、tools 定义）变化（含首见）
+    ⇒ 返回 [(kind, chunk), ...]；未变/无身份/无文本 ⇒ []。
 
     判定窗 = 改动区（与 store 中上次已判定文本 diff，定位客户端真正改的位置）；改动区合计
     ≤ 4×cc 全判，超限/首见/守卫 ⇒ 均匀抽 4×cc。无身份绑定键（干跑/匿名）不判不记。
+    get_prev(key_id) -> str：store 中该身份上次已判定全文（'' = 首见）。
     """
-    if not system_text or request is None:
+    if not text or request is None:
         return []
     kid = _identity_bind_key(request)
     if not kid:
         return []
-    prev = await run_in_threadpool(get_session_store().get_system_text, kid)
-    if prev == system_text:
+    prev = await run_in_threadpool(get_prev, kid)
+    if prev == text:
         return []
     cc = max(1, int(_l2_scope_cfg().get("chunk_chars") or 1200))
-    cap = _SYS_MAX_BLOCKS * cc
+    cap = _DIFF_MAX_BLOCKS * cc
 
     def _plan():
         if prev:
-            spans = _system_diff_spans(prev, system_text)
+            spans = _diff_spans(prev, text)
             if spans is not None and sum(e - s for s, e in spans) <= cap:
-                return [system_text[s:e] for s, e in spans]
-        return _l2_long_windows(system_text, cc, _SYS_MAX_BLOCKS, 0)
+                return [text[s:e] for s, e in spans]
+        return _l2_long_windows(text, cc, _DIFF_MAX_BLOCKS, 0)
     pieces = await run_in_threadpool(_plan)
     out = []
     for p in pieces:
         for i in range(0, len(p), cc):
-            if len(out) >= _SYS_MAX_BLOCKS:
+            if len(out) >= _DIFF_MAX_BLOCKS:
                 return out
-            out.append(("system", p[i:i + cc]))
+            out.append((kind, p[i:i + cc]))
     return out
 
 
@@ -1653,7 +1657,7 @@ async def _inline_media_scan(kind: str, payload) -> tuple[str, bool, dict, bool]
 def _merge_file_findings(a: dict, b: dict) -> dict:
     """合并多个内联 blob 的 file findings 进一个摘要 dict。
 
-    镜像 /v1/files/check 单文件的 findings 形态，供审计展开区 (FindingsDetail)
+    镜像内联附件预检单文件的 findings 形态，供审计展开区 (FindingsDetail)
     以「文件预检结果」呈现。列表型(key) 合并去重；数值累加；布尔 OR；字串取首。
     """
     out = dict(a)
@@ -1888,7 +1892,7 @@ def _intent_source(l2_chunks, l2_text, text) -> str:
     return l2_text or text
 
 
-async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "", session_hint: Optional[str] = None, system_text: str = "") -> tuple[dict, dict, dict | None]:
+async def _review_text(text: str, request: Optional[Request] = None, extra_findings: Optional[dict] = None, l2_text: Optional[str] = None, l2_chunks: Optional[list] = None, file_ctx: Optional[dict] = None, model: str = "", session_hint: Optional[str] = None, system_text: str = "", tools_src: str = "") -> tuple[dict, dict, dict | None]:
     """
 
     纯文本审查（chat / messages / responses 共用）：
@@ -1898,16 +1902,17 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
 
     全本地别名组（_all_local_alias，候选全内网）跳过 L1/L2 直接 allow。
 
-    system_text：客户端可写的 system/instructions 原文（各端点提取后传入）。变化（含首见）
-    时按 diff 改动区（首见/超限退均匀抽样）插入 system 块做语义判定，上次全文在可信判定后
-    落写（见 _system_diff_chunks）。
+    system_text：客户端可写的 system/instructions 原文（各端点提取后传入）。tools_src：
+    tools 定义全文（tools_text 提取，各端点传入）。两者变化（含首见）时按 diff 改动区
+    （首见/超限退均匀抽样）插入 system / tools 块做语义判定，上次全文在可信判定后落写
+    （见 _diff_trigger_chunks）。
 
     返回 (decision, text_findings, l2_result)
 
     """
     text, _overflow = _cap_review_text(text)
     from .intent_router import ctx_set as _intent_ctx_reset
-    _intent_ctx_reset(None)   # 同 task 二次审查（files_check）时不留上一轮的档位
+    _intent_ctx_reset(None)   # 同 task 二次审查（内联附件预检）时不留上一轮的档位
     if model and _all_local_alias(model):
         return {"action": "allow", "name": "local_alias_bypass"}, {}, None
     # KEY 中间档：强制转内网，跳过 L1+L2（route_local 在 resolve 里等价 force_local）
@@ -1972,7 +1977,6 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
             _intent_task = None
 
     # 2026-10-19：/v1/embeddings 已收口到本函数（灰区 L2 与 chat 同源，见 embeddings 端点）。
-    # files_check 的单块文件式 L2 走自己的路径（门槛同为灰区，见 files_check）。
     _dec_blocks = l2_chunks or [(_L2_SCOPE_LAST_USER, l2_text or text)]
     if (decision.get("action") == "allow"
             and (_l2_always() or _l2_gray_trigger(text_findings))
@@ -1984,11 +1988,18 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
         # tool/history/long_text 掉在最后（下次请求 system 未变、恢复全槽），基线不挤。
         # 截断必须显式做在这里：classify_chunks 内部 chunks[:5] 会静默砍队尾块，但审计
         # scopes_run 按 _dec_blocks 记 ⇒ 不截断 = 虚报「判了 6 块」（2026-11-04 生产实测）。
+        # tools 定义与 system 同机制（diff 触发、非配置档）；插入序 system 在前、tools 紧随，
+        # 5 槽溢出时与 tool/history/long_text 一样掉队尾（下次请求该字段未变、恢复全槽）。
         _sys = []
+        _tools = []
         if system_text:
-            _sys = await _system_diff_chunks(system_text, request)
-            if _sys:
-                _dec_blocks = (_dec_blocks[:1] + _sys + _dec_blocks[1:])[:_L2_SCOPE_MAX_BLOCKS]
+            _sys = await _diff_trigger_chunks("system", system_text, request,
+                                              get_session_store().get_system_text)
+        if tools_src:
+            _tools = await _diff_trigger_chunks(_L2_SCOPE_TOOLS, tools_src, request,
+                                                get_session_store().get_tools_text)
+        if _sys or _tools:
+            _dec_blocks = (_dec_blocks[:1] + _sys + _tools + _dec_blocks[1:])[:_L2_SCOPE_MAX_BLOCKS]
         _hit = _dec_blocks[0][0]
         if len(_dec_blocks) == 1:
             # 单块（默认档 scopes=["last_user"]）仍走 classify —— 与历史逐字节等价
@@ -2008,17 +2019,27 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
                 l2_result["scope"] = _hit
             l2_result["scopes_run"] = [s for s, _ in _dec_blocks]
             l2_result.setdefault("degraded_scopes", [])
-        # system diff 上次全文：system 块真拿到可信判定才落写（degraded=没判、disabled=恒
-        # NORMAL 都不算判过）——不落写则未判状态不失效，下个灰区请求重判。超 difflib 守卫的
-        # 超长文本不落写：diff 用不上（必退抽样），只会在 Redis 里按 key 囤 body 级体积。
-        if _sys and isinstance(l2_result, dict) and not is_degraded(l2_result) \
-                and not l2_result.get("disabled") \
-                and len(system_text) <= _SYS_DIFF_MAX_INPUT:
-            try:
-                await run_in_threadpool(get_session_store().set_system_text,
-                                        _identity_bind_key(request), system_text)
-            except Exception:
-                pass
+        # diff 触发上次全文（system / tools）：块真拿到可信判定才落写（degraded=没判、
+        # disabled=恒 NORMAL 都不算判过）——不落写则未判状态不失效，下个灰区请求重判。
+        # 被 5 槽上限挤出 _dec_blocks 的块同样不算判过：基线=「全文判过」，部分块存活
+        # （system 占掉部分槽时 tools 只能判前几块）也 ⇒ 不写，下个请求整份重判。
+        # 超 difflib 守卫的超长文本不落写：diff 用不上（必退抽样），只会在 Redis 里
+        # 按 key 囤 body 级体积。
+        _diff_counts: dict = {}
+        for _s, _ in _dec_blocks:
+            _diff_counts[_s] = _diff_counts.get(_s, 0) + 1
+        for _diff_blocks, _kind, _diff_full, _diff_set in (
+                (_sys, "system", system_text, get_session_store().set_system_text),
+                (_tools, _L2_SCOPE_TOOLS, tools_src, get_session_store().set_tools_text)):
+            if _diff_blocks and _diff_counts.get(_kind, 0) >= len(_diff_blocks) \
+                    and isinstance(l2_result, dict) \
+                    and not is_degraded(l2_result) \
+                    and not l2_result.get("disabled") \
+                    and len(_diff_full) <= _DIFF_MAX_INPUT:
+                try:
+                    await run_in_threadpool(_diff_set, _identity_bind_key(request), _diff_full)
+                except Exception:
+                    pass
 
         # A/B 影子（2026-10-26）：AI_GATEWAY_L2_HISTORY_SHADOW 开且本次真跑了 history 块时，
         # 再判一次「无 history」口径，只留痕（l2.history_shadow 进审计）不改判决。
@@ -2051,7 +2072,6 @@ async def _review_text(text: str, request: Optional[Request] = None, extra_findi
         # 恒为 0（只由探针路径写），而 P2 的交付物是「各 scope 命中率」：
         # 读的人会以为 last_user 从没跑过、也从没拦下过（2026-09-16 生产实测）。
         # 口径与探针侧一致：按「提交送审的块」计，缓存命中同样计入。
-        # 注：/v1/files/check 那处 `_l2_decision` 是文件通道单块判定，不计入。
         try:
             _m_scope = get_metrics()
             for _s_dec, _ in _dec_blocks:
@@ -2743,8 +2763,8 @@ async def chat_completions(request: Request, identity: Identity = Depends(_rate_
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx={"text": inline_text} if inline_text else None,
         model=str(req.model or ""), session_hint=session_id,
-        system_text=_system_text_chat(req.messages))
-    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
+        system_text=_system_text_chat(req.messages), tools_src=_tt)
+    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区）。
     _note_file_findings(inline_findings)
 
 
@@ -3110,8 +3130,9 @@ async def anthropic_messages(request: Request, identity: Identity = Depends(_rat
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx={"text": inline_text} if inline_text else None,
         model=str((body or {}).get("model") or ""),
-        system_text=_system_text_anthropic(body))
-    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
+        system_text=_system_text_anthropic(body),
+        tools_src=tools_text((body or {}).get("tools")))
+    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区）。
     _note_file_findings(inline_findings)
 
 
@@ -3340,8 +3361,9 @@ async def responses_api(request: Request, identity: Identity = Depends(_rate_lim
     decision, text_findings, l2_result = await _review_text(
         text, request, _media_extra or None,
         l2_chunks=l2_blocks, file_ctx=file_ctx, model=str(body.get("model") or ""),
-        session_hint=session_id, system_text=_sys_text)
-    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区），镜像 /v1/files/check。
+        session_hint=session_id, system_text=_sys_text,
+        tools_src=tools_text(body.get("tools")))
+    # 把内联附件预检 findings 写入审计（FindingsDetail 文件预检区）。
     _note_file_findings(inline_findings)
 
 
@@ -3550,140 +3572,6 @@ def _body_text(payload: Any, _depth: int = 0, _budget: list | None = None) -> st
     return ""
 
 
-@app.post("/v1/files/check")
-
-async def files_check(request: Request, file: UploadFile = File(...), identity: Identity = Depends(_rate_limit_files)):
-    _max = int(os.getenv("AI_GATEWAY_FILES_CHECK_MAX_BYTES", str(25 * 1024 * 1024)))
-    data = await file.read(_max + 1)
-    if len(data) > _max:
-        raise HTTPException(413, detail={"type": "file_too_large", "message": f"文件超过 {_max // (1024*1024)}MB 上限"})
-    filename = file.filename or "unknown"
-
-    # 异步线程池，避免阻塞事件循环（Excel/PDF 解析 20-100ms）
-    file_info = await run_in_threadpool(inspect_file, data, filename)
-    # M3（2026-10-19）：不再切前 5000 字符——inspect_file 输出本身已有上限（文本 50KB /
-    # xlsx 15KB），切片只会让 >5000 字符后的机密关键词免审（垫长前置即可绕过）。
-    text = file_info.get("text", "")
-    text_findings = inspect_text(text)
-    _note_risk(text_findings)
-    session_id = extract_session_id(request.headers)
-    session_conf = await run_in_threadpool(_is_session_confidential, session_id)
-    ctx = {
-
-        "text": text + " " + filename,
-        "session": {"confidential": session_conf},
-        "file": {
-
-            "ext": file_info.get("ext", ""),
-            "filename": filename,
-            "headers": file_info.get("headers", []),
-            "sheet_names": file_info.get("sheet_names", []),
-            "text": text,
-            "watermark": file_info.get("findings", {}).get("text_preview", "") if isinstance(file_info.get("findings"), dict) else "",
-            "size": len(data),
-
-        },
-        "findings": {**text_findings, **file_info.get("findings", {})},
-
-    }
-    ctx["file"]["findings_text"] = str(file_info.get("findings", {}))
-    policy_list = load_policy()
-    decision = decide(policy_list, ctx)
-    # 与 _review_text 同口径：解码层独有关键词 L2 判不了（只见编码串）⇒ 直接转本地，
-    # 否则 base64 包一层机密文件的预检会误报「审查通过：可走外网」
-    _enc = _encoded_keyword_decision(text_findings)
-    if _enc and decision.get("action") == "allow":
-        decision = _enc
-    if decision.get("action") != "allow":
-        request.state.gw_block_reason = f"l1:{decision.get('name') or 'rule'}"
-
-
-    # L2 小模型二次判定（文件场景：L1 为 allow 时触发，支持分块聚合应对长文档）
-    # 2026-10-13 起对齐 _review_text：加灰区门槛（risk_score >= 20 才跑 L2），
-    # 与 chat/messages/responses 的 L2 触发语义一致。
-    l2_result = None
-    if decision.get("action") == "allow" and (_l2_always() or _l2_gray_trigger(text_findings)):
-
-        chunks = file_info.get("chunks") or [text[:2000]]
-        if len(chunks) > 1:
-
-            l2_result = await classify_chunks(chunks, filename=filename, headers=file_info.get("headers", []), sheet_names=file_info.get("sheet_names", []))
-
-        else:
-
-            l2_result = await small_classify(
-
-                text[:2000],
-                filename=filename,
-                headers=file_info.get("headers", []),
-                sheet_names=file_info.get("sheet_names", []),
-
-            )
-
-        _d = _l2_decision(l2_result)
-        if _d is not None:
-            decision = _d
-            request.state.gw_block_reason = f"l2:{(l2_result or {}).get('reason') or 'confidential'}"
-
-
-    decision, downgraded = _block_to_fallback(decision)
-    _mark_gw_action(request, decision)
-    _mark_pre_upstream(request)
-    try:
-
-        prov = None
-        model = ""
-        prov, model, notes = resolve(decision, {"model": ""}, None, kind="chat")
-
-    except RoutingError as exc:
-
-        await log_upstream_failure(request, type_="file", status=exc.status_code,
-
-                              action=decision.get("action"), rule=decision.get("name"),
-                              provider=prov, model=model, filename=filename, ext=file_info.get("ext"), session_id=session_id)
-
-        raise HTTPException(exc.status_code, detail={"type": (getattr(exc, "type_", "") or "routing_error"), "message": str(exc)})
-
-
-    await run_in_threadpool(log_entry, {"client_ip": _resolve_client_ip(request), "requested_model": "", 
-
-        "type": "file", "filename": filename, "ext": file_info.get("ext"),
-        "action": decision.get("action"), "rule": decision.get("name"),
-        "provider": prov.name, "local": prov.local, "model": model,
-        "override_denied": notes.get("override_denied") if notes else None,
-        "findings": file_info.get("findings"), "l2": l2_result,
-        "layer": "L2" if l2_result and decision.get("name") in ("l2_confidential", "l2_unavailable", "l2_injection") else "L1",
-        "downgraded_from": downgraded,
-        "session_id": session_id,
-
-    })
-    await run_in_threadpool(_mark_hit_context, session_id, _identity_bind_key(request), filename, filename, decision)
-
-
-    if decision.get("action") == "block":
-
-        raise HTTPException(403, detail={"type": "policy_violation", "rule": decision.get("name"), "findings": file_info.get("findings")})
-
-
-    gw = _gateway_meta(decision, prov, model, notes, l2_result, downgraded)
-    if l2_result:
-
-        gw["l2"] = l2_result
-
-
-    return {
-
-        "filename": filename,
-        "ext": file_info.get("ext"),
-        "gateway": gw,
-        "findings": file_info.get("findings"),
-        "text_findings": text_findings,
-        "preview": file_info.get("findings", {}).get("sample_preview") or file_info.get("findings", {}).get("text_preview", "")[:800],
-        "message": "审查未通过：已自动转本地模型，文件内容不会出境" if gw["action"] == "route_local" else "审查通过：可走外网模型",
-
-    }
-
-
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 
 async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bind_identity_ctx)):
@@ -3691,7 +3579,7 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
 
     未单独实现的 /v1/* 端点：先审查，通过才转发到外网 provider。
 
-    必须注册在所有具体 /v1 路由之后，否则会把 /v1/files/check 之类吞掉。
+    必须注册在所有具体 /v1 路由之后，否则会把具体路由吞掉。
 
     """
     session_id = extract_session_id(request.headers)
@@ -3702,12 +3590,16 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
                                          "message": "严格出网模式：该端点不在白名单内"})
 
 
+    body = b""
     if request.method in ("POST", "PUT"):
+        # 流只读一次：multipart 分支 form() 会消费流，转发时再调 request.body() 会抛
+        # RuntimeError('Stream consumed')（files/check 下线、请求落兜底代理后暴露，2026-11-04）
+        body = await request.body()
         ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
         if ctype.startswith("multipart/"):
             # 上游 files / audio 转写等多为 multipart：request.json() 会直接抛
             # JSONDecodeError（之前是未处理 500）。只取表单文本字段+文件名送审，
-            # 文件字节本身不审（走 /v1/files/check 做内容预检）。
+            # 文件字节本身不审（协议边界：multipart 转发只审文本字段+文件名）。
             try:
                 form = await request.form()
             except Exception:
@@ -3794,7 +3686,6 @@ async def v1_proxy(path: str, request: Request, identity: Identity = Depends(_bi
                                          "message": f"网关未配置 {prov.name} 凭据，请联系管理员（{prov.api_key_env}；不再支持随请求携带上游密钥）"})
 
 
-    body = await request.body()
     client = get_proxy_client(prov.local)
     try:
 

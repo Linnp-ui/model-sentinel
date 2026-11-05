@@ -6,7 +6,7 @@ src/gateway/policy_admin.py
   校验失败不动原文件（回滚语义）。
 - 规则测试（5.3 的 L1 半边）：给定 text/filename/size 构造 ctx 跑 decide()，
   返回命中的规则与动作 —— 供 UI 调规则用。
-- file.size 支持：main.py 的 files/check ctx 已注入 "size"（本模块同步支持），
+- file.size 支持：内联附件预检 ctx 已注入 "size"（本模块同步支持），
   规则可写 {"file.size >=": 102400}。
 """
 from __future__ import annotations

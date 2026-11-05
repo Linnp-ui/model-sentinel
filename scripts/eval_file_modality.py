@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""文件通道与多模态样本评测：xlsx / PDF（文本层 + 扫描件 OCR）/ 图片 OCR / 内联图片 chat。
+"""内联附件与多模态样本评测：codex input_file（PDF/xlsx/CSV）/ 内联图片 chat / workbuddy 粘贴。
 
 用法: .venv/bin/python scripts/eval_file_modality.py
 输出: docs/thesis/eval/file-modality-results.json
 
 隔离环境与 tests/conftest.py 一致：内存审计后端、L2 关闭、外网路由走产品 mock。
 期望标签：敏感样本应 route_local/block（不出境），良性样本应 allow。
+注：专用 /v1/files/check 预检端点 2026-11-04 下线（无真实客户端调用），原 xlsx/PDF/图片
+直传 19 例随之移除；OCR 抽查（ocr_probe）直调 inspect_file，与端点无关，保留。
 """
 import base64
 import io
@@ -118,34 +120,6 @@ def responses_payload(text, files):
 
 
 # id, 类别, 说明, 期望("local"=不出境 / "allow"), 请求方式
-XLSX = [
-    ("xlsx_sheet", "工作表名命中", "工资表2024", ["姓名", "身份证", "工资"], [["张三", "110101199001011237", "30000"]], "salary.xlsx", "local"),
-    ("xlsx_filename", "文件名命中", "Sheet1", ["姓名", "工资"], [["李四", "28000"]], "工资表.xlsx", "local"),
-    ("xlsx_sheet_budget", "工作表名命中（预算）", "预算表", ["项目", "金额"], [["A", "1"]], "data.xlsx", "local"),
-    ("xlsx_filename_cost", "文件名命中（cost）", "Sheet1", ["Product", "Price"], [["A", "100"]], "cost_report.xlsx", "local"),
-    ("xlsx_headers", "表头命中", "Sheet1", ["姓名", "身份证号", "工资"], [["王五", "110101199001011237", "42000"]], "data.xlsx", "local"),
-    ("xlsx_pii_content", "表头无关，正文身份证号", "Sheet1", ["编号", "证件", "备注"], [["1", "110101199001011237", "x"]], "data.xlsx", "local"),
-    ("xlsx_benign_price", "良性（价格表）", "Sheet1", ["Product", "Price"], [["A", "100"]], "price.xlsx", "allow"),
-    ("xlsx_benign_normal", "良性（普通表）", "Sheet1", ["Name", "Age"], [["Alice", "30"]], "normal.xlsx", "allow"),
-]
-
-PDF = [
-    ("pdf_text_conf", "文本层机密", "CONFIDENTIAL SALARY REPORT 30000", "local"),
-    ("pdf_text_blueprint", "文本层图纸词", "BLUEPRINT A01 REV C", "local"),
-    ("pdf_text_pii", "文本层身份证号", "ID 110101199001011237 NAME ZHANG", "local"),
-    ("pdf_scanned_conf", "扫描件（无文本层，走 OCR）", "CONFIDENTIAL SALARY 30000", "local"),
-    ("pdf_benign", "良性文本", "WEATHER STATION DATA 2024 PUBLIC", "allow"),
-    ("pdf_corrupt", "损坏 PDF（fail-closed）", None, "local"),
-]
-
-IMAGE = [
-    ("img_phone", "图片 OCR：手机号", "13800138000", "local"),
-    ("img_conf", "图片 OCR：机密标记", "CONFIDENTIAL", "local"),
-    ("img_pii", "图片 OCR：身份证号", "110101199001011237", "local"),
-    ("img_benign", "图片 OCR：良性文字", "HELLO WORLD 2024", "allow"),
-    ("img_blank", "空白图片（fail-closed）", None, "local"),
-]
-
 CODEX = [
     ("codex_pdf_data", "input_file PDF 带字节（文本层）", "分析附件",
      [("salary_2024.pdf", pdf_text_bytes("CONFIDENTIAL SALARY 30000"), "application/pdf")], "local"),
@@ -197,41 +171,6 @@ def main():
 
     cases = []
     with TestClient(app) as client:
-        for cid, desc, sheet, headers, rows, fn, exp in XLSX:
-            data = xlsx_bytes(sheet, headers, rows)
-            t0 = time.perf_counter()
-            r = client.post("/v1/files/check", headers=H,
-                            files={"file": (fn, data, XLSX_MIME)})
-            ms = (time.perf_counter() - t0) * 1000
-            cases.append(dict(id=cid, kind="xlsx", desc=desc, expected=exp,
-                              status=r.status_code, gw=r.json().get("gateway", {}),
-                              ms=round(ms, 3), file=fn))
-
-        for cid, desc, text, exp in PDF:
-            if text is None:
-                data = b"%PDF-1.7\nbroken garbage\n%%EOF"
-            elif cid == "pdf_scanned_conf":
-                data = pdf_scanned_bytes(text)
-            else:
-                data = pdf_text_bytes(text)
-            t0 = time.perf_counter()
-            r = client.post("/v1/files/check", headers=H,
-                            files={"file": (cid + ".pdf", data, "application/pdf")})
-            ms = (time.perf_counter() - t0) * 1000
-            cases.append(dict(id=cid, kind="pdf", desc=desc, expected=exp,
-                              status=r.status_code, gw=r.json().get("gateway", {}),
-                              ms=round(ms, 3), file=cid + ".pdf"))
-
-        for cid, desc, text, exp in IMAGE:
-            png = _png(text)
-            t0 = time.perf_counter()
-            r = client.post("/v1/files/check", headers=H,
-                            files={"file": (cid + ".png", png, "image/png")})
-            ms = (time.perf_counter() - t0) * 1000
-            cases.append(dict(id=cid, kind="image", desc=desc, expected=exp,
-                              status=r.status_code, gw=r.json().get("gateway", {}),
-                              ms=round(ms, 3), file=cid + ".png"))
-
         # 首条 user 文本必须逐例唯一：workbuddy 无会话头，靠首问指纹 chat-<sha16> 认会话，
         # 撞文案会被前序判密粘住（实测误报 1/9），评测样本也就不再独立
         for cid, desc, text, exp in CHAT:
@@ -330,7 +269,7 @@ def main():
     result = {
         "cases": cases,
         "summary_all": summary(),
-        "summary_by_kind": {k: summary(k) for k in ("xlsx", "pdf", "image", "chat_image", "codex", "workbuddy")},
+        "summary_by_kind": {k: summary(k) for k in ("chat_image", "codex", "workbuddy")},
         "ocr_probe": ocr_probe,
         "ocr_probe_ok": sum(1 for p in ocr_probe if p["ok"]),
         "ocr_probe_n": len(ocr_probe),

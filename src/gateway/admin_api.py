@@ -2300,7 +2300,7 @@ async def route_inspect_api(body: RouteInspectReq):
 
     files（codex ∪ workbuddy 并集）：每项 {filename, file_data?}，file_data 为
     data-URL 或裸 base64。channel 决定复刻哪条真链路：
-      check     = /v1/files/check 全量解析（magic 嗅探 + OCR + 表格），无 file_data 时仅文件名；
+      check     = 文件全量解析（magic 嗅探 + OCR + 表格），无 file_data 时仅文件名；
       chat      = workbuddy image_url 内联图（文件必须带 file_data，由产品内联扫描判定）；
       responses = codex input_file 块（filename 必取；file_data 仅 csv/txt/tsv 解析表头，
                   pdf/xlsx 只看文件名 —— 与线上同宽松口径）。
@@ -2481,7 +2481,7 @@ async def route_inspect_api(body: RouteInspectReq):
                                      shadow=await _shadow_of(text, _fn), uncovered=uncovered)
 
     if channel == "check" and files:
-        # ctx/findings 已在上分支建成（含文件合并）；文件式 L2（files/check 同款：allow 即审，分块聚合）
+        # ctx/findings 已在上分支建成（含文件合并）；文件式 L2（allow 即审，分块聚合）
         l1 = _pol.decide(_pol.load_policy(), ctx)
         _enc = _m._encoded_keyword_decision(findings)
         if _enc and l1.get("action") == "allow":

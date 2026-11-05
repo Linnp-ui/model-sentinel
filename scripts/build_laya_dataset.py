@@ -17,6 +17,7 @@ import os
 import random
 import re
 import statistics
+import sys
 from collections import Counter
 
 import pymysql
@@ -739,6 +740,40 @@ def load_hard():
         return []
 
 
+def check_train_pilot_overlap(train, real_eval):
+    """训测泄漏守卫（2026-11-05 增补二十八）：pilot 评测集与 real_eval 留出集的文字
+    不得出现在训练集中（双向包含，最短 8 字）。命中时警告并记入 stats，不 raise
+    （现行 6024 数据集已有 23 条 pilot 同源，重建时须先处理种子句再重建）。
+    背景：训练集增强曾复用 pilot 原句作种子（对抗前缀/后缀变体），使 pilot 上微调
+    模型指标虚增（干净 161 口径见论文 §6.5.3）。"""
+    pilot_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "tests", "fixtures", "pilot_dataset.jsonl")
+    out = {"pilot_in_train": [], "real_eval_in_train": []}
+    try:
+        pilot = [json.loads(l) for l in open(pilot_path, encoding="utf-8") if l.strip()]
+    except OSError:
+        return out
+    tset = [t["text"].strip() for t in train]
+    for p in pilot:
+        pt = p["text"].strip()
+        if len(pt) < 8:
+            continue
+        if any(pt in t or t in pt for t in tset):
+            out["pilot_in_train"].append(p["id"])
+    for r in real_eval:
+        rt = r["text"].strip()
+        if len(rt) < 8:
+            continue
+        if any(rt in t or t in rt for t in tset):
+            out["real_eval_in_train"].append(rt[:40])
+    if out["pilot_in_train"] or out["real_eval_in_train"]:
+        print(f"!! 训测泄漏检查: pilot 同句 {len(out['pilot_in_train'])} 条 "
+              f"({', '.join(out['pilot_in_train'][:5])}{'…' if len(out['pilot_in_train']) > 5 else ''})、"
+              f"real_eval 同句 {len(out['real_eval_in_train'])} 条 —— 微调模型在重叠样本上的"
+              f"指标不可作为泛化证据（论文 §6.5.3 干净口径）", file=sys.stderr)
+    return out
+
+
 def balance(train, target=POS_RATIO):
     """多数类下采样到目标正比：只删不造；优先删合成，真实审计/人工/难例尽量保留。"""
     pos = [x for x in train if x["label"] == 1]
@@ -798,6 +833,7 @@ def main():
 
     dump("train.jsonl", train)
     dump("real_eval.jsonl", real_eval)
+    overlap = check_train_pilot_overlap(train, real_eval)
     lp = [len(v["text"]) for v in real_train if v["label"] == 1]
     ln = [len(v["text"]) for v in real_train if v["label"] == 0]
     stats = {
@@ -819,6 +855,7 @@ def main():
         "train_pos_ratio": round(sum(v["label"] for v in train) / max(1, len(train)), 3),
         "hard_total": len(hard), "hard_weight": HARD_WEIGHT,
         "hard_train_rows": len(hard_train),
+        "pilot_overlap": overlap,
         "real_pos_source": dict(Counter(v["source"] for v in real_train + real_eval if v["label"] == 1)),
         "real_len_p50_pos": statistics.median(lp) if lp else 0,
         "real_len_p50_neg": statistics.median(ln) if ln else 0,

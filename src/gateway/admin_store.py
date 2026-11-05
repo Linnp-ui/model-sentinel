@@ -263,7 +263,7 @@ def _real_model_label(routes: dict, provider: str, model: str) -> str:
     cands = ((routes or {}).get(m.lower()) or {}).get("candidates") or []
     if cands:
         return f"{cands[0]['provider']}/{cands[0]['model']}"
-    # 脏行归一：空 model（files/check 等路径传 ""）→ 只留 provider；
+    # 脏行归一：空 model（文件类路径传 ""）→ 只留 provider；
     # 客户端斜杠式 model 已含 provider 前缀 → 去重，避免 "vllm_local/vllm_local/..."
     # 双前缀行在外网 provider 上让 _price_billing 按首 / 拆名静默漏定价。
     if m and p and m.lower().startswith(p.lower() + "/"):

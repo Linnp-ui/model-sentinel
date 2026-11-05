@@ -763,7 +763,7 @@ def inspect_inline_bytes(data: bytes) -> Dict[str, Any]:
         text = r.get('text') or ''
         f = r.get('findings') or {}
         # findings 随结果一起返回：失败路径也带 unparsed_binary/parse_failed/ocr_empty_and_image，
-        # 这些本身就是 fail-closed 的预检结论，供审计展开区在非 /v1/files/check 场景下显示。
+        # 这些本身就是 fail-closed 的预检结论，供审计展开区（文件预检区）显示。
         # sheet_names/headers 同返：审计 file_findings 的文件段要显示表名/表头（多 blob 由调用方去重合并）。
         extra = {'sheet_names': r.get('sheet_names') or [], 'headers': r.get('headers') or []}
         if text.strip() == '' or f.get('ocr_empty_and_image') or f.get('parse_failed'):

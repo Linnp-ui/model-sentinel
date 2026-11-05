@@ -2,11 +2,11 @@
 
 用法（隔离环境，勿装进生产 .venv）：
   /tmp/opencode/presidio-venv/bin/python scripts/plot_thesis_figures.py
-输出：
-  docs/thesis/figures/fig6-1-latency.png       图 6-1 各方案 P95 延迟
-  docs/thesis/figures/fig6-2-concurrency.png   图 6-2 并发压测吞吐与 P99（需 perf-concurrency.json）
-  docs/thesis/figures/fig6-3-metrics.png       图 6-3 各方案召回/误报
-  docs/thesis/figures/fig6-4-ablation.png      图 6-4 L1 消融
+输出（图号 2026-11-04 顺延：实机截图占用图 6-1~6-3，本脚本四图顺延为 6-4~6-7）：
+  docs/thesis/figures/fig6-4-latency.png       图 6-4 各方案 P95 延迟
+  docs/thesis/figures/fig6-5-concurrency.png   图 6-5 并发压测吞吐与 P99（需 perf-concurrency.json）
+  docs/thesis/figures/fig6-6-metrics.png       图 6-6 各方案召回/误报
+  docs/thesis/figures/fig6-7-ablation.png      图 6-7 L1 消融
 """
 import json
 import os
@@ -60,7 +60,7 @@ def bar_labels(ax, bars, fmt="{:.2f}"):
                     ha="center", va="bottom", fontsize=8)
 
 
-# ---- 图 6-1 P95 延迟（对数轴，否则 0.26ms 与 20ms 无法同图可读）
+# ---- 图 6-4 P95 延迟（对数轴，否则 0.26ms 与 20ms 无法同图可读）
 fig, ax = plt.subplots(figsize=(7, 3.6))
 bars = ax.bar(METHODS, P95, color=["#4C78A8"] * 3 + ["#9E9E9E"] * 2)
 ax.set_yscale("log")
@@ -68,9 +68,9 @@ ax.set_ylabel("P95 延迟 (ms，对数轴)")
 ax.set_title("各方案 P95 延迟对比（n=184）")
 bar_labels(ax, bars, "{:.2f}")
 ax.grid(axis="y", alpha=0.3)
-save(fig, "fig6-1-latency.png")
+save(fig, "fig6-4-latency.png")
 
-# ---- 图 6-2 并发压测：吞吐与 P99（双轴；perf-concurrency.json 缺失时跳过）
+# ---- 图 6-5 并发压测：吞吐与 P99（双轴；perf-concurrency.json 缺失时跳过）
 if PERF:
     _conc = [int(k) for k in PERF["concurrency"]]
     _qps = [PERF["concurrency"][str(k)]["qps"] for k in _conc]
@@ -87,9 +87,9 @@ if PERF:
     ax1.legend(h1 + h2, l1 + l2, loc="center right")
     ax1.set_title("并发压测：吞吐与 P99 延迟（L2=qwen，每档 n=300，3 次中位数）")
     ax1.grid(alpha=0.3)
-    save(fig, "fig6-2-concurrency.png")
+    save(fig, "fig6-5-concurrency.png")
 
-# ---- 图 6-3 召回 / 误报
+# ---- 图 6-6 召回 / 误报
 fig, ax = plt.subplots(figsize=(7, 3.6))
 x = range(len(METHODS))
 w = 0.38
@@ -104,9 +104,9 @@ bar_labels(ax, b1, "{:.1f}")
 bar_labels(ax, b2, "{:.1f}")
 ax.legend()
 ax.grid(axis="y", alpha=0.3)
-save(fig, "fig6-3-metrics.png")
+save(fig, "fig6-6-metrics.png")
 
-# ---- 图 6-4 消融
+# ---- 图 6-7 消融
 NAMES = {"Full": "全量", "-regular": "-正则", "-checksum": "-校验位",
          "-keyword": "-关键词", "-darkrule": "-暗语规则", "-piiweight": "-PII加权"}
 keys = list(NAMES)
@@ -124,4 +124,4 @@ bar_labels(ax, b1, "{:.1f}")
 bar_labels(ax, b2, "{:.2f}")
 ax.legend()
 ax.grid(axis="y", alpha=0.3)
-save(fig, "fig6-4-ablation.png")
+save(fig, "fig6-7-ablation.png")

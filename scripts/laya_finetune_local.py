@@ -7,7 +7,11 @@
   CUDA_VISIBLE_DEVICES=5 ~/venvs/laya/bin/python scripts/laya_finetune_local.py \
     ~/models/laya/multilingual ~/models/laya-dataset ~/models/laya-finetuned-confidential
 
-⚠️ QUESTIONS 必须与 scripts/laya_l2_server.py 的 QUESTIONS 逐字一致（训练/推理同题规格）。
+  # 冒烟（不训练不落盘）: 末尾加 --smoke [步数, 默认 200]
+  #   1正/1负过拟合 + 选项 logit 读出方向验证（target 向量/选项序映射错误兜底）
+
+⚠️ QUESTIONS 必须与 scripts/laya_l2_server.py 的 QUESTIONS 逐字一致（训练/推理同题规格，
+   逐字一致由 tests/test_l2_questions_consistency.py 守卫，注释约定已不够）。
 """
 import json
 import math
@@ -167,6 +171,66 @@ def main():
     total_updates = max(1, (len(items) // (MICRO_BATCH * GRAD_ACCUM)) * EPOCHS)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_updates, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=True)
+
+    smoke_steps = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[4] == "--smoke" else None
+    if smoke_steps is None and len(sys.argv) > 4 and sys.argv[4] == "--smoke":
+        smoke_steps = 2000
+    if smoke_steps:
+        # 方向验证（不训练不落盘）：target 向量/选项序映射错误时 loss 照样能降（CE 可拟合
+        # 任意目标），只有按推理口径读出（选项 logit argmax）才暴露。过拟合 1 正 + 1 负，
+        # 读出须与标签一致。
+        pos_it = next(it for it in items if it["label"] == 1)
+        neg_it = next(it for it in items if it["label"] == 0)
+
+        def one_logits(it):
+            batch = collate_train_batch([it], tok.pad_token_id)
+            with torch.autocast("cuda", dtype=torch.float16):
+                logits, _ = model(batch["input_ids"].to(device),
+                                  batch["attention_mask"].to(device),
+                                  batch["marker_pos"].to(device),
+                                  batch["marker_mask"].to(device),
+                                  batch["qtype"].to(device))
+            return logits.float(), batch["marker_mask"]
+
+        # 过拟合须收敛（loss<0.01）方向断言才有意义：底座有强先验（零样本"机密过敏"），
+        # 负样本要克服先验翻向标签，步数不足会误报。不收敛 → 大声失败，不静默放行。
+        report = max(1, smoke_steps // 10)
+        for it in (pos_it, neg_it):
+            last = float("inf")
+            for step in range(1, smoke_steps + 1):
+                optimizer.zero_grad(set_to_none=True)
+                logits, mmask = one_logits(it)
+                batch = collate_train_batch([it], tok.pad_token_id)
+                loss = -(batch["target"].to(device)
+                         * torch.log_softmax(logits.masked_fill(~mmask.to(device), -1e4), -1)
+                         ).sum(-1).mean()
+                last = loss.item()
+                if step % report == 0 or step == 1:
+                    lg = logits.detach().float().cpu().numpy()[0]
+                    print(f"  overfit label={it['label']} step={step} loss={last:.4f} "
+                          f"margin(true-false)={lg[1] - lg[0]:.3f}")
+                if last < 0.01:
+                    break
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            if last >= 0.05:
+                print(f"!! 过拟合未收敛（loss={last:.3f} >= 0.05，上限 {smoke_steps} 步）：加大步数重跑，方向验证不作数")
+                sys.exit(1)
+        model.eval()
+        with torch.no_grad():
+            for it in (pos_it, neg_it):
+                logits, _mm = one_logits(it)
+                lg = logits.cpu().numpy()[0, :len(it["markers"])]
+                # 选项序 = marker 序 = [false, true]（target 向量同序对齐）
+                got = 1 if lg[1] > lg[0] else 0
+                margin = abs(float(lg[1] - lg[0]))
+                print(f"direction: label={it['label']} got={got} margin={margin:.4f}")
+                if got != it["label"]:
+                    print("!! 方向验证失败：过拟合后读出方向与标签不符（检查 target 向量/选项序），拒绝训练")
+                    sys.exit(1)
+        print(f"direction OK（1正+1负过拟合 {smoke_steps} 步，读出方向与标签一致）")
+        return
 
     t0 = time.time()
     for epoch in range(EPOCHS):

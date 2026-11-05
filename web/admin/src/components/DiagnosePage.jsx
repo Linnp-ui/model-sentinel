@@ -57,7 +57,7 @@ export default function RouteInspectCard() {
           value={text} onChange={(e) => setText(e.target.value)} />
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--gw-sp-8)', alignItems: 'center' }}>
           <Select style={{ width: 300 }} value={channel} onChange={setChannel} options={[
-            { value: 'check', label: '文件通道：files/check 全量解析' },
+            { value: 'check', label: '文件通道：文件全量解析（magic+OCR+表格）' },
             { value: 'chat', label: '文件通道：workbuddy image_url 内联图' },
             { value: 'responses', label: '文件通道：codex input_file 块' },
           ]} />
