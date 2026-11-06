@@ -645,6 +645,12 @@ def _divergence_regression(url: str) -> dict:
     for r in get_audit_store().query_mysql(limit=5000) or []:
         if not r.get("text_preview"):
             continue
+        # 分歧样本只考"真实用户对话"：系统注入的上下文块 / 图片 base64 / 表格编辑指令
+        # 不是聊天内容，混进去只污染回归分数（v37 实测 3 条误报均属此类）
+        _tp = str(r.get("text_preview") or "")
+        if ("<system-reminder" in _tp or "data:image/" in _tp or "base64," in _tp
+                or len(re.sub(r"\\s+", " ", _tp).strip()) < 10):
+            continue
         l2 = r.get("l2")
         if isinstance(l2, str):
             try:

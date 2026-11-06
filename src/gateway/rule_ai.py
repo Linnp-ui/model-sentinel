@@ -1,9 +1,9 @@
 """Rule AI — L1 匹配条件的 AI 生成（需求 5.2「匹配条件（AI生成）」）。
 src/gateway/rule_ai.py
 
-管理员输入自然语言描述（如「工资表这类文件不能出外网」），调本地 L2 模型
-（Qwen3-4B，small_model 同一端点）生成整组匹配条件：字段（content_type）+
-匹配方式 + 匹配项，通常 1 行、跨字段需求 2-4 行（any/all）。只生成不落库 ——
+管理员输入自然语言描述（如「工资表这类文件不能出外网」），调本地 chat 模型
+（Qwen3-4B，与 L2 判密模型解耦，见下方 RULE_AI_*）生成整组匹配条件：字段
+（content_type）+ 匹配方式 + 匹配项，通常 1 行、跨字段需求 2-4 行（any/all）。只生成不落库 ——
 UI 预览确认后由管理员保存，生成失败可手动填写（兜底）。
 模型输出是幻觉高危区：parse_suggestion 逐行走 policy_admin.build_when
 （组合白名单/正则/非空值）校验，认不出的整组拒掉，不产出静默失效的规则。
@@ -19,9 +19,14 @@ import httpx
 
 from . import policy_admin
 
-SMALL_MODEL_URL = os.getenv("SMALL_MODEL_URL", "http://10.0.0.10:8002/v1/chat/completions")
-SMALL_MODEL_NAME = os.getenv("SMALL_MODEL_NAME", "Qwen3-4B-Instruct-2507")
-TIMEOUT = float(os.getenv("SMALL_MODEL_TIMEOUT", "10"))
+# 生成用模型与 L2 判密模型解耦：管理台把 L2 后端切到专用分类器（laya）后
+# SMALL_MODEL_NAME=laya-multilingual，拿它打 chat 口必然 404（实测 2026-11，
+# 表现为「AI 生成不可用」）。生成固定用 chat 模型的 Qwen，需要时用 RULE_AI_* 单独指。
+# 超时同理不继承 L2 的（判密 2s 够，生成 500 token 不够）。
+SMALL_MODEL_URL = os.getenv("RULE_AI_URL") or os.getenv(
+    "SMALL_MODEL_URL", "http://10.0.0.10:8002/v1/chat/completions")
+SMALL_MODEL_NAME = os.getenv("RULE_AI_MODEL") or "Qwen3-4B-Instruct-2507"
+TIMEOUT = float(os.getenv("RULE_AI_TIMEOUT", "10"))
 # 生成采样温度：高温度让同一（尤其模糊）描述每次选出不同的关键词/字段组合；
 # 输出仍逐行过 parse_suggestion/build_when 整组校验，抽坏了是显式失败（UI 手填兜底），
 # 不会静默落坏规则
@@ -126,27 +131,54 @@ def parse_suggestion(content: str) -> Dict[str, Any]:
     return {"rows": rows, "combiner": combiner, "explanation": str(obj.get("explanation", ""))[:100]}
 
 
+def _resolve_generator(provider: str = "", model: str = "") -> tuple[str, str, dict, float]:
+    """生成模型落点 -> (url, model, headers, timeout)。provider 空 = 用 RULE_AI_* 环境默认。
+
+    管理台可选的生成模型限定「内网 + OpenAI chat 口」：生成的是管理员写的内容
+    （可能带业务词），不能借这里出境；/classify 决策模型与 embedding 也没有对话能力。
+    超时用 provider 自己的（qwen2.5:7b 是推理模型，实测一次生成 ~10s，环境默认的
+    10s 卡在边界上；判密那条 2s 的预算也不能继承）。
+    """
+    if not provider:
+        return SMALL_MODEL_URL, model or SMALL_MODEL_NAME, {}, TIMEOUT
+    from .providers import load_routing
+    p = load_routing().get(provider)
+    if p is None:
+        raise ValueError(f"未知 provider：{provider}")
+    if not p.local:
+        raise ValueError(f"{provider} 是外网 provider，生成内容不允许出境")
+    if p.kind != "chat" or p.api_mode != "openai" or str(p.base_url or "").rstrip("/").endswith("/classify"):
+        raise ValueError(f"{provider} 不是 OpenAI 协议的 chat 口，不能用于生成")
+    return p.endpoint("chat"), model or p.default_model, p.headers(), p.timeout
+
+
 async def generate_rule_suggestion(description: str, exclude: Optional[list] = None,
-                                   scopes: Optional[list] = None) -> Dict[str, Any]:
+                                   scopes: Optional[list] = None,
+                                   provider: str = "", model: str = "") -> Dict[str, Any]:
     """返回 {rows, combiner, explanation}；模型不可用/输出不合法时抛 RuntimeError。
 
     exclude=已生成的匹配项（前端重复点击「换一组」时传入），提示模型换词；
-    scopes=覆盖范围限定（允许生成的 content_type 集合），越界输出整组拒。"""
+    scopes=覆盖范围限定（允许生成的 content_type 集合），越界输出整组拒；
+    provider/model=管理台选的生成模型（见 _resolve_generator），空=环境默认。"""
     if not (description or "").strip():
         raise ValueError("description is required")
-    # L2 关闭时（测试/降级）直接失败，让 UI 走手动填写兜底
-    if os.getenv("SMALL_MODEL_ENABLED", "true").lower() != "true":
+    # L2 关闭只挡「走 L2 默认模型」的路径；显式选了生成模型就与判密开关无关
+    if not provider and os.getenv("SMALL_MODEL_ENABLED", "true").lower() != "true":
         raise RuntimeError("L2 small model is disabled (SMALL_MODEL_ENABLED=false)")
-    client = httpx.AsyncClient(timeout=TIMEOUT, trust_env=False)
+    url, gen_model, headers, timeout = _resolve_generator(provider, model)
+    client = httpx.AsyncClient(timeout=timeout, trust_env=False)
     try:
-        resp = await client.post(SMALL_MODEL_URL, json={
-            "model": SMALL_MODEL_NAME,
+        resp = await client.post(url, headers=headers, json={
+            "model": gen_model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": _gen_user_message(description, exclude, scopes)},
             ],
             "temperature": GEN_TEMPERATURE,
             "max_tokens": 500,
+            # Qwen3 系推理模型默认先产一长段思考（qwen2.5:7b 实测 10s+，500 token 被
+            # 思考吃光 ⇒ content 空 ⇒ 503）：生成只要 JSON，关掉思考。模板不认该参数会忽略。
+            "chat_template_kwargs": {"enable_thinking": False},
         })
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"] or ""

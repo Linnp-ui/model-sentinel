@@ -116,7 +116,7 @@ async def audit_entries_api(request: Request, ip=None, token=None, action=None, 
             return v
         return str(v)
 
-    _keys = ("time", "type", "rule", "action", "provider", "local", "model",
+    _keys = ("id", "time", "type", "rule", "action", "provider", "local", "model",
              "requested_model", "downgraded_from", "filename", "text_preview", "client_ip", "token_masked", "key_name", "session_id", "l2", "status_code", "risk_score", "layer", "findings", "file_findings", "usage")
 
     def _entry_val(k, e):

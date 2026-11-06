@@ -3,7 +3,7 @@ import { Table, Button, Input, InputNumber, Modal, Form, Select, Tag, Space, mes
 import { RobotOutlined, DeleteOutlined, LockOutlined } from '@ant-design/icons';
 import { api, errText, usePoll } from '../api.js';
 import { L2PromptsSection } from './ModelPolicyPage.jsx';
-import { wideSticky } from '../utils.js';
+import { wideSticky, TABLE_X, mergeAiRows } from '../utils.js';
 import { Tip } from '../terms.jsx';
 import Arrow from './Arrow.jsx';
 
@@ -53,11 +53,11 @@ const SCOPE_TIPS = {
   ),
 };
 
-// L2 配置劈两页：本页管判定档/判密阈值/提示词，模型配置页管端点/模型/超时/影子/灰区下限。互链别让用户猜
+// L2 配置劈两页：本页管判定档/判密阈值/提示词，模型配置页管模型/超时/影子/灰区下限。互链别让用户猜
 const L2_CROSS_LINK = (
-  <Tooltip title="端点 / 模型 / 超时 / 影子 / 灰区下限在「模型配置」页的审查模型卡">
+  <Tooltip title="模型 / 超时 / 影子 / 灰区下限在「模型配置」页的审查模型卡">
     <Button type="link" size="small" style={{ padding: 0 }}
-      onClick={() => { window.location.hash = '/modelpolicy'; }} icon={<Arrow />} iconPosition="end">审查模型</Button>
+      onClick={() => { window.location.hash = '/modelpolicy?focus=review'; }} icon={<Arrow />} iconPosition="end">审查模型</Button>
   </Tooltip>
 );
 
@@ -137,6 +137,8 @@ function L2RulesCard() {
 export default function RulesPage() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
+  const l2RulesRef = useRef(null);
+  const focus = new URLSearchParams((window.location.hash.split('?')[1] || '')).get('focus');
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState(null); // 规则名或 null=新增
   const [prioSort, setPrioSort] = useState('ascend'); // 优先级仅升/降两态，点击直接切换
@@ -180,6 +182,16 @@ export default function RulesPage() {
   const [unparsed, setUnparsed] = useState(false);
   // AI 生成的覆盖范围限定（允许生成的 content_type 集合）；空=不限
   const [aiScopes, setAiScopes] = useState([]);
+  // AI 这次生成的「依据」：常驻显示，保存时 description 为空就自动填它
+  const [aiNote, setAiNote] = useState('');
+  // 生成模型（"provider|model"，空=服务端默认）：内网 chat 模型可选，选择记在本机
+  const [aiModel, setAiModel] = useState(() => localStorage.getItem('gw.ruleAiGenModel') || '');
+  const [aiModelList, setAiModelList] = useState([]);
+  // 草稿试跑：保存前拿样例文本验这一条 when（未保存也能测）
+  const [testText, setTestText] = useState('');
+  const [testFilename, setTestFilename] = useState('');
+  const [testRes, setTestRes] = useState(null);
+  const [testing, setTesting] = useState(false);
   // 覆盖范围选项 = choices 里的 distinct content_type（唯一真源仍是后端 MATCH_CHOICES）；
   // bool 字段 label 首段共用「开关」，取第二段区分；title=该字段各匹配方式说明（悬停用）
   const scopeOptions = [...new Map((choices || []).map((c) => [c.content_type, c])).keys()].map((ct) => {
@@ -192,6 +204,16 @@ export default function RulesPage() {
   });
   const [verView, setVerView] = useState(null);
   const [promptVerView, setPromptVerView] = useState(null);
+  // 生成模型候选 = 内网模型登记里的 chat 模型（与「目标 provider」同一份注册表，
+  // laya /classify 与 embedding 不能生成）；provider 的 local/kind 以 /providers 为准
+  const aiModelOptions = aiModelList
+    .filter((m) => m.enabled !== false)
+    .filter((m) => {
+      const p = providers.find((x) => x.name === m.provider);
+      return p && p.local && p.kind === 'chat'
+        && !String(p.base_url || '').replace(/\/+$/, '').endsWith('/classify');
+    })
+    .map((m) => ({ value: `${m.provider}|${m.model}`, label: `${m.model}（${m.provider}）` }));
   // 构造器可选项来自后端 policy_admin.MATCH_CHOICES（唯一真源），不在前端抄一份
   const loadChoices = useCallback(async () => {
     try {
@@ -203,6 +225,8 @@ export default function RulesPage() {
     regex: '正则表达式，如 AWS_SECRET|akia',
     contains: '关键词1, 关键词2',
     size: '字节数，如 1048576',
+    pii_score: '分数阈值，如 60',
+    hour_range: '时段，如 9-18 或 22-6',
     in: '枚举值1, 枚举值2',
     not_in: '枚举值1, 枚举值2（都不匹配才算命中）',
     bool: 'true / false（是 / 否 也认）',
@@ -239,6 +263,9 @@ export default function RulesPage() {
     loadProviders();
     loadChoices();
     loadModels(form.getFieldValue('target_provider') || '');
+    api('/model-policy')
+      .then((d) => setAiModelList((d?.policy?.internal_models) || []))
+      .catch(() => setAiModelList([]));
   }, [modalOpen, loadProviders, loadChoices, loadModels, form]);
   // builder auto-sync: builder edits rebuild when_json (debounced 400ms);
   // manual when_json edits set a dirty flag pausing auto-sync until builder changes.
@@ -266,6 +293,7 @@ export default function RulesPage() {
       progRef.current = true;
       form.setFieldsValue({ when_json: JSON.stringify(d.when, null, 2) });
       progRef.current = false;
+      setTestRes(null); // 条件变了，上次试跑结果作废
     } catch (e) { message.error(errText(e)); }
   }, [modalOpen, form]);
   const scheduleSync = useCallback((rws, cmb) => {
@@ -278,6 +306,7 @@ export default function RulesPage() {
     if (changed.when_json !== undefined) {
       whenDirtyRef.current = true;
       setWhenDirty(true);
+      setTestRes(null);
       if (whenSyncTimer.current) { clearTimeout(whenSyncTimer.current); whenSyncTimer.current = null; }
     }
   };
@@ -304,6 +333,59 @@ export default function RulesPage() {
     setCombiner(v);
     scheduleSync(rows, v);
   };
+  // 换「字段 · 匹配方式」：匹配方式变了 ⇒ 值的格式也变了（regex 串 / 关键词 / 数字），
+  // 留着旧值会静默变成另一条规则（如 "工资, 薪资" 当 regex 是合法但不达意的正则），
+  // 所以方式一变就清空值；只换字段（contains→contains）保留关键词。
+  const updateRowKey = (i, key) => {
+    const oldMt = String(rows[i].key || '').split('|')[1] || '';
+    const newMt = String(key).split('|')[1] || '';
+    updateRow(i, oldMt === newMt ? { key } : { key, value: '' });
+  };
+  const addRow = () => {
+    whenDirtyRef.current = false;
+    setWhenDirty(false);
+    editDirtyRef.current = true;
+    setTestRes(null);
+    setRows((r) => [...r, { key: '', value: '' }]);
+  };
+  // 清空构造器 = 连 when_json 一起清（留着旧 JSON 会让人以为清掉了，保存仍是旧条件）；
+  // 清成空串后表单的 required 会挡住保存，直到重新生成/填写
+  const clearRows = () => {
+    whenDirtyRef.current = false;
+    setWhenDirty(false);
+    setUnparsed(false);
+    editDirtyRef.current = true;
+    setTestRes(null);
+    setRows([{ key: '', value: '' }]);
+    progRef.current = true;
+    form.setFieldsValue({ when_json: '' });
+    progRef.current = false;
+  };
+  // 构造器下拉 Option：choices 已含自带字段（size/hour_range/pii_score）；多行时排除
+  // hour_range（它自身就是 any/all 壳，build_when_group 会拒）
+  const rowOptions = (r) => {
+    const opts = (choices || [])
+      .filter((c) => !(rows.length > 1 && c.match_type === 'hour_range'))
+      .map((c) => ({ value: c.key, label: c.label, title: c.desc }));
+    // match 里落过、但已不在构造器白名单的组合（如 2026-10-13 精简掉的 model/ocr）：
+    // 照样显示原文，别让下拉看起来「没选」；要保留/修改走 when JSON
+    if (r.key && !opts.some((o) => o.value === r.key)) {
+      opts.push({ value: r.key, label: `${r.key}（手写，不在构造器列表）`,
+        title: '该组合不在构造器白名单，改匹配项会校验失败；要保留请直接改 when JSON' });
+    }
+    return opts;
+  };
+  const runDraftTest = async () => {
+    let when;
+    try { when = JSON.parse(form.getFieldValue('when_json') || '{}'); }
+    catch { message.error('when JSON 不合法，无法试跑'); return; }
+    setTesting(true);
+    try {
+      setTestRes(await api('/policies/test', { method: 'POST', body: JSON.stringify({
+        text: testText, filename: testFilename, when }) }));
+    } catch (e) { message.error(errText(e)); }
+    setTesting(false);
+  };
 
   const loadVersions = useCallback(async () => {
     try { setVersions((await api('/policy/versions?limit=50')).items || []); } catch { setVersions([]); }
@@ -320,6 +402,15 @@ export default function RulesPage() {
     loadPromptVersions();
   }, [loadVersions, loadPromptVersions]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (focus === 'l2' && l2RulesRef.current) {
+      const id = setTimeout(() => {
+        const el = l2RulesRef.current;
+        window.scrollTo({ top: el.offsetTop - 80, behavior: 'auto' });
+      }, 300);
+      return () => clearTimeout(id);
+    }
+  }, [focus, items]);
   usePoll(() => load(true), 60000); // 规则/版本变化低频，60s 轮询即可
 
   const viewVersion = async (vid) => {
@@ -359,6 +450,8 @@ export default function RulesPage() {
   const openEdit = async (rec) => {
     setEditing(rec ? rec.name : null);
     setAiScopes([]);
+    setAiNote('');
+    setTestText(''); setTestFilename(''); setTestRes(null);
     progRef.current = true;
     setWhenDirty(false);
     editDirtyRef.current = false;
@@ -411,7 +504,13 @@ export default function RulesPage() {
       const used = rows
         .filter((r) => { const mt = String(r.key || '').split('|')[1]; return mt === 'contains' || mt === 'in' || mt === 'not_in'; })
         .flatMap((r) => String(r.value || '').split(',').map((s) => s.trim()).filter(Boolean));
-      const d = await api('/l2/generate-rule', { method: 'POST', body: JSON.stringify({ description: desc, exclude: used, scopes: aiScopes }) });
+      const body = { description: desc, exclude: used, scopes: aiScopes };
+      const sep = aiModel.indexOf('|');
+      if (sep > 0) {
+        body.provider = aiModel.slice(0, sep);
+        body.model = aiModel.slice(sep + 1);
+      }
+      const d = await api('/l2/generate-rule', { method: 'POST', body: JSON.stringify(body) });
       const s = d.suggestion;
       const fmt = (v) => (Array.isArray(v) ? v.join(', ') : String(v ?? ''));
       // AI 连字段一起选（1-4 行 any/all）；旧格式 {match_type,value} 按提示词单行兜底
@@ -422,25 +521,9 @@ export default function RulesPage() {
         const mt = s.match_type === 'contains' ? 'contains' : 'regex';
         next = [{ key: `prompt|${mt}`, value: fmt(s.value) }];
       }
-      // 累积合并（只增不减）：关键词类按 (字段,方式) 取并集追加，已有项不删；
-      // regex/bool 行已有则保留、没有才补；combiner 沿用已有行，首生成才取 AI 给的
-      const kw = (k) => ['contains', 'in', 'not_in'].includes(String(k || '').split('|')[1]);
+      // 累积合并（只增不减，口径与跳过原因见 utils.mergeAiRows）
       const cur = rows.filter((r) => r.key && String(r.value ?? '').trim() !== '');
-      const merged = cur.map((r) => ({ ...r }));
-      let added = 0;
-      for (const r of next) {
-        const i = merged.findIndex((m) => m.key === r.key);
-        if (i < 0) {
-          merged.push(r);
-          added += kw(r.key) ? String(r.value).split(',').filter((x) => x.trim()).length : 1;
-          continue;
-        }
-        if (kw(r.key)) {
-          const old = String(merged[i].value).split(',').map((x) => x.trim()).filter(Boolean);
-          const news = String(r.value).split(',').map((x) => x.trim()).filter(Boolean).filter((x) => !old.includes(x));
-          if (news.length) { merged[i] = { ...merged[i], value: [...old, ...news].join(', ') }; added += news.length; }
-        }
-      }
+      const { rows: merged, added, skipped } = mergeAiRows(cur, next, choices);
       const cmb = cur.length ? combiner : (s.combiner || 'any');
       whenDirtyRef.current = false;
       setWhenDirty(false);
@@ -448,8 +531,14 @@ export default function RulesPage() {
       setCombiner(cmb);
       setRows(merged);
       scheduleSync(merged, cmb);
-      if (added) message.success(`新增 ${added} 个匹配项（${s.explanation}），已有项保留，请确认后保存`);
-      else message.warning(`本次未产生新词（${s.explanation}），已有项保留，可再试`);
+      // AI 的「一句话说明」常驻显示；说明还没写就自动填上（可再改），审计能一眼看出依据
+      setAiNote(s.explanation || '');
+      if (!String(form.getFieldValue('description') || '').trim()) {
+        form.setFieldsValue({ description: s.explanation || '' });
+      }
+      const skipTip = skipped.length ? `；未加入：${skipped.join('，')}` : '';
+      if (added) message.success(`新增 ${added} 个匹配项（${s.explanation}）${skipTip}，请确认后保存`);
+      else message.warning(`本次未新增匹配项（${s.explanation}）${skipTip || '，已有项保留，可再试'}`);
     } catch (e) { message.warning(`AI 生成不可用，请手动填写（${errText(e)}）`); }
     setAiLoading(false);
   };
@@ -459,6 +548,13 @@ export default function RulesPage() {
       const v = await form.validateFields();
       let when;
       try { when = JSON.parse(v.when_json); } catch { message.error('when JSON 不合法'); return; }
+      // 半截的条件行（选了字段没填值 / 多行里有一行还没选字段）：when_json 还是旧值，
+      // 静默保存等于"这行没生效"，直接拦。单行且空不拦（老规则解析不出 when 时只走 JSON）
+      if (rows.some((r) => (r.key && String(r.value ?? '').trim() === '') || (rows.length > 1 && !r.key))) {
+        message.error('有条件的匹配项没填：填完或删掉该行再保存');
+        return;
+      }
+      const filled = rows.filter((r) => r.key && String(r.value ?? '').trim() !== '');
        const body = {
         name: v.name, priority: v.priority, action: v.action,
         priority_locked: !!v.priority_locked, description: v.description, when,
@@ -468,7 +564,6 @@ export default function RulesPage() {
       // 构造器匹配信息随规则持久化（下次编辑原样还原）：单行用老形状
       // {content_type,match_type,match_value}（兼容老规则），多行用 {combiner, rows}。
       // when_json 被手改过（与构造器不同步）或行未填齐时不落 match。
-      const filled = rows.filter((r) => r.key && String(r.value ?? '').trim() !== '');
       if (filled.length === rows.length && filled.length > 0 && !whenDirtyRef.current) {
         body.match = filled.length === 1
           ? { content_type: filled[0].key.split('|')[0], match_type: filled[0].key.split('|')[1], match_value: filled[0].value }
@@ -516,15 +611,15 @@ export default function RulesPage() {
         : <span style={{ display: 'inline-block', minWidth: '100%', textAlign: 'center' }}>{v}</span>) },
     { title: '名称', dataIndex: 'name', width: '15%', ellipsis: true, align: 'center', className: 'cell-center',
       render: (v) => <Text code title={v}><RuleZh name={v} /></Text> },
-    { title: <>{'动作'}<Tip term="action" /></>, dataIndex: 'action', width: '12%',
+    { title: <>{'动作'}<Tip term="action" /></>, dataIndex: 'action', width: '14%',
       render: (v) => {
         const [name, color] = ACTION_INFO[v] || [v || '—', undefined];
         return <Tag color={color} title={v}>{name}</Tag>;
       } },
-    { title: '说明', dataIndex: 'description', width: '43%', ellipsis: true },
+    { title: '说明', dataIndex: 'description', width: '42%', ellipsis: true },
     // 操作列要装下 编辑+删除 两个默认尺寸按钮 + 24/24 cell padding，
     // 150 会撑出 wrapper 右缘（2026-10 实测）
-    { title: '操作', width: '20%',
+    { title: '操作', width: '19%',
       render: (_, rec) => (
         <Space>
           <Button type="link" onClick={() => openEdit(rec)}>编辑</Button>
@@ -545,6 +640,7 @@ export default function RulesPage() {
         </Space>
       }>
         <Table rowKey="name" className="tbl-l1" columns={cols} dataSource={items} loading={loading} size="small"
+          scroll={{ x: TABLE_X }}
           sticky={wideSticky()}
           tableLayout="fixed"
           pagination={{ pageSize: 50, showSizeChanger: false }}
@@ -567,20 +663,20 @@ export default function RulesPage() {
         </Space>
       </Card>
 
-      <L2RulesCard />
+      <div ref={l2RulesRef}><L2RulesCard /></div>
 
       <Card title="L1规则历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
         {versions.length ? (
-          <Table rowKey="id" size="small" scroll={{ y: 400 }} pagination={false} tableLayout="fixed" dataSource={versions} columns={[
+          <Table rowKey="id" size="small" scroll={{ y: 400, x: TABLE_X }} pagination={false} tableLayout="fixed" dataSource={versions} columns={[
             /* 列宽全 % + tableLayout=fixed；操作列两个链接按钮，14% 够放 */
-            { title: '时间', dataIndex: 'ts', width: '16%' },
-            { title: '变更内容（与下一更新状态比）', width: '70%', ellipsis: true,
+            { title: '时间', dataIndex: 'ts', width: '16%', ellipsis: true },
+            { title: '变更内容（与下一更新状态比）', width: '68%', ellipsis: true,
               render: (_, r) => {
                 const cs = r.changes;
                 const text = (Array.isArray(cs) && cs.length) ? cs.join('；') : '无变化（内容相同）';
                 return <span title={text}>{text}</span>;
               } },
-            { title: '操作', width: '14%', render: (_, r) => (
+            { title: '操作', width: '16%', render: (_, r) => (
               <Space size={4}>
                 <Button size="small" type="link" onClick={() => viewVersion(r.id)}>查看</Button>
                 <Popconfirm title={`回滚到该版本（${r.rule_count} 条规则）？现状也会存一版，可再反悔。`}
@@ -597,14 +693,13 @@ export default function RulesPage() {
 
       <Card title="L2 提示词历史版本" style={{ marginTop: 'var(--gw-sp-12)' }}>
         {promptVersions.length ? (
-          <Table rowKey="id" size="small" pagination={false} tableLayout="fixed" dataSource={promptVersions} columns={[
-            { title: '时间', dataIndex: 'ts', width: '16%' },
-            { title: 'system prompt 预览', width: '70%', ellipsis: true,
+          <Table rowKey="id" size="small" scroll={{ x: TABLE_X }} pagination={false} tableLayout="fixed" dataSource={promptVersions} columns={[
+            { title: '时间', dataIndex: 'ts', width: '16%', ellipsis: true },            { title: 'system prompt 预览', width: '68%', ellipsis: true,
               render: (_, r) => {
                 const text = r.system_preview || r.system_prompt || '（空，使用默认）';
                 return <span title={text}>{text}</span>;
               } },
-            { title: '操作', width: '14%', render: (_, r) => (
+            { title: '操作', width: '16%', render: (_, r) => (
               <Space size={4}>
                 <Button size="small" type="link" onClick={() => viewPromptVersion(r.id)}>查看</Button>
                 <Popconfirm title={`回滚到该版本？现状也会存一版，可再反悔。`}
@@ -656,15 +751,24 @@ export default function RulesPage() {
             </Tag>}
             {whenDirty && <Tag color="orange" style={{ marginLeft: 'var(--gw-sp-8)', fontWeight: 'normal' }}>JSON 已手改，构造器同步暂停（再改构造器任一条件即恢复）</Tag>}
           </>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
+            {aiNote && <Alert type="info" showIcon style={{ marginBottom: 'var(--gw-sp-8)' }}
+              message={`AI 依据：${aiNote}`} />}
             <Space direction="vertical" style={{ width: '100%' }} size={6}>
               {rows.map((r, i) => {
                 const mt = String(r.key || '').split('|')[1] || '';
-                const choice = (choices || []).find((c) => c.key === r.key);
                 return (
                   <Space key={i} align="center" wrap>
-                    <Tooltip title={choice ? choice.desc : undefined} overlayStyle={{ maxWidth: 400 }}>
-                      <Text style={{ display: 'inline-block', minWidth: 200, paddingLeft: 'var(--gw-sp-12)' }}>{choice ? choice.label : (r.key || '—')}</Text>
-                    </Tooltip>
+                    <Select style={{ minWidth: 240 }} value={r.key || undefined}
+                      data-testid={rows.length === 1 ? 'rule-match-select' : `rule-row-select-${i}`}
+                      placeholder="字段 · 匹配方式" options={rowOptions(r)}
+                      popupMatchSelectWidth={false}
+                      optionRender={(o) => (
+                        <div style={{ maxWidth: 420, whiteSpace: 'normal', lineHeight: 1.6 }}>
+                          <div>{o.label}</div>
+                          {o.data.title && <div style={{ fontSize: 'var(--gw-fs-12)', color: 'var(--gw-faint)' }}>{o.data.title}</div>}
+                        </div>
+                      )}
+                      onChange={(key) => updateRowKey(i, key)} />
                     <Input id={rows.length === 1 ? 'rule-match-value' : `rule-row-value-${i}`}
                       style={{ minWidth: 260 }} placeholder={VALUE_HINT[mt] || '匹配项'}
                       value={r.value} onChange={(e) => updateRow(i, { value: e.target.value })} />
@@ -675,6 +779,12 @@ export default function RulesPage() {
                   </Space>
                 );
               })}
+              <Space size={4}>
+                <Button size="small" onClick={addRow} disabled={rows.length >= 8}>＋ 添加条件</Button>
+                <Popconfirm title="清空构造器条件和 when JSON？（重新起草时用）" okText="清空" cancelText="取消" onConfirm={clearRows}>
+                  <Button size="small" type="text">清空条件</Button>
+                </Popconfirm>
+              </Space>
               {rows.length > 1 && (
                 <Radio.Group size="small" value={combiner} onChange={(e) => changeCombiner(e.target.value)}>
                   <Radio.Button value="any">任一命中</Radio.Button>
@@ -720,6 +830,13 @@ export default function RulesPage() {
                 )}
                 onChange={(v) => setAiScopes(Array.isArray(v) ? v : [])}
                 maxTagCount={2} />
+              <Select id="ai-model" style={{ width: 230 }} allowClear value={aiModel || undefined}
+                placeholder="生成模型（默认服务端配置）" options={aiModelOptions}
+                onChange={(v) => {
+                  const nv = v || '';
+                  setAiModel(nv);
+                  try { localStorage.setItem('gw.ruleAiGenModel', nv); } catch { /* 隐私模式忽略 */ }
+                }} />
               <Input id="ai-desc" style={{ width: 320 }} placeholder="用大白话描述需求，AI 生成字段+方式+匹配项，如：拦截含 AWS 密钥的提示词；再点一次=追加新词（避开已用词，已有不删）"
                 onChange={(e) => form.setFieldValue('ai_description', e.target.value)} />
               <Button icon={<RobotOutlined />} loading={aiLoading}
@@ -731,6 +848,23 @@ export default function RulesPage() {
             rules={[{ required: true }]} htmlFor="rule-when-json">
             <Input.TextArea id="rule-when-json" rows={4} />
           </Form.Item>
+          <Card size="small" style={{ marginBottom: 'var(--gw-sp-12)' }}
+            title={<>试跑这条条件 <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)', fontWeight: 'normal' }}>
+              （用当前 when JSON 判样例，未保存也能测）</Text></>}>
+            <Space direction="vertical" style={{ width: '100%' }} size={8}>
+              <Space wrap>
+                <Input value={testFilename} onChange={(e) => { setTestFilename(e.target.value); setTestRes(null); }}
+                  placeholder="文件名（可选，例：工资表.xlsx）" style={{ width: 260 }} />
+                <Button onClick={runDraftTest} loading={testing}>试跑</Button>
+                {testRes && <Tag color={testRes.matched ? 'green' : 'default'}>
+                  {testRes.matched ? '命中' : '未命中'}
+                </Tag>}
+              </Space>
+              <Input.TextArea rows={2} value={testText}
+                onChange={(e) => { setTestText(e.target.value); setTestRes(null); }}
+                placeholder="样例文本（可粘贴一句提示词；文件内容/OCR 类条件也用它当解析正文）" />
+            </Space>
+          </Card>
           <Space>
             <Form.Item name="target_provider" label="目标 provider（可选）" style={{ marginBottom: 0 }} htmlFor="rule-target-provider">
               <Select id="rule-target-provider" showSearch allowClear style={{ width: 200 }} options={providers.map((p) => ({ value: p.name, label: p.local ? `${p.name} (local)` : p.name }))} onChange={onProviderChange} />
@@ -743,7 +877,7 @@ export default function RulesPage() {
             )}
             </Form.Item>
           </Space>
-          <Form.Item name="description" label="说明"><Input /></Form.Item>
+          <Form.Item name="description" label="说明" htmlFor="rule-description"><Input id="rule-description" /></Form.Item>
         </Form>
       </Modal>
     </Space>

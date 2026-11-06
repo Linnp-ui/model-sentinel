@@ -3,7 +3,7 @@ import {
   Alert, Button, Card, Input, Modal, Popconfirm, Select, Space, Spin, Statistic, Table, Tag, Tooltip, Typography, message,
 } from 'antd';
 import { api, errText } from '../api';
-import { bj, wideSticky } from '../utils.js';
+import { bj, wideSticky, TABLE_X } from '../utils.js';
 import WheelGate from './WheelGate.jsx';
 import { Tip } from '../terms.jsx';
 import Arrow from './Arrow.jsx';
@@ -240,7 +240,7 @@ export default function L2Page() {
                 {base ? `，现影子 ${base.correct}/${base.total}` : ''}；
                 标注回归 {lb.matched}/{lb.total}
                 {dg ? `，分歧回归 ${dg.matched}/${dg.total}` : ''}
-                {job.report?.prompt ? `；qwen prompt ${job.report.prompt.sha1}` : ''}</Text>
+                {job.report?.prompt ? `；主判 prompt ${job.report.prompt.sha1}` : ''}</Text>
               {dg && dg.missed?.length > 0 && (
                 <div style={{ fontSize: 'var(--gw-fs-13)', width: '100%' }}>
                   <Text type="danger">分歧回归漏判 {dg.missed.length} 条：</Text>
@@ -295,6 +295,16 @@ export default function L2Page() {
               )}
               {lb.missed?.length > 0 && (
                 <Text type="danger">标注回归错 {lb.missed.length} 条：{lb.missed.map((m) => `${m.req_id}(want${m.want}/p${m.p})`).join('，')}</Text>
+              )}
+              <Text strong>晋升建议：</Text>{' '}
+              {job.report?.regressions?.new?.length > 0 ? (
+                <Text type="danger">不建议晋升（有 {job.report.regressions.new.length} 条新错）</Text>
+              ) : (lb.missed?.length || 0) + (dg?.missed?.length || 0) > 0 ? (
+                <Text type="warning">谨慎晋升（存在回归错）</Text>
+              ) : (b.total && b.correct / b.total < 0.95) ? (
+                <Text type="warning">谨慎晋升（金标集准确率偏低）</Text>
+              ) : (
+                <Text type="success">建议晋升（零新错且回归通过）</Text>
               )}
             </>
           );
@@ -366,7 +376,7 @@ export default function L2Page() {
           const cx = (k) => (b.cats?.[k] ? `${b.cats[k].correct}/${b.cats[k].total}` : '-');
           return (
             <Space direction="vertical" size={4} style={{ fontSize: 'var(--gw-fs-13)', width: '100%' }}>
-              <Text type="secondary">评测时间 {sel.ts || '-'} · qwen prompt {sel.report?.prompt?.sha1 || '-'}</Text>
+              <Text type="secondary">评测时间 {sel.ts || '-'} · 主判 prompt {sel.report?.prompt?.sha1 || '-'}</Text>
               <Space wrap size={12}>
                 <Text><Text strong>候选 battery：</Text>{b.correct}/{b.total}（探针 {cx('probe')} · 真实 {cx('real')} · 回归 {cx('reg')}）</Text>
                 {base && <Text><Text strong>现影子同电池：</Text>{base.correct}/{base.total}</Text>}
@@ -489,11 +499,11 @@ export default function L2Page() {
   const cols = [
     /* 时间是纯文本无省略号：窄列溢出到邻列，加 ellipsis 裁切 */
     { title: '时间', dataIndex: 'ts', width: '15%', ellipsis: true, render: (v) => bj(v) },
-    { title: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>主 <Arrow size={12} /> 影</span>, width: '24%',
+    { title: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>主 <Arrow size={12} /> 影</span>, width: '25%',
       render: (_, x) => <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>{labelTag(x.main)}<Arrow size={12} />{labelTag(x.shadow)}</div> },
     { title: '影子置信度', dataIndex: 'shadow_prob', width: '9%',
       render: (v) => (v == null ? '-' : Number(v).toFixed(3)) },
-    { title: '用户query', dataIndex: 'text_preview', width: '32%', ellipsis: true,
+    { title: '用户query', dataIndex: 'text_preview', width: '31%', ellipsis: true,
       render: (t, x) => (
         <div>
           <Space size={4}>
@@ -507,7 +517,7 @@ export default function L2Page() {
        = 196px。% 比例列在窄屏会被挤到 171px（1280）/153px（1100）→ 已标注行多出
        「取消」按钮后折行，行高 41→69px（1100 屏 →97px）。固定 px 后按钮恒一行。
        其余列仍 % （随容器），标注列的固定宽从内容列/时间列里扣 */
-    { title: <>{'标注'}<Tip text="人工结论：这条到底密不密。标错会进训练集，往后每一版都带着这个错。" /></>, width: 200,
+    { title: <>{'标注'}<Tip text="人工结论：这条到底密不密。标错会进训练集，往后每一版都带着这个错。" /></>, width: '20%',
       render: (_, x) => {
         const sg = x.label == null ? suggest[x.req_id] : null;
         return (
@@ -574,18 +584,19 @@ export default function L2Page() {
       </Card>
        <Card title={<>灌数轮次<Tip term="flood_round" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}>
         <Table size="small" sticky={wideSticky()} rowKey={(r) => r.started} dataSource={rounds} tableLayout="fixed"
+          scroll={{ x: TABLE_X }}
           pagination={false} locale={{ emptyText: '还没跑过 scripts/gray_flood.py' }}
           /* 百分比铺满卡片（antd 表格默认 width:100%）。不设 width 会被 auto 布局
              均分，实测「轮次」内容 75px 却分到 666px（占 55%）；钉死 px 又在窄屏溢出 */
           columns={[
-            { title: '时间', dataIndex: 'started', width: '22%',
+            { title: '时间', dataIndex: 'started', width: '16%',
               render: (v) => bj(v).slice(5, 16) },
-            { title: '影子版本', dataIndex: 'laya', width: '22%',
+            { title: '影子版本', dataIndex: 'laya', width: '16%',
               render: (v) => (v ? <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>
                 {String(v).split('/').pop().replace('laya-finetuned-confidential-', '')}</Text> : '-') },
-            { title: '发送', dataIndex: 'sent', width: '9%' },
-            { title: 'L2 判定', dataIndex: 'l2_total', width: '11%' },
-            { title: '一致率', width: '12%', align: 'center',
+            { title: '发送', dataIndex: 'sent', width: '8%' },
+            { title: 'L2 判定', dataIndex: 'l2_total', width: '10%' },
+            { title: '一致率', width: '14%', align: 'center',
               /* 按显示精度（1 位小数）判定，不按原始值：agree_rate=0.9796 显示
                  "98.0%" 却因 0.9796<0.98 染成橙色，看着像 bug（实测有 2 轮如此）。
                  颜色只表达「这轮是否够绿」，与用户看到的数字自洽即可 */
@@ -595,17 +606,17 @@ export default function L2Page() {
             /* 四格混淆矩阵：拆成 4 列而不是一列 "12 / 3 / 0 / 45"——合并写法看不出
                哪个是影子漏报，而漏报方向是要重点盯的。cn=主密影放(漏报嫌疑)、
                nc=主放影密(误报嫌疑)，用色与下方环形图一致 */
-            { title: <Tooltip title="主判密 · 影密（一致）"><Text type="success">主密影密</Text></Tooltip>,
-              width: '6%', align: 'center',
+            { title: <Tooltip title="主判密 · 影密（一致）"><Text type="success">密/密</Text></Tooltip>,
+              width: '9%', align: 'center',
               render: (_, r) => <Text type={(r.cells || {}).cc ? 'success' : undefined}>{(r.cells || {}).cc ?? 0}</Text> },
-            { title: <Tooltip title="主判密 · 影放 —— 影子漏报嫌疑"><Text type="warning">主密影放</Text></Tooltip>,
-              width: '6%', align: 'center',
+            { title: <Tooltip title="主判密 · 影放 —— 影子漏报嫌疑"><Text type="warning">密/放</Text></Tooltip>,
+              width: '9%', align: 'center',
               render: (_, r) => <Text type={(r.cells || {}).cn ? 'warning' : undefined}>{(r.cells || {}).cn ?? 0}</Text> },
-            { title: <Tooltip title="主判放 · 影密 —— 影子误报嫌疑"><Text type="danger">主放影密</Text></Tooltip>,
-              width: '6%', align: 'center',
+            { title: <Tooltip title="主判放 · 影密 —— 影子误报嫌疑"><Text type="danger">放/密</Text></Tooltip>,
+              width: '9%', align: 'center',
               render: (_, r) => <Text type={(r.cells || {}).nc ? 'danger' : undefined}>{(r.cells || {}).nc ?? 0}</Text> },
-            { title: <Tooltip title="主判放 · 影放（一致）"><Text type="secondary">主放影放</Text></Tooltip>,
-              width: '6%', align: 'center',
+            { title: <Tooltip title="主判放 · 影放（一致）"><Text type="secondary">放/放</Text></Tooltip>,
+              width: '9%', align: 'center',
               render: (_, r) => <Text type="secondary">{(r.cells || {}).nn ?? 0}</Text> },
           ]} />
       </Card>
@@ -620,7 +631,7 @@ export default function L2Page() {
       <Card title={<>Qwen 提示词自动修补<Tip term="prompt_patch" /></>} style={{ marginBottom: 'var(--gw-sp-12)' }}
         extra={<Button type="primary" size="small" loading={proposing} onClick={propose}>自动修补（~2min）</Button>}>
         <Alert type="info" showIcon
-          message={<span style={{ fontSize: 'var(--gw-fs-14)' }}>语料 = 下方「分歧样本」里已标注且与 qwen 主判相反的错题（筛「主判错的（改prompt）」可只看这批）。结果已持久化到 ~/models（重启/切页不丢）；「填入编辑器」跳规则管理页的 L2 提示词编辑器，人工确认后才保存生效。</span>} />
+          message={<span style={{ fontSize: 'var(--gw-fs-14)' }}>语料 = 下方「分歧样本」里已标注且与 {backend} 主判相反的错题（筛「主判错的（改prompt）」可只看这批）。结果已持久化到 ~/models（重启/切页不丢）；「填入编辑器」跳规则管理页的 L2 提示词编辑器，人工确认后才保存生效。</span>} />
         {proposal && (
           <Alert type={proposal.candidate.correct >= proposal.baseline.correct ? 'success' : 'warning'}
             showIcon style={{ marginTop: 'var(--gw-sp-8)' }}
@@ -678,6 +689,7 @@ export default function L2Page() {
         }>
         {shown.length ? (
           <Table rowKey="req_id" className="tbl-divs" size="small" sticky={wideSticky()} tableLayout="fixed" columns={cols} dataSource={shown}
+            scroll={{ x: TABLE_X }}
             pagination={{ pageSize: 20, showSizeChanger: false }} />
         ) : (
           <Alert type="info" showIcon

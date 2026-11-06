@@ -424,6 +424,10 @@ def _internal_model_lookup(cfg, model_name: str):
         for im in load_model_policy().internal_models:
             if not im.enabled or im.model != model_name:
                 continue
+            # /classify 决策模型（laya）不是对话模型：即便 provider 已登记也按非 chat 处理，
+            # 否则裸名会被当普通模型转发到它的 /classify 上（2026-11 加 laya provider 后的防线）。
+            if str(im.url or "").rstrip("/").endswith("/classify"):
+                return None, True
             cand = cfg.get(im.provider) or find_provider(im.provider)
             if cand is not None and cand.local and cand.kind != "embedding":
                 return (im.provider, im.model), False

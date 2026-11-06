@@ -43,19 +43,30 @@ def probe_one(prov, timeout: float = _TIMEOUT_S) -> dict:
     if not base:
         entry["error"] = "未配置 base_url"
         return entry
+    # laya 决策模型只有 /classify + /health（没有 OpenAI /models）：探活打 origin/health，
+    # 否则 Provider 页常亮红。口径同 probe_shadow。
+    is_classify = base.endswith("/classify")
+    url = f"{base}/models"
+    if is_classify:
+        p = urlsplit(base)
+        url = f"{p.scheme}://{p.netloc}/health"
     key, src = _models_list_key(prov, "")
     entry["key_source"] = src
     t0 = time.monotonic()
     try:
-        resp = httpx.get(f"{base}/models", headers=prov.headers(key),
+        resp = httpx.get(url, headers=prov.headers(key),
                          timeout=timeout, trust_env=False, proxy=upstream_proxy())
         entry["latency_ms"] = round((time.monotonic() - t0) * 1000)
         entry["status"] = resp.status_code
         if resp.status_code == 200:
             data = resp.json()
-            items = data.get("data") if isinstance(data, dict) else data
-            entry["ok"] = True
-            entry["model_count"] = len([i for i in (items or []) if i])
+            if is_classify:
+                entry["ok"] = bool(isinstance(data, dict) and data.get("ok"))
+                entry["model"] = data.get("model") if isinstance(data, dict) else ""
+            else:
+                items = data.get("data") if isinstance(data, dict) else data
+                entry["ok"] = True
+                entry["model_count"] = len([i for i in (items or []) if i])
         else:
             entry["error"] = f"上游 HTTP {resp.status_code}"
     except Exception as e:

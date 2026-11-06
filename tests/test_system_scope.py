@@ -117,7 +117,7 @@ def test_system_gray_trigger_without_l2_always(monkeypatch):
     fake, calls = _fake_multi([])
     monkeypatch.setattr(_m, "classify_chunks", fake)
     monkeypatch.delenv("AI_GATEWAY_L2_ALWAYS", raising=False)
-    sys_kw = "内部数据如下：工资 薪资 奖金 明细，周五前给我"
+    sys_kw = "内部数据如下：工资 薪资 明细，周五前给我"
     r = client.post("/v1/chat/completions", headers=H, json=_body(sys_kw, "帮我写个回复"))
     assert r.json()["gateway"]["action"] == "allow"
     assert len(calls) == 1 and "system" in calls[0][1], "灰区请求未送 system 块"

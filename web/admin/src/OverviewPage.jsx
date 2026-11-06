@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Row, Col, Card, Typography, Alert, Space, Button, Select, Table, Tag, Tooltip, Spin } from 'antd';
 import { errText, fetchJson as get, RANGES } from './api.js';
-import { bj, avg } from './utils.js';
+import { bj, avg, TABLE_X } from './utils.js';
 import { ACTION_INFO, RuleZh } from './ruleNames.jsx';
 import { Tip } from './terms.jsx';
 import UPlotChart, { msAxis, qpsAxis } from './UPlotChart.jsx';
@@ -77,6 +77,7 @@ function EventStreamCard({ events, go }) {
       ) : (
         <>
           <Table rowKey={(r) => `${r.ts}-${r.rule}`} size="small" tableLayout="fixed" columns={cols} dataSource={recent}
+            scroll={{ x: TABLE_X }}
             pagination={false} />
           <Typography.Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>
             本时间窗内最近 {recent.length} 条（最多 {EV_RECENT_MAX} 条）；逐条明细点右上「审计明细 →」进审计页
@@ -139,7 +140,10 @@ export default function OverviewPage() {
   const dismissGuide = () => { localStorage.setItem('gw-firstguide-dismissed', '1'); setGuideHidden(true); };
   // 跨度管拦截率/本地路由率/Token（stats/overview 口径）+ 两大折线图（stats/chart 按窗口重分桶）；
   // QPS/错误率 KPI 是实时信号（环近 10 tick），不随跨度变
-  const [hours, setHours] = useState(24);
+  const _oh = Number(new URLSearchParams(window.location.hash.split('?')[1] || '').get('hours'));
+  let _ols = 24;
+  try { _ols = Number(localStorage.getItem('gw_hours')) || 24; } catch { /* ignore */ }
+  const [hours, setHours] = useState(RANGES.some((r) => r.hours === _ols) ? _ols : (RANGES.some((r) => r.hours === _oh) ? _oh : 24));
   // 切窗反馈：只有手动切窗显加载动画，30s 轮询刷新不闪 Spin
   const [loading, setLoading] = useState(false);
   const hoursRef = useRef(hours);
@@ -243,7 +247,7 @@ export default function OverviewPage() {
       {/* 时间窗：Portal 进标题右侧（#page-toolbar-slot），标题栏本就常驻；切页卸载自动清空 */}
       {typeof document !== 'undefined' && document.getElementById('page-toolbar-slot')
         ? createPortal((
-          <Select size="small" value={hours} onChange={(v) => { setLoading(true); setHours(v); }} style={{ width: 130 }}
+          <Select size="small" value={hours} onChange={(v) => { setLoading(true); setHours(v); try { localStorage.setItem('gw_hours', String(v)); } catch { /* ignore */ } }} style={{ width: 130 }}
             options={RANGES.map((r) => ({ value: r.hours, label: r.label }))} />
         ), document.getElementById('page-toolbar-slot'))
         : null}
@@ -254,12 +258,12 @@ export default function OverviewPage() {
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-qps" title={<>QPS（近 10 tick）<Tip term="qps" /></>} bar="#1677ff"
             value={d && d.qps != null ? d.qps.toFixed(1) : '-'} suffix="req/s"
-            go="/stats" hint="跳统计页：QPS 趋势 / 分位延迟 / 运行指标" />
+            go={`/stats?hours=${hours}`} hint="跳统计页：QPS 趋势 / 分位延迟 / 运行指标" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
           <Kpi testid="ov-err" title={<>错误率 5xx+429（近10tick）<Tip text="5xx = 网关或上游自己出错；429 = 请求太密集被限流。取最近 10 个采样点（约 100 秒）的平均值。" /></>}
             value={d && d.err != null ? (d.err * 100).toFixed(1) + '%' : '-'}
-            color={errColor} bar="#722ed1" go="/stats"
+            color={errColor} bar="#722ed1" go={`/stats?focus=err&hours=${hours}`}
             hint="跳统计页：错误率趋势（5xx+429 近 10 tick 口径）" />
         </Col>
         <Col flex={1} style={{ minWidth: 0 }}>
@@ -278,7 +282,7 @@ export default function OverviewPage() {
           <Kpi testid="ov-tokens" title={<>Token 用量<Tip term="token" /></>} bar="#13c2c2"
             value={d && d.tokens ? d.tokens.toLocaleString() : '-'}
             suffix={d && d.cost != null ? `tokens · ¥${Number(d.cost).toFixed(2)}` : 'tokens'}
-            go="/stats?focus=billing"
+            go={`/stats?focus=billing&hours=${hours}`}
             hint="跳统计页并定位：Token 计费（KEY × 金额 / 每日金额）" />
         </Col>
       </Row>

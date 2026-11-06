@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from .policy import PolicyDoc, decide, invalidate_policy_cache, load_policy, DEFAULT_POLICY
+from .policy import PolicyDoc, _match_when, decide, invalidate_policy_cache, load_policy, DEFAULT_POLICY
 
 # 5.2 表单的"内容类型" -> when 条件字段的映射（下拉框语义）
 CONTENT_TYPE_FIELD = {
@@ -400,8 +400,11 @@ def build_when_group(combiner: str, rows: List[Dict[str, Any]]) -> Dict[str, Any
 
 
 def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = "",
-              client_key: str = "", hour: Optional[int] = None) -> Dict[str, Any]:
+              client_key: str = "", hour: Optional[int] = None,
+              when: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """L1 规则测试（5.3 的 L1 半边）：构造 ctx 跑 decide()，返回命中详情。
+
+    when 给定 = 草稿试跑（规则还没保存）：只判这一条 when，不跑整链，rule/action 为 null。
 
     model / client_key / hour 对应 main._review_text ctx 的 model / client.key / time.hour
     （三者都可匹配了，2026-10-08）。留空则该字段为空串 / 当前小时——干跑传空 = 走默认，
@@ -430,6 +433,9 @@ def test_rule(text: str = "", filename: str = "", size: int = 0, model: str = ""
         "client": {"key": client_key or ""},
         "time": {"hour": int(hour) if hour is not None else datetime.now().hour},
     }
+    if when is not None:
+        return {"matched": bool(_match_when(when, ctx)), "rule": None,
+                "action": None, "target": None, "description": ""}
     hit = decide(load_policy(_policy_path()), ctx)
     return {
         "matched": hit.get("name") != "default_allow" or hit.get("action") != "allow",

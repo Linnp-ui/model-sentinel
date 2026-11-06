@@ -1694,6 +1694,10 @@ def test_billing_endpoint(tmp_path, monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
     _mp.invalidate_model_policy_cache()
     store = get_admin_store()
+    try:
+        store.create_api_key("pytest-bill-key", "pytest-bill")
+    except Exception:
+        pass
     seed = lambda prov, m, p, c, h, w=0: store.insert_request_log(
         {"key_name": "pytest-bill", "action": "allow", "model": m, "provider": prov,
          "client_ip": "9.9.9.9", "prompt_tokens": p, "completion_tokens": c,
@@ -1733,6 +1737,10 @@ def test_model_spend_endpoint(tmp_path, monkeypatch):
     store = get_admin_store()
     try:
         # 唯一 key/model：同 session 共享 memory store，防其他测试种子行串扰
+        try:
+            store.create_api_key("pytest-spend-unique", "pytest-spend-unique", "", "test")
+        except Exception:
+            pass
         store.insert_request_log({"key_name": "pytest-spend-unique", "action": "allow",
                                   "model": "spend-model", "provider": "spend-prov",
                                   "client_ip": "9.9.9.9",
@@ -1762,6 +1770,10 @@ def test_billing_daily_split(tmp_path, monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_MODEL_POLICY_PATH", str(mp_path))
     _mp.invalidate_model_policy_cache()
     store = get_admin_store()
+    try:
+        store.create_api_key("pytest-bill-daily-key", "pytest-bill-daily")
+    except Exception:
+        pass
     from datetime import datetime, timedelta, timezone
     base = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
         hour=15, minute=0, second=0, microsecond=0)
@@ -2049,6 +2061,10 @@ def test_stats_summary_equivalent_to_individual_funcs():
     from src.gateway.admin_store import get_admin_store
     from src.gateway import stats_service as _ss
     store = get_admin_store()
+    try:
+        store.create_api_key("pytest-summary-key", "pytest-summary")
+    except Exception:
+        pass
     seed = lambda **kw: store.insert_request_log({
         "key_name": "pytest-summary", "action": "allow", "model": "sum-model",
         "provider": "sum-prov", "client_ip": "7.7.7.7", "status_code": 200,
@@ -2164,6 +2180,10 @@ def test_stats_summary_endpoint():
     import time
     from src.gateway.admin_store import get_admin_store
     store = get_admin_store()
+    try:
+        store.create_api_key("pytest-summary-ep-key", "pytest-summary-ep")
+    except Exception:
+        pass
     # 本测试独立 seed（不依赖其他用例的行），唯一 KEY 便于按 key 切片对比
     store.insert_request_log({
         "key_name": "pytest-summary-ep", "action": "allow", "model": "sum-ep-model",
@@ -2951,19 +2971,19 @@ def test_divergence_regression_dedup_and_want(monkeypatch):
     class FakeAudit:
         def query_mysql(self, **kw):
             return [
-                {"req_id": "a", "text_preview": "同一句分歧", "filename": "",
+                {"req_id": "a", "text_preview": "同一句分歧样例文本内容", "filename": "",
                  "l2": '{"label": "NORMAL", "shadow_label": "CONFIDENTIAL"}'},
-                {"req_id": "b", "text_preview": "同一句分歧", "filename": "",
+                {"req_id": "b", "text_preview": "同一句分歧样例文本内容", "filename": "",
                  "l2": '{"label": "NORMAL", "shadow_label": "CONFIDENTIAL"}'},  # 多轮重复
                 {"req_id": "c", "text_preview": "主影一致的不考", "filename": "",
                  "l2": '{"label": "NORMAL", "shadow_label": "NORMAL"}'},
-                {"req_id": "d", "text_preview": "候选表里没有的句子", "filename": "",
+                {"req_id": "d", "text_preview": "候选表里没有的句子样本", "filename": "",
                  "l2": '{"label": "NORMAL", "shadow_label": "CONFIDENTIAL"}'},
                 {"req_id": "e", "text_preview": "没进 L2 的不考", "filename": "", "l2": None},
             ]
 
     monkeypatch.setattr(audit_store, "get_audit_store", lambda: FakeAudit())
-    monkeypatch.setattr(l2_retrain, "_candidate_wants", lambda: [("同一句分歧", 1)])
+    monkeypatch.setattr(l2_retrain, "_candidate_wants", lambda: [("同一句分歧样例文本内容", 1)])
     monkeypatch.setattr(l2_retrain, "_classify", lambda *a: 0.02)
     d = l2_retrain._divergence_regression("http://x")
     assert d["total"] == 1 and d["matched"] == 0
@@ -3365,6 +3385,55 @@ def test_rule_ai_scopes_message_and_check():
         rule_ai._check_scopes(rows, ["prompt"])
 
 
+def test_rule_ai_generator_target():
+    """生成模型可选：provider 必须是内网 OpenAI chat 口。
+
+    外网 provider（规则描述会出境）、laya /classify 决策模型、embedding 一律拒；
+    provider 空 = 走 RULE_AI_* / SMALL_MODEL_URL 环境默认（兼容旧行为）。
+    """
+    import pytest as _pytest
+    from src.gateway import rule_ai
+
+    url, name, headers, timeout = rule_ai._resolve_generator("", "")
+    assert url == rule_ai.SMALL_MODEL_URL and name == rule_ai.SMALL_MODEL_NAME and headers == {}
+    assert timeout == rule_ai.TIMEOUT
+
+    url, name, _, timeout = rule_ai._resolve_generator("vllm_l2", "")
+    assert url.endswith("/chat/completions") and name == "Qwen3-4B-Instruct-2507"
+    assert timeout > rule_ai.TIMEOUT  # 用 provider 自己的预算，不是环境默认那条
+    assert rule_ai._resolve_generator("vllm_l2", "custom-model")[1] == "custom-model"
+
+    for bad in ("deepseek", "laya", "bge_m3", "no-such-provider"):
+        with _pytest.raises(ValueError):
+            rule_ai._resolve_generator(bad, "")
+
+
+def test_rule_ai_model_decoupled_from_l2(monkeypatch):
+    """生成用模型不跟 L2 判密配置走：L2 切 laya 分类器后 SMALL_MODEL_NAME 变成
+    laya-multilingual，拿它打 chat 口 404（2026-11 实测「AI 生成不可用」）。
+    生成固定用 chat 模型；要换用 RULE_AI_MODEL / RULE_AI_TIMEOUT 单独指。
+    """
+    import importlib
+    from src.gateway import rule_ai
+
+    monkeypatch.setenv("SMALL_MODEL_NAME", "laya-multilingual")
+    monkeypatch.setenv("SMALL_MODEL_TIMEOUT", "2")
+    for k in ("RULE_AI_MODEL", "RULE_AI_URL", "RULE_AI_TIMEOUT"):
+        monkeypatch.delenv(k, raising=False)
+    importlib.reload(rule_ai)
+    try:
+        assert rule_ai.SMALL_MODEL_NAME == "Qwen3-4B-Instruct-2507"
+        assert rule_ai.TIMEOUT == 10
+        monkeypatch.setenv("RULE_AI_MODEL", "chat-other")
+        monkeypatch.setenv("RULE_AI_TIMEOUT", "20")
+        importlib.reload(rule_ai)
+        assert rule_ai.SMALL_MODEL_NAME == "chat-other"
+        assert rule_ai.TIMEOUT == 20
+    finally:
+        monkeypatch.undo()
+        importlib.reload(rule_ai)  # 还原模块常量，别污染后续用例
+
+
 def test_policy_test_endpoint_matches_model_client_hour(tmp_path, monkeypatch):
     """规则测试区（干跑）不再对 model/client.key/time.hour 假阴性。
 
@@ -3433,6 +3502,46 @@ def test_policy_test_dryrun_carries_findings(tmp_path, monkeypatch):
                     json={"text": "我的 AKIAIOSFODNN7EXAMPLE 泄露了"})
     assert r.status_code == 200, r.text
     assert r.json()["rule"] == "pii-score-rule", r.text
+
+
+def test_policy_test_draft_when(tmp_path, monkeypatch):
+    """草稿试跑：带 when 只判这一条（规则还没保存），不看已保存规则也不落库。
+
+    编辑弹窗「保存前试跑」靠它；样例文本/文件名进 ctx，findings 仍由 text 现算
+    （pii_score 草稿也能测）。不给 when 时行为不变（整链 decide）。
+    """
+    from src.gateway.policy import invalidate_policy_cache
+
+    pol = tmp_path / "policy_draft_when.yaml"
+    pol.write_text("policies:\n  - name: base-allow\n    priority: 100\n    action: allow\n"
+                   "    when: always\n", encoding="utf-8")
+    monkeypatch.setenv("AI_GATEWAY_POLICY_PATH", str(pol))
+    invalidate_policy_cache()
+
+    hit = client.post("/admin/api/policies/test", json={
+        "text": "帮我看下这份工资表", "when": {"any": [{"text contains_any": ["工资表"]}]}})
+    assert hit.status_code == 200, hit.text
+    assert hit.json()["matched"] is True and hit.json()["rule"] is None
+
+    miss = client.post("/admin/api/policies/test", json={
+        "text": "无关内容", "when": {"any": [{"text contains_any": ["工资表"]}]}})
+    assert miss.json()["matched"] is False
+
+    # 文件名 / 文件正文 / 评分字段都从同一构造的 ctx 取（草稿条件照样可测）
+    by_name = client.post("/admin/api/policies/test", json={
+        "text": "", "filename": "财务汇总.xlsx",
+        "when": {"file.filename contains_any": ["财务"]}})
+    assert by_name.json()["matched"] is True
+    by_pii = client.post("/admin/api/policies/test", json={
+        "text": "我的 AKIAIOSFODNN7EXAMPLE 泄露了",
+        "when": {"findings.weighted_pii_score >=": 60}})
+    assert by_pii.json()["matched"] is True
+
+    # 引擎认不出的条件 → 不命中，而不是误报命中
+    assert client.post("/admin/api/policies/test", json={
+        "text": "x", "when": {"nothing matches": 1}}).json()["matched"] is False
+    # 不给 when：旧行为（整链）不变
+    assert client.post("/admin/api/policies/test", json={"text": "x"}).json()["rule"] == "base-allow"
 
 
 def test_request_log_by_req_ids_lookup():

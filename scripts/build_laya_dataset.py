@@ -831,6 +831,21 @@ def main():
             for it in items:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
+    # 防覆盖（2026-11-05 13:38 事故：103 条已评审留出集被 33 条新挖掘集静默覆盖，
+    # real_eval_reviewed 标记与 2 条人工标签修正一并丢失）：新集若缺现有条目，
+    # 视为含人工维护/标注，不覆盖——写出 .fresh 候选并退出，要换先挪走旧文件。
+    old_re_path = os.path.join(OUT_DIR, "real_eval.jsonl")
+    if os.path.exists(old_re_path):
+        old_re = [json.loads(l) for l in open(old_re_path, encoding="utf-8") if l.strip()]
+        new_ids = {_sha1(re.sub(r"\s+", " ", r["text"]).strip()) for r in real_eval}
+        lost = [v for v in old_re
+                if _sha1(re.sub(r"\s+", " ", v["text"]).strip()) not in new_ids]
+        if lost:
+            dump("real_eval.jsonl.fresh", real_eval)
+            print(f"[build_laya_dataset] 拒写 real_eval.jsonl：现有 {len(old_re)} 条中 "
+                  f"{len(lost)} 条不在新集（疑人工维护/标注），新集已写 real_eval.jsonl.fresh")
+            raise SystemExit(2)
+
     dump("train.jsonl", train)
     dump("real_eval.jsonl", real_eval)
     overlap = check_train_pilot_overlap(train, real_eval)

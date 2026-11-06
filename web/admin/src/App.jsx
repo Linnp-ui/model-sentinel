@@ -86,8 +86,8 @@ function StatusBar() {
       <span style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 'var(--gw-sp-8)', flexWrap: 'wrap' }}>
       <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)' }}>网关运行状态</Text>
       {node(st.l2On ? 'green' : 'red', !st.l2On,
-        `内容审查小模型（L2：判断内容是不是机密）｜当前用 ${st.l2Backend}｜影子 ${st.l2Shadow ? '开（并行打标，不改路由）' : '关'}｜审查小模型不可用时按配置放行或转内网`,
-        `L2 审查·${st.l2Backend}${st.l2On && st.l2Shadow ? '·影子开' : ''}`)}
+        `内容审查小模型（L2：判断内容是不是机密）｜当前用 ${st.l2Backend}｜影子 ${st.l2Backend === 'laya' ? '不适用（laya 即主判）' : (st.l2Shadow ? '开（并行打标，不改路由）' : '关')}｜审查小模型不可用时按配置放行或转内网`,
+        `L2 审查·${st.l2Backend}${st.l2On && st.l2Shadow && st.l2Backend !== 'laya' ? '·影子开' : ''}`)}
       {node((st.extMissing.length || st.extDown.length) ? 'orange' : 'green', false,
         [st.extDown.length
           ? `外网模型服务连不上（上游或网络问题，30s 探测一次）：${st.extDownTip.join('、')}`

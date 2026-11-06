@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { Table, Button, Input, Modal, Form, Space, message, Popconfirm, Typography, Alert, Card, Tag, Dropdown } from 'antd';
 import { KeyOutlined, CopyOutlined, ImportOutlined, MoreOutlined } from '@ant-design/icons';
 import { api, errText, copyText } from '../api.js';
-import { wideSticky } from '../utils.js';
+import { wideSticky, TABLE_X } from '../utils.js';
 import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
@@ -91,11 +91,11 @@ export default function KeysPage() {
   const cols = [
     { title: '名称', dataIndex: 'name', width: '14%', ellipsis: true, className: 'cell-center' },
     { title: 'KEY', dataIndex: 'key_masked', width: '16%', ellipsis: true, className: 'cell-center', render: (v) => <Text code>{v}</Text> },
-    { title: '备注', dataIndex: 'note', width: '27%', ellipsis: true },
+    { title: '备注', dataIndex: 'note', width: '31%', ellipsis: true },
     { title: '登记时间', dataIndex: 'created_at', width: '16%', ellipsis: true, className: 'cell-center' },
     {
       title: '操作',
-      width: '27%',
+      width: '23%',
       // 编辑/删除/⋯ 恒一行：窄屏行高不随按钮换行变高；「调用明细」收进 ⋯ 菜单
       render: (_, rec) => (
         <Space>
@@ -123,6 +123,7 @@ export default function KeysPage() {
         <Button type="primary" icon={<KeyOutlined />} onClick={openGenerate}>生成 KEY</Button>
       </Space>}>
       <Table rowKey="id" className="tbl-keys" columns={cols} dataSource={items} loading={loading} size="small"
+        scroll={{ x: TABLE_X }}
         sticky={wideSticky()}
         tableLayout="fixed"
         locale={{ emptyText: '暂无已登记 KEY（点「生成 KEY」或「批量导入」添加）' }}

@@ -13,10 +13,11 @@ const pct = (v) => v == null ? '-' : (v * 100).toFixed(1) + '%';
 // 双源：24h 内 QPS/错误率/L2 走环（10s 自刷新）；超 24h 三者走 request_log 分桶快照（stats/chart）。
 // 延迟分位 tab 恒走 stats/chart 分桶（与总览图同源同口径，10s 刷新）——
 // 环分位是 5 分钟滑窗（PCT_WINDOW_S），与总览分桶口径对不上，不再用于展示。
-export default function MetricsSection({ hours = 24 }) {
+export default function MetricsSection({ hours = 24, focus }) {
   const [data, setData] = useState(null);   // 环（常驻：L2 tab + 版本/uptime）
   const [chart, setChart] = useState(null); // request_log 分桶（延迟分位固定数据源）
   const [chartTab, setChartTab] = useState('qps');
+  useEffect(() => { if (focus === 'err') setChartTab('err'); else setChartTab('qps'); }, [focus]);
   const bigWin = (hours || 24) > 24;
   const winHours = Math.min(hours || 24, 24);
   const [err, setErr] = useState('');

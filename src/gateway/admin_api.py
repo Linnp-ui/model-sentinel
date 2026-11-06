@@ -24,7 +24,7 @@ M2：
   POST   /admin/api/policies                 新增规则
   PUT    /admin/api/policies/{name}          更新规则（可重命名：body 里带 new_name）
   DELETE /admin/api/policies/{name}
-  POST   /admin/api/policies/test            L1 规则测试（text/filename/size/model/client_key/hour -> 命中详情）
+  POST   /admin/api/policies/test            L1 规则测试（text/filename/size/model/client_key/hour -> 命中详情；带 when 则只判该草稿条件）
   GET    /admin/api/policies/match-choices  5.2 构造器可选项（前端下拉数据源）
   POST   /admin/api/policies/build-when      5.2 表单语义 -> when 条件（前端预览用）
   POST   /admin/api/policies/build-when-group 条件组（多行 any/all）-> when 条件
@@ -669,6 +669,8 @@ class PolicyTestReq(BaseModel):
     model: str = ""
     client_key: str = ""
     hour: Optional[int] = Field(default=None, ge=0, le=23)
+    # 草稿试跑：给了 when 就只判这一条（规则还没保存），不给走整链 decide()
+    when: Optional[dict] = None
 
 
 class ParseWhenReq(BaseModel):
@@ -690,11 +692,16 @@ class BuildWhenGroupReq(BaseModel):
 
 class L2GenerateReq(BaseModel):
     description: str = Field(min_length=2, max_length=500)
-    # 「换一组」：已生成的匹配项，非空时提示模型避开这些词换一组（只传关键词类）
-    exclude: list = Field(default_factory=list, max_length=50)
+    # 「换一组」：已生成的匹配项，非空时提示模型避开这些词换一组（只传关键词类）。
+    # 前端累积合并只增不减，词多后全量回传：上限须覆盖合理词表规模（50 曾卡死
+    # 56 词的规则）；进 prompt 的只有 rule_ai 的 excl[:40]，这里只防滥用。
+    exclude: list = Field(default_factory=list, max_length=500)
     # 覆盖范围：允许生成的 content_type 集合（prompt/filename/file/sheet_names/headers/…），
     # 空=不限；越界输出整组拒
     scopes: list = Field(default_factory=list, max_length=12)
+    # 生成模型（可选）：内网 chat provider + 模型名，空=用 RULE_AI_* 环境默认
+    provider: str = Field(default="", max_length=64)
+    model: str = Field(default="", max_length=128)
 
 
 class L2TestReq(BaseModel):
@@ -764,9 +771,11 @@ def build_public_models() -> list:
         for im in load_model_policy().internal_models:
             if not im.enabled or im.model in seen:
                 continue
-            # 只暴露「能对话的内网模型」：provider 须在 routing.yaml 里且是 chat。
-            # laya 是 /classify 决策模型（非 chat 协议，model_policy 注释即写「不暴露」），
-            # 暴露出去只会让客户端拿它当对话模型调 → 落回外网上游。
+            # 只暴露「能对话的内网模型」：provider 须在 routing.yaml 里且是 chat；
+            # /classify 决策模型（laya）即便登记了 chat provider 也不暴露
+            # （model_policy 注释即写「不暴露」），暴露出去客户端会拿它当对话模型调 → 落回外网上游。
+            if str(im.url or "").rstrip("/").endswith("/classify"):
+                continue
             _cand = _rcfg.get(im.provider) or find_provider(im.provider)
             if _cand is None or _cand.kind != "chat":
                 continue
@@ -1174,6 +1183,10 @@ def list_provider_models_api(name: str, x_api_key: Optional[str] = Header(None, 
     base = (prov.base_url or "").rstrip("/")
     if not base:
         raise HTTPException(422, f"provider {name} 未配置 base_url")
+    # laya 决策模型没有 OpenAI /models，直接回它的登记模型名（不发起网络请求）
+    if base.endswith("/classify"):
+        return {"models": ([{"id": prov.default_model, "name": prov.default_model}]
+                           if prov.default_model else [])}
     try:
         key, _src = _models_list_key(prov, x_api_key)
         resp = httpx.get(f"{base}/models", headers=prov.headers(key),
@@ -1302,7 +1315,7 @@ def policy_version_rollback_api(vid: int, request: Request):
 @router.post("/policies/test")
 def test_policy_api(body: PolicyTestReq):
     return policy_admin.test_rule(body.text, body.filename, body.size,
-                                  body.model, body.client_key, body.hour)
+                                  body.model, body.client_key, body.hour, body.when)
 
 
 @router.get("/policies/match-choices")
@@ -1369,7 +1382,9 @@ async def l2_generate_rule_api(body: L2GenerateReq):
     """AI 生成匹配项建议（5.2）。只返回建议，不落库；失败由 UI 手动填写兜底。"""
     from src.gateway.rule_ai import generate_rule_suggestion
     try:
-        suggestion = await generate_rule_suggestion(body.description, exclude=body.exclude, scopes=body.scopes)
+        suggestion = await generate_rule_suggestion(body.description, exclude=body.exclude,
+                                                    scopes=body.scopes, provider=body.provider,
+                                                    model=body.model)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except RuntimeError as e:

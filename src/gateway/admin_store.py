@@ -1240,10 +1240,16 @@ class AdminStore:
             _routes = self.get_alias_routes()
         except Exception:
             _routes = {}
+        try:
+            registered_keys = {str(k.get("name") or "").strip() for k in (self.list_api_keys() or [])}
+        except Exception:
+            registered_keys = set()
 
         agg: dict = {}
         for r in rows:
             key = (r.get("key_name") or "").strip() or "未登记"
+            if registered_keys and key not in registered_keys:
+                continue
             label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
             g = agg.setdefault((key, label), {"key": key, "model": label, "tokens": 0, "calls": 0})
             g["tokens"] += int(r.get("prompt_tokens") or 0) + int(r.get("completion_tokens") or 0)
@@ -1275,9 +1281,15 @@ class AdminStore:
             _routes = self.get_alias_routes()
         except Exception:
             _routes = {}
+        try:
+            registered_keys = {str(k.get("name") or "").strip() for k in (self.list_api_keys() or [])}
+        except Exception:
+            registered_keys = set()
         agg: dict = {}
         for r in rows:
             key = (r.get("key_name") or "").strip() or "未登记"
+            if registered_keys and key not in registered_keys:
+                continue
             label = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
             g = agg.setdefault((key, label), {"key": key, "model": label, "prompt": 0,
                                               "completion": 0, "cached": 0,
@@ -1322,8 +1334,15 @@ class AdminStore:
             _routes = self.get_alias_routes()
         except Exception:
             _routes = {}
+        try:
+            registered_keys = {str(k.get("name") or "").strip() for k in (self.list_api_keys() or [])}
+        except Exception:
+            registered_keys = set()
         agg: dict = {}
         for r in rows:
+            key = (r.get("key_name") or "").strip() or "未登记"
+            if registered_keys and key not in registered_keys:
+                continue
             day = (to_beijing(r.get("ts")) or "")[:10]
             if not day:
                 continue
@@ -1560,11 +1579,28 @@ class AdminStore:
         返回 [{label, calls, tokens, blocked, local_routed, errors}]，按 calls 降序。
         """
         rows = self._log_rows(since, until)
+        registered_keys = set()
+        if dim == "key_name":
+            try:
+                registered_keys = {str(k.get("name") or "").strip() for k in (self.list_api_keys() or [])}
+            except Exception:
+                registered_keys = set()
+        registered_providers = set()
+        if dim == "provider":
+            try:
+                from .providers import load_routing
+                registered_providers = set((load_routing().providers or {}).keys())
+            except Exception:
+                registered_providers = set()
         agg: dict = {}
         for r in rows:
             raw = (r.get(dim) or "").strip()
             if dim == "provider" and not raw:
                 continue  # 空 provider = 没到上游（拦截/未路由），不进 provider 分布
+            if dim == "provider" and registered_providers and raw not in registered_providers:
+                continue  # 只统计登记的 provider
+            if dim == "key_name" and registered_keys and raw not in registered_keys:
+                continue
             label = raw or "(unknown)"
             g = agg.setdefault(label, {"label": label, "calls": 0, "tokens": 0,
                                        "blocked": 0, "local_routed": 0, "errors": 0})
@@ -1699,6 +1735,15 @@ class AdminStore:
             _routes = self.get_alias_routes()
         except Exception:
             _routes = {}
+        try:
+            registered_keys = {str(k.get("name") or "").strip() for k in (self.list_api_keys() or [])}
+        except Exception:
+            registered_keys = set()
+        try:
+            from .providers import load_routing as _lr
+            registered_providers = set((_lr().providers or {}).keys())
+        except Exception:
+            registered_providers = set()
         # overview
         blocked = 0
         local_routed = 0
@@ -1753,6 +1798,10 @@ class AdminStore:
                              (g_rule, r.get("blocked_reason"))):
                 if agg is g_prov and not (raw or "").strip():
                     continue
+                if agg is g_prov and registered_providers and (raw or "").strip() not in registered_providers:
+                    continue
+                if agg is g_key and registered_keys and (raw or "").strip() not in registered_keys:
+                    continue
                 label = (raw or "").strip() or "(unknown)"
                 g = agg.setdefault(label, {"label": label, "calls": 0, "tokens": 0,
                                            "blocked": 0, "local_routed": 0, "errors": 0})
@@ -1766,28 +1815,29 @@ class AdminStore:
                     g["errors"] += 1
             # key×model / 计费（口径同 stats_key_model / stats_billing）
             key = (r.get("key_name") or "").strip() or "未登记"
-            label_m = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
-            g = km.setdefault((key, label_m), {"key": key, "model": label_m, "tokens": 0, "calls": 0})
-            g["tokens"] += p + c
-            g["calls"] += 1
-            g = bill.setdefault((key, label_m), {"key": key, "model": label_m, "prompt": 0,
-                                                  "completion": 0, "cached": 0,
-                                                  "creation": 0, "calls": 0})
-            g["prompt"] += p
-            g["completion"] += c
-            g["cached"] += min(int(r.get("cached_tokens") or 0), p)
-            g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
-            g["calls"] += 1
-            day = (to_beijing(r.get("ts")) or "")[:10]
-            if day:
-                g = bill_day.setdefault((day, label_m), {"day": day, "model": label_m, "prompt": 0,
-                                                          "completion": 0, "cached": 0,
-                                                          "creation": 0, "calls": 0})
+            if not registered_keys or key in registered_keys:
+                label_m = _real_model_label(_routes, r.get("provider") or "", r.get("model") or "")
+                g = km.setdefault((key, label_m), {"key": key, "model": label_m, "tokens": 0, "calls": 0})
+                g["tokens"] += p + c
+                g["calls"] += 1
+                g = bill.setdefault((key, label_m), {"key": key, "model": label_m, "prompt": 0,
+                                                      "completion": 0, "cached": 0,
+                                                      "creation": 0, "calls": 0})
                 g["prompt"] += p
                 g["completion"] += c
                 g["cached"] += min(int(r.get("cached_tokens") or 0), p)
                 g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
                 g["calls"] += 1
+                day = (to_beijing(r.get("ts")) or "")[:10]
+                if day:
+                    g = bill_day.setdefault((day, label_m), {"day": day, "model": label_m, "prompt": 0,
+                                                              "completion": 0, "cached": 0,
+                                                              "creation": 0, "calls": 0})
+                    g["prompt"] += p
+                    g["completion"] += c
+                    g["cached"] += min(int(r.get("cached_tokens") or 0), p)
+                    g["creation"] += min(int(r.get("cache_creation_tokens") or 0), p)
+                    g["calls"] += 1
             # timeseries 分桶（口径同 stats_timeseries）
             if start is not None:
                 try:

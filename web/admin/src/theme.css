@@ -114,42 +114,20 @@ body .uplot, .uplot * {
 }
 /* code 字号跟随周围正文：antd 默认 0.85em 会随父级缩到 10.2/11.9px，比同格文字小一号 */
 code { font-size: 1em !important; }
-/* 每列最窄列宽：rc-table 默认 tableLayout=fixed，列宽只认 col 的 %，单元格
-   min-width/内容宽都不参与布局 ⇒ ellipsis 列可被压到 0、各表横滚起点互不相同
-   （2026-10 实测；auto 布局也不行——Blink 把 nowrap 全文宽当硬下限，长文本列
-   直接撑爆容器）。fixed 下 <col> 的 min-width 才生效（探针验证）：全部列 96px
-   兜底，列宽 = max(指定宽, 96px)，总和放不下时表内横滚——「灌数轮次」表的行为，
-   全部表同口径。展开图标列不是数据列，排除在外（不排会把 24px 宽度抬回 96px，
-   2026-10 浏览器实测） */
-.ant-table col:not(.ant-table-expand-icon-col) { min-width: 96px; }
-/* 逐列下限：内容宽于 96 的 Tag/按钮列不能 ellipsis 裁切（切 Tag/切按钮会坏），
-   按列给足。rc-table 只在 auto 布局反映 column.minWidth，fixed 只能 col nth-child
-   （2026-10 实测内容宽：主→影双 Tag≈300 / 方向 Tag≈130 / 动作 Tag≈152 / 类型双 Tag≈155 /
-   keys 操作 2 按钮≈175（启用/停用按钮 2026-10-14 已删，原 3 按钮≈255）/
-   外部候选·限流 操作双链接≈150 / 熔断 操作 2 按钮≈170 /
-   注册表 操作≈145 / 注册表 Key 列 code+Tag+按钮≈305） */
-.tbl-divs col:nth-child(2) { min-width: 130px; }
-.tbl-divs col:nth-child(3) { min-width: 310px; }
-.tbl-l1 col:nth-child(3) { min-width: 155px; }
-.tbl-registry col:nth-child(4) { min-width: 160px; }
-.tbl-registry col:nth-child(6) { min-width: 310px; }
-.tbl-registry col:nth-child(8) { min-width: 150px; }
-.tbl-keys col:nth-child(5) { min-width: 180px; }
-.tbl-ext col:nth-child(8) { min-width: 150px; }
-.tbl-limits col:nth-child(5) { min-width: 150px; }
-.tbl-circuit col:nth-child(2) { min-width: 150px; }
-.tbl-circuit col:nth-child(6) { min-width: 170px; }
-.tbl-logs col:nth-child(2) { min-width: 110px; }
-.tbl-logs col:nth-child(3) { min-width: 110px; }
-.tbl-logs col:nth-child(4) { min-width: 90px; }
-.tbl-logs col:nth-child(8) { min-width: 150px; }
-/* sticky 模式下 rc-table 把表头拆成独立 <table>：表头列是实测 px 宽、表体仍走 % 宽，
-   上面这些 col min-width 只会夹住表头（px 列才吃 min-width）⇒ 表头/表体列错位
-   （实测 rules 7px、L2 分歧表 45px）。表头宽度本就是按表体实测回填的，无需再夹一遍 */
-.ant-table-sticky-holder col { min-width: 0 !important; }
-/* 无固定头的表 .ant-table-content 默认 overflow visible：nowrap 后表宽超卡会顶出
-   卡片撑宽 body，改表内横向滚动。开 sticky 后 rc-table 换成固定头结构（表头/表体
-   拆两 div），表体走 .ant-table-body，故两条同口径 */
+/* 横向滚动触发点统一由 scroll={{x: TABLE_X}}（utils.js）控制，不再用 col min-width：
+   2026-11 实测 <col> 的 min-width 不是逐列硬下限，而是按比例放大整表宽度 ⇒ 各表触发点
+   随列数/字符数漂移（同为 1280 宽，有的表滚 2px、有的 6px、有的不滚；分歧表还被一条
+   写错列的 310px 规则提前撑开）。现在：
+   - 表格宽度 = max(TABLE_X, 卡片宽)（antd 在 scroll.x 下写 width=X; min-width:100%）；
+   - 单元格裁剪，内容再长也不参与表宽计算；
+   - 按钮/Tag 列用 px 定宽（各表 columns 里），保证 TABLE_X 下不被裁。 */
+.ant-table-cell { overflow: hidden; text-overflow: ellipsis; }
+/* 展开图标列（仅审计表）：列宽 24px 是刻意收窄的（见下方 .audit-table 规则），
+   单元格裁剪会把箭头裁掉 ⇒ 该列保持 overflow visible（图标在第一列，往右溢出不遮挡数据）。 */
+.ant-table-row-expand-icon-cell { overflow: visible !important; }
+/* 无固定头的表 .ant-table-content 默认 overflow visible：改为表内横向滚动。
+   开 sticky 后 rc-table 换成固定头结构（表头/表体拆两 div），表体走 .ant-table-body；
+   设了 scroll.x 后两容器列宽联动（rc-table 自带同步）。 */
 .ant-table-content, .ant-table-body { overflow-x: auto; }
 /* 全表 sticky（组件侧传 sticky）：吸顶位=顶部常驻块高度，由 App.jsx 实测写
    --app-topbar-h；rc-table 内联 top:0 压不住，必须 !important。z-index 由 antd

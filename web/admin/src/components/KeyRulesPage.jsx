@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, Input, Modal, Form, Select, Tag, Space, message, Popconfirm, Popover, Typography, Alert, Card, List, InputNumber, Spin, Tabs } from 'antd';
 import { StopOutlined, ThunderboltOutlined, SlidersOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { api, errText, RANGES, usePoll } from '../api.js';
-import { wideSticky } from '../utils.js';
+import { wideSticky, TABLE_X } from '../utils.js';
 import { Tip } from '../terms.jsx';
 
 const { Text } = Typography;
@@ -369,18 +369,18 @@ export default function KeyRulesPage() {
   /* 列宽全 % + tableLayout=fixed：跟随容器、按比例分配；备注/操作原先无宽（auto
      布局弹性列），现在固定占比 */
   const cols = [
-    { title: <>{'类型'}<Tip text="黑名单 = 命中即不服务（403）；中间状态 = 强制转内网、跳过 L1+L2（内容不出境）；白名单 = 可信，少走甚至跳过 L2 审查。" /></>, dataIndex: 'kind', width: '10%',
+    { title: <>{'类型'}<Tip text="黑名单 = 命中即不服务（403）；中间状态 = 强制转内网、跳过 L1+L2（内容不出境）；白名单 = 可信，少走甚至跳过 L2 审查。" /></>, dataIndex: 'kind', width: '12%',
       render: (v) => (v === 'black' ? <Tag color="black">黑名单</Tag>
         : v === 'middle' ? <Tag color="orange">中间状态</Tag>
         : <Tag color="green">白名单</Tag>) },
-    { title: '名称', dataIndex: 'key_masked', width: '14%',
+    { title: '名称', dataIndex: 'key_masked', width: '10%',
       render: (m) => (nameByMask[m] || <Text type="secondary">—</Text>) },
-    { title: 'KEY', dataIndex: 'key_masked', width: '18%', render: (v) => <Text code>{v}</Text> },
-    { title: '来源', dataIndex: 'source', width: '10%',
+    { title: 'KEY', dataIndex: 'key_masked', width: '16%', render: (v) => <Text code>{v}</Text> },
+    { title: '来源', dataIndex: 'source', width: '13%',
       render: (v) => (v === 'manual' ? <Tag>手动添加</Tag> : <Tag color="orange">策略建议</Tag>) },
-    { title: '备注', dataIndex: 'note', width: '18%', ellipsis: true, align: 'center', className: 'cell-center' },
+    { title: '备注', dataIndex: 'note', width: '14%', ellipsis: true, align: 'center', className: 'cell-center' },
     { title: '添加时间', dataIndex: 'created_at', width: '18%' },
-    { title: '操作', width: '12%',
+    { title: '操作', width: '17%',
       render: (_, rec) => (
         <Popconfirm title="确认移除？" onConfirm={() => del(rec.id)}>
           <Button type="link" danger>移除</Button>
@@ -394,6 +394,7 @@ export default function KeyRulesPage() {
         message="默认放行所有 KEY；黑名单命中即拦截（403）；中间状态强制转内网并跳过 L1+L2。一个 KEY 只能归属一个名单（三选一），换档请先移除原规则。按 Bearer key 原文精确匹配。" />
       <Card title={<>KEY 规则<Tip text="按 KEY（按登记名单里的 key 原文精确匹配）设的黑名单/白名单。" /></>} extra={<Button type="primary" icon={<StopOutlined />} onClick={() => setModalOpen(true)}>添加规则</Button>}>
       <Table rowKey="id" columns={cols} dataSource={items} loading={loading} size="small" sticky={wideSticky()} tableLayout="fixed"
+        scroll={{ x: TABLE_X }}
         pagination={{ pageSize: 50, showSizeChanger: false }} />
       </Card>
       <Modal title="添加 KEY 规则" open={modalOpen} onOk={submit} onCancel={() => setModalOpen(false)}>

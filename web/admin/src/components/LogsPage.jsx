@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Card, Table, Button, Select, Space, Tag, Typography, message } from 'antd';
 import { DatabaseOutlined, SearchOutlined } from '@ant-design/icons';
 import { api, errText, RANGES } from '../api.js';
-import { wideSticky, patchHashQuery } from '../utils.js';
+import { wideSticky, patchHashQuery, TABLE_X } from '../utils.js';
 import { ACTION_INFO } from '../ruleNames.jsx';
 
 const { Text } = Typography;
@@ -62,7 +62,10 @@ export default function LogsPage({ tableSlotRef }) {
     const p = new URLSearchParams(window.location.hash.split('?')[1] || '');
     // 新 l_ 参数优先，回落旧 #/logs 裸参数（key= 为更早的兼容名）
     const get = (k) => p.get(F_URL[k]) || p.get(LEGACY[k]) || (k === 'key_name' ? p.get('key') : '') || '';
-    return { hours: get('hours') || '168', key_name: get('key_name'),
+    let lsH = 168;
+    try { lsH = Number(localStorage.getItem('gw_hours')) || 168; } catch { /* ignore */ }
+    const initHours = (RANGES.some((r) => r.hours === lsH) ? String(lsH) : '') || get('hours') || '168';
+    return { hours: initHours, key_name: get('key_name'),
              model: get('model'), action: get('action'),
              status_code: get('status_code') };
   });
@@ -117,6 +120,7 @@ export default function LogsPage({ tableSlotRef }) {
         </Space>
       }>
       <Table className="tbl-logs" rowKey="id" columns={cols} dataSource={data?.items || []} loading={loading} size="small"
+        scroll={{ x: TABLE_X }}
         sticky={wideSticky()}
         tableLayout="fixed"
         locale={{ emptyText: '当前筛选无明细记录：可扩大时间范围或清空筛选条件' }}
@@ -133,7 +137,8 @@ export default function LogsPage({ tableSlotRef }) {
         <Space wrap>
           <Select style={{ width: 140 }} value={f.hours}
             options={RANGES.map((r) => ({ value: String(r.hours), label: r.label }))}
-            onChange={(v) => { const next = { ...f, hours: v }; setF(next); setPageNo(1); writeUrl(next); }} />
+            onChange={(v) => { const next = { ...f, hours: v }; setF(next); setPageNo(1); writeUrl(next);
+              const h = Number(v); if (RANGES.some((r) => r.hours === h)) { try { localStorage.setItem('gw_hours', String(h)); } catch { /* ignore */ } } }} />
           <Select style={{ width: 120 }} value={f.action || undefined} options={LOG_ACTIONS} allowClear placeholder="动作"
             onChange={(v) => { const next = { ...f, action: v || '' }; setF(next); setPageNo(1); writeUrl(next); }} />
           {facetSel('key_name', '调用方', facets.key_name, 180)}

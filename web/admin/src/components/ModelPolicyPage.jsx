@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Table, Button, AutoComplete, Input, InputNumber, Modal, Form, Select, Tag, Space, message, Popconfirm, Typography, Card, Switch, Slider, Tooltip } from 'antd';
 import { api, errText, usePoll } from '../api.js';
-import { wideSticky } from '../utils.js';
+import { wideSticky, TABLE_X } from '../utils.js';
 import { Tip } from '../terms.jsx';
 import Arrow from './Arrow.jsx';
 
@@ -116,10 +116,11 @@ function AliasGroupsCard() {
         pagination={false}
         size="small"
         tableLayout="fixed"
+        scroll={{ x: TABLE_X }}
         columns={[
-          /* 列宽全 %  + tableLayout=fixed：表跟随容器宽度，列按比例分配；操作列装两个链接按钮，给足 14% */
-          { title: '别名组', dataIndex: 'name', width: '12%', render: (v) => <Tag color="blue">{v}</Tag> },
-          { title: '候选链（复杂度路由按档位定链首；数字为档位）', width: '74%', render: (_, g) => (
+          /* 列宽全 % + tableLayout=fixed：表跟随容器宽度，列按比例分配；操作列装两个链接按钮，给足 19% */
+          { title: '别名组', dataIndex: 'name', width: '15%', render: (v) => <Tag color="blue">{v}</Tag> },
+          { title: '候选链（复杂度路由按档位定链首；数字为档位）', width: '66%', render: (_, g) => (
               <Space direction="vertical" size={2}>
                 {(g.members || []).map((m, i) => (
                   <Typography.Text key={i} type={m.enabled ? undefined : 'secondary'}>
@@ -131,7 +132,7 @@ function AliasGroupsCard() {
                 ))}
               </Space>
           )},
-          { title: '操作', width: '14%', render: (_, g) => (
+          { title: '操作', width: '19%', render: (_, g) => (
               <Space size={4}>
                 <Button type="link" onClick={() => { addForm.resetFields(); setEditing({
                   name: g.name, origName: g.name, description: g.description || '',
@@ -330,18 +331,18 @@ function ExternalCandidatesCard() {
     <Card title={<>外部候选<Tip term="candidate" /></>}
       extra={<Button type="primary"
         onClick={() => setModal({ mode: 'new' })}>新增候选</Button>}>
-      <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" sticky={wideSticky()} pagination={false}
+      <Table rowKey={(r) => `${r.provider}/${r.model}`} className="tbl-ext" size="small" sticky={wideSticky()} pagination={false} scroll={{ x: TABLE_X }}
         tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无外部候选，点「新增候选」添加' }}
         columns={[
           /* 全部列显式 % 宽（fixed 布局下无宽 auto 列没有最窄列宽，会塌到 0） */
           { title: 'Provider', dataIndex: 'provider', width: '12%' },
-          { title: '模型', dataIndex: 'model', width: '15%' },
+          { title: '模型', dataIndex: 'model', width: '20%' },
           { title: '价格入(¥/1M)', dataIndex: 'price_per_1m_in', width: '13%' },
           { title: '价格出(¥/1M)', dataIndex: 'price_per_1m_out', width: '13%' },
           { title: '上下文', dataIndex: 'context_length', width: '11%' },
-          { title: <>{'推荐等级'}<Tip text="按单价和实际花费排出来的推荐顺序（越便宜越靠前），只是参考，不会自动改路由。" /></>, width: '10%', render: (_, r) => {
+          { title: <>{'推荐等级'}<Tip text="按单价和实际花费排出来的推荐顺序（越便宜越靠前），只是参考，不会自动改路由。" /></>, width: '12%', render: (_, r) => {
             const lv = recommendOf(r);
             return (
               <Tooltip title={spendTip(r)}>
@@ -349,7 +350,7 @@ function ExternalCandidatesCard() {
               </Tooltip>
             );
           } },
-          { title: '操作', width: '26%', render: (_, r, i) => (
+          { title: '操作', width: '19%', render: (_, r, i) => (
             <Space>
               <Button type="link" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.provider}/${r.model}？`} onConfirm={() => {
@@ -391,25 +392,39 @@ function L2RuntimeSection() {
   const loadedRef = useRef(null);
   // 内部模型（审查模型下拉的数据源，含停用项——停用只控制 /v1/models 暴露，不影响下拉可选）
   const [internals, setInternals] = useState([]);
-  // provider 展开地址（qwen 模式按所选模型自动推导端点用；/providers.raw 形态不可直接拼）
+  // provider 展开地址（chat 类端点推导用；/providers.raw 形态不可直接拼）
   const [provs, setProvs] = useState([]);
   // 只刷下拉数据源：内部模型表拨开关/增删后经 gateway:model-policy-saved 事件同步，
   // 不碰 cfg 草稿（用户编辑途中也不会被冲掉）。
   const loadInternals = useCallback(async () => {
     try {
       const d = await api('/model-policy');
-      setInternals(d.policy.internal_models || []);
-    } catch (e) { /* 下拉无数据时仍可显示现值，见 modelOptions 兜底 */ }
+      const ins = d.policy.internal_models || [];
+      setInternals(ins);
+      return ins;
+    } catch (e) { return []; } // 下拉无数据时仍可显示现值，见 modelOptions 兜底
   }, []);
   const load = useCallback(async () => {
-    try {
-      const next = await api('/l2-config');
+    let next = null;
+    try { next = await api('/l2-config'); } catch (e) { message.error(errText(e)); }
+    const ins = await loadInternals();
+    if (next) {
+      // laya 不读模型名，现场 SMALL_MODEL_NAME 可能还是切后端前的 chat 旧值：
+      // 按实际端点（AI_GATEWAY_L2_SHADOW_URL，主链路就读它）反查登记模型，下拉回显真正在用的模型。
+      if (((next.AI_GATEWAY_L2_BACKEND) || 'qwen') === 'laya') {
+        const cur = ins.find((m) => m.model === next.SMALL_MODEL_NAME);
+        if (!cur || !/\/classify\/?$/.test(String(cur.url || '').trim())) {
+          const shadowUrl = String(next.AI_GATEWAY_L2_SHADOW_URL || '').trim();
+          const hit = ins.find((m) => /\/classify\/?$/.test(String(m.url || '').trim())
+            && String(m.url || '').trim() === shadowUrl);
+          if (hit) next = { ...next, SMALL_MODEL_NAME: hit.model };
+        }
+      }
       loadedRef.current = JSON.stringify(next);
       setDirty(false);
       setCfg(next);
       setLoadedAt(new Date());
-    } catch (e) { message.error(errText(e)); }
-    loadInternals();
+    }
     try {
       const p = await api('/providers');
       setProvs(p.providers || []);
@@ -439,16 +454,23 @@ function L2RuntimeSection() {
     setDirty(JSON.stringify(next) !== loadedRef.current);
     return next;
   });
-  const isLaya = (((cfg || {}).AI_GATEWAY_L2_BACKEND) || 'qwen') === 'laya';
-  // qwen 模式端点自动推导：所选内部模型的 provider 展开地址 + /chat/completions。
-  // 推导不出（如选了无 provider 的 laya）则沿用现值，绝不存空。
+  const storedIsLaya = (((cfg || {}).AI_GATEWAY_L2_BACKEND) || 'qwen') === 'laya';
+  // 端点不再手配：由所选内部模型推导。laya 类登记网址就是 /classify 全地址，原样用；
+  // chat 类取 provider 展开地址（无则退回登记网址）+ /chat/completions。
+  const isClassifyUrl = (u) => /\/classify\/?$/.test(String(u || '').trim());
+  const modelEntry = ((cfg || {}).SMALL_MODEL_NAME
+    ? internals.find((m) => m.model === cfg.SMALL_MODEL_NAME) : null);
   const derivedUrl = (() => {
-    if (!cfg || isLaya) return '';
-    const entry = internals.find((m) => m.model === cfg.SMALL_MODEL_NAME);
-    const base = String((provs.find((p) => p.name === (entry && entry.provider)) || {}).base_url_resolved || '').replace(/\/+$/, '');
-    return base ? `${base}/chat/completions` : '';
+    if (!modelEntry) return '';
+    const raw = String(modelEntry.url || '').trim();
+    if (isClassifyUrl(raw)) return raw;
+    const base = String((provs.find((p) => p.name === modelEntry.provider) || {}).base_url_resolved || raw)
+      .replace(/\/+$/, '');
+    if (!base) return '';
+    return /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
   })();
-  const effUrl = derivedUrl || (cfg || {}).SMALL_MODEL_URL || '';
+  // 后端跟着所选模型走：/classify 类 = laya，chat 类 = qwen（模型没登记时沿用现值兜底）。
+  const selectedIsLaya = modelEntry ? isClassifyUrl(modelEntry.url) : storedIsLaya;
   const cfgRow = (label, control) => (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--gw-sp-8)' }}>
       <Text style={{ whiteSpace: 'nowrap' }}>{label}</Text>
@@ -456,17 +478,23 @@ function L2RuntimeSection() {
     </div>
   );
   const save = async () => {
+    if (!derivedUrl) {
+      message.error('请选择登记了服务地址的内部模型');
+      return;
+    }
     setSaving(true);
     try {
       await api('/l2-config', { method: 'PUT', body: JSON.stringify({
         SMALL_MODEL_ENABLED: cfg.SMALL_MODEL_ENABLED,
         SMALL_MODEL_TIMEOUT: cfg.SMALL_MODEL_TIMEOUT,
-        SMALL_MODEL_URL: isLaya ? cfg.SMALL_MODEL_URL : effUrl,
+        // 后端跟所选模型的协议走。laya 主链路实际读 AI_GATEWAY_L2_SHADOW_URL
+        // （small_model._call_laya），该模式无影子；SMALL_MODEL_URL 保持 chat 口原值不动。
+        SMALL_MODEL_URL: selectedIsLaya ? cfg.SMALL_MODEL_URL : derivedUrl,
         SMALL_MODEL_NAME: cfg.SMALL_MODEL_NAME,
         SMALL_MODEL_MAX_TOKENS: cfg.SMALL_MODEL_MAX_TOKENS,
-        AI_GATEWAY_L2_BACKEND: cfg.AI_GATEWAY_L2_BACKEND || 'qwen',
+        AI_GATEWAY_L2_BACKEND: selectedIsLaya ? 'laya' : 'qwen',
         AI_GATEWAY_L2_SHADOW: !!cfg.AI_GATEWAY_L2_SHADOW,
-        AI_GATEWAY_L2_SHADOW_URL: cfg.AI_GATEWAY_L2_SHADOW_URL || '',
+        AI_GATEWAY_L2_SHADOW_URL: selectedIsLaya ? derivedUrl : (cfg.AI_GATEWAY_L2_SHADOW_URL || ''),
         AI_GATEWAY_WL_L2_SAMPLE: cfg.AI_GATEWAY_WL_L2_SAMPLE,
         AI_GATEWAY_L2_GRAY_FLOOR: cfg.AI_GATEWAY_L2_GRAY_FLOOR,
       }) });
@@ -475,7 +503,8 @@ function L2RuntimeSection() {
     setSaving(false);
   };
   if (!cfg) return <Text type="secondary">加载中…</Text>;
-  // 审查模型下拉：选项来自内部模型登记（含 laya 这类停用项）；现值不在登记内则兜底一项，保证不丢显示。
+  // 审查模型下拉：选项来自内部模型登记（含停用项——停用只控制 /v1/models 暴露，不影响下拉可选）；
+  // 端点与后端都跟着所选模型推导，所以不再按协议过滤。
   const modelOptions = internals.map((m) => ({
     value: m.model,
     label: `${m.provider}/${m.model}${m.enabled ? '' : '（停用）'}`,
@@ -483,8 +512,8 @@ function L2RuntimeSection() {
   if (cfg.SMALL_MODEL_NAME && !modelOptions.some((o) => o.value === cfg.SMALL_MODEL_NAME)) {
     modelOptions.push({ value: cfg.SMALL_MODEL_NAME, label: `${cfg.SMALL_MODEL_NAME}（未在内部模型登记）` });
   }
-  // 地址类下拉：选项=登记了网址的内部模型（laya 类）；存的是网址原文，schema 不动。
-  const urlOptions = internals.filter((m) => m.url).map((m) => ({
+  // 影子端点只能是 laya 类（/classify）内部模型；存的是网址原文，schema 不动。
+  const urlOptions = internals.filter((m) => isClassifyUrl(m.url)).map((m) => ({
     value: m.url, label: `${m.provider}/${m.model}`,
   }));
   const urlOptionsWith = (cur) => ((cur && !urlOptions.some((o) => o.value === cur))
@@ -499,12 +528,6 @@ function L2RuntimeSection() {
         </Text>
       </Space>
       <Space direction="vertical" size={10} style={{ width: '100%', marginLeft: 'var(--gw-sp-8)', marginTop: 'var(--gw-sp-12)' }}>
-        {isLaya && cfgRow('端点：',
-          <Select size="small" showSearch style={{ width: '100%', maxWidth: 320 }} value={cfg.SMALL_MODEL_URL || ''}
-            placeholder="从内部模型中选择"
-            options={urlOptionsWith(cfg.SMALL_MODEL_URL || '')}
-            onChange={(v) => set('SMALL_MODEL_URL', v)}
-            filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />)}
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 'var(--gw-sp-8) var(--gw-sp-16)' }}>
           {cfgRow('超时(s)：',
             <Slider style={{ width: '100%', maxWidth: 280, minWidth: 120 }} min={0.5} max={60} step={0.5}
@@ -514,35 +537,47 @@ function L2RuntimeSection() {
               value={cfg.AI_GATEWAY_WL_L2_SAMPLE} onChange={(v) => set('AI_GATEWAY_WL_L2_SAMPLE', v)} />)}
           {cfgRow('模型：',
             <Select size="small" showSearch style={{ width: 280 }} value={cfg.SMALL_MODEL_NAME || ''}
-              disabled={isLaya} title={isLaya ? 'backend=laya 时模型字段不生效（/classify 无模型参数）' : '选项来自内部模型登记，改名先去内部模型登记'}
+              status={derivedUrl ? '' : 'warning'}
+              title="选项来自内部模型登记；端点与后端（laya/chat）由所选模型自动推导，改名先去内部模型登记"
               placeholder="从内部模型中选择"
               options={modelOptions}
               onChange={(v) => set('SMALL_MODEL_NAME', v)}
               filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />)}
-          {cfgRow('max_tokens：',
-            <InputNumber size="small" min={8} max={512} value={cfg.SMALL_MODEL_MAX_TOKENS}
-              onChange={(v) => set('SMALL_MODEL_MAX_TOKENS', v)} />)}
+          {cfgRow(<>max_tokens：<Tip term="max_tokens" /></>,
+            <Space size={6}>
+              <InputNumber size="small" min={8} max={512} value={cfg.SMALL_MODEL_MAX_TOKENS}
+                disabled={selectedIsLaya}
+                title={selectedIsLaya
+                  ? '当前所选模型走 laya /classify，无 max_tokens 参数；值保留，切回 chat 模型即生效'
+                  : 'L2 判定 JSON 的输出上限；太小会截断 JSON 导致判定降级'}
+                onChange={(v) => set('SMALL_MODEL_MAX_TOKENS', v)} />
+              {selectedIsLaya
+                ? <Tooltip title="laya 走 /classify，请求里没有 max_tokens 参数；值会保留，切回 chat 模型自动恢复">
+                    <Text type="secondary" style={{ fontSize: 'var(--gw-fs-12)', cursor: 'help' }}>不生效</Text>
+                  </Tooltip>
+                : null}
+            </Space>)}
           {cfgRow(<>灰区下限：<Tip term="gray" /></>,
             <InputNumber size="small" min={0} max={20} value={cfg.AI_GATEWAY_L2_GRAY_FLOOR}
               title="risk_score ≥ 该值即强制送 L2 复核（改完即时生效）。上限 20：再高则 25/30 档关键词单命中不再进灰区"
               onChange={(v) => set('AI_GATEWAY_L2_GRAY_FLOOR', v)} />)}
         </div>
       </Space>
-      <Space align="center" wrap style={{ marginTop: 'var(--gw-sp-12)' }}>
-        <Text title="qwen 权威、laya 并行打标（shadow_* 进审计），backend=laya 时不生效">影子双跑：</Text><Tip term="shadow" />
-        <Switch size="small" aria-label="影子双跑" checked={!!cfg.AI_GATEWAY_L2_SHADOW}
-          disabled={(cfg.AI_GATEWAY_L2_BACKEND || 'qwen') === 'laya'}
-          onChange={(v) => set('AI_GATEWAY_L2_SHADOW', v)} />
-        <Text>影子端点：</Text>
-        <Select size="small" showSearch style={{ width: '100%', maxWidth: 280 }} value={cfg.AI_GATEWAY_L2_SHADOW_URL || ''}
-          placeholder="从内部模型中选择"
-          options={urlOptionsWith(cfg.AI_GATEWAY_L2_SHADOW_URL || '')}
-          onChange={(v) => set('AI_GATEWAY_L2_SHADOW_URL', v)}
-           filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />
-        {(cfg.AI_GATEWAY_L2_BACKEND || 'qwen') === 'laya'
-          ? <Text type="secondary">backend=laya 时「端点」即 /classify（qwen 的模型/max_tokens 不生效）</Text>
-          : null}
-      </Space>
+      {selectedIsLaya
+        ? <Space align="center" wrap style={{ marginTop: 'var(--gw-sp-12)' }}>
+            <Text type="secondary">后端 laya：端点取所选内部模型的登记网址（{derivedUrl || '未推导出'}，/classify 原样使用），无影子双跑</Text>
+          </Space>
+        : <Space align="center" wrap style={{ marginTop: 'var(--gw-sp-12)' }}>
+            <Text title={`${cfg.AI_GATEWAY_L2_BACKEND || 'qwen'} 权威、laya 并行打标（shadow_* 进审计）`}>影子双跑：</Text><Tip term="shadow" />
+            <Switch size="small" aria-label="影子双跑" checked={!!cfg.AI_GATEWAY_L2_SHADOW}
+              onChange={(v) => set('AI_GATEWAY_L2_SHADOW', v)} />
+            <Text>影子端点：</Text>
+            <Select size="small" showSearch style={{ width: '100%', maxWidth: 280 }} value={cfg.AI_GATEWAY_L2_SHADOW_URL || ''}
+              placeholder="从内部模型中选择"
+              options={urlOptionsWith(cfg.AI_GATEWAY_L2_SHADOW_URL || '')}
+              onChange={(v) => set('AI_GATEWAY_L2_SHADOW_URL', v)}
+               filterOption={(inp, opt) => String((opt && (opt.value || opt.label)) || '').toLowerCase().includes(inp.toLowerCase())} />
+          </Space>}
       <Space align="center" wrap style={{ marginTop: 'var(--gw-sp-12)', marginLeft: 'var(--gw-sp-8)' }}>
         <Button type="primary" loading={saving} onClick={save}>保存生效</Button>
       </Space>
@@ -612,7 +647,7 @@ function InternalModelsCard() {
   return (
     <Card title={<>内部模型<Tip term="internal_model" /></>}
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增内部模型</Button>}>
-      <Table data-testid="mp-internal-table" rowKey={(r) => `${r.provider}/${r.model}`} size="small" sticky={wideSticky()} pagination={false}
+      <Table data-testid="mp-internal-table" rowKey={(r) => `${r.provider}/${r.model}`} size="small" sticky={wideSticky()} pagination={false} scroll={{ x: TABLE_X }}
         tableLayout="fixed"
         loading={loading} dataSource={rows}
         locale={{ emptyText: '暂无内部模型，点「新增内部模型」添加' }}
@@ -620,10 +655,10 @@ function InternalModelsCard() {
           /* 列宽全 % + tableLayout=fixed；操作列是按钮组，同样给 % 定比。
              Provider 列已删（2026-10-14）：内部模型都是同一个本机 provider，列里全是重复值；字段仍留（弹窗可编辑、路由要用） */
           { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true, align: 'center', className: 'cell-center' },
-          { title: '服务地址', dataIndex: 'url', width: '30%', ellipsis: true, align: 'center', className: 'cell-center',
+          { title: '服务地址', dataIndex: 'url', width: '27%', ellipsis: true, align: 'center', className: 'cell-center',
             render: (v) => (v ? <Text code style={{ fontSize: 'var(--gw-fs-12)' }}>{v}</Text> : <Text type="secondary">—</Text>) },
           { title: '备注', dataIndex: 'note', width: '13%', ellipsis: true, align: 'center', className: 'cell-center' },
-          { title: '健康', width: '26%', ellipsis: true, align: 'center', className: 'cell-center', render: (_, r, i) => (
+          { title: '健康', width: '24%', ellipsis: true, align: 'center', className: 'cell-center', render: (_, r, i) => (
             <Space size={4}>
               {!r._health ? <Text type="secondary">—</Text>
               : r._health.ok
@@ -631,7 +666,7 @@ function InternalModelsCard() {
                 : <Text type="danger" title={r._health.error}>{r._health.error || '异常'}</Text>}
               <Button type="link" size="small" loading={checking === i} onClick={() => checkRow(r, i)}>检查</Button>
             </Space>) },
-          { title: '操作', width: '11%', align: 'center', className: 'cell-center', render: (_, r, i) => (
+          { title: '操作', width: '16%', align: 'center', className: 'cell-center', render: (_, r, i) => (
             <Space>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.provider}/${r.model}？`} onConfirm={() => {
@@ -719,7 +754,7 @@ function ModelLimitsCard() {
   return (
     <Card title="模型限流"
       extra={<Button type="primary" onClick={() => setModal({ mode: 'new' })}>新增限流</Button>}>
-      <Table rowKey="model" className="tbl-limits" size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed"
+      <Table rowKey="model" className="tbl-limits" size="small" sticky={wideSticky()} pagination={false} tableLayout="fixed" scroll={{ x: TABLE_X }}
         loading={loading} dataSource={rows}
         locale={{ emptyText: '未配置限流（全部不限）' }}
         columns={[
@@ -728,7 +763,7 @@ function ModelLimitsCard() {
           { title: '模型', dataIndex: 'model', width: '20%', ellipsis: true, render: (v) => <Text code>{v}</Text> },
           { title: 'RPM', dataIndex: 'rpm', width: '20%', render: (v) => (v > 0 ? v : <Tag>不限</Tag>) },
           { title: '备注', dataIndex: 'note', width: '40%' },
-          { title: '操作', width: '20%', render: (_, r, i) => (
+          { title: '操作', width: '16%', render: (_, r, i) => (
             <Space>
               <Button type="link" size="small" onClick={() => setModal({ mode: 'edit', row: r, idx: i })}>编辑</Button>
               <Popconfirm title={`删除 ${r.model} 的限流？`} onConfirm={() => {
@@ -769,6 +804,8 @@ function ModelLimitsCard() {
 export default function ModelPolicyPage() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
+  const reviewRef = useRef(null);
+  const focus = new URLSearchParams((window.location.hash.split('?')[1] || '')).get('focus');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -780,6 +817,14 @@ export default function ModelPolicyPage() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (focus === 'review' && !loading && data) {
+      const id = setTimeout(() => {
+        window.scrollTo({ top: document.body.scrollHeight, behavior: 'auto' });
+      }, 300);
+      return () => clearTimeout(id);
+    }
+  }, [focus, loading, data]);
 
   if (loading || !data) return <Card loading />;
 
@@ -789,12 +834,12 @@ export default function ModelPolicyPage() {
       <ExternalCandidatesCard />
       <InternalModelsCard />
       <ModelLimitsCard />
-      <Card title={<>审查模型<Tip term="l2" /></>}
+      <Card ref={reviewRef} style={{ scrollMarginTop: 'var(--app-topbar-h, 80px)' }} title={<>审查模型<Tip term="l2" /></>}
         extra={
-          // L2 配置劈两页（本页=端点/模型/超时/影子/灰区下限，规则管理页=判定档/判密阈值/提示词），互链别让用户猜
+          // L2 配置劈两页（本页=模型/超时/影子/灰区下限，规则管理页=判定档/判密阈值/提示词），互链别让用户猜
           <Tooltip title="L2 判定档 / 判密阈值 / 提示词在「规则管理」页的 L2 拦截配置卡">
             <Button type="link" size="small" style={{ padding: 0 }}
-              onClick={() => { window.location.hash = '/rules'; }} icon={<Arrow />} iconPosition="end">L2 拦截配置</Button>
+              onClick={() => { window.location.hash = '/rules?focus=l2'; }} icon={<Arrow />} iconPosition="end">L2 拦截配置</Button>
           </Tooltip>
         }>
         <L2RuntimeSection />

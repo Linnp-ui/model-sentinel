@@ -53,6 +53,9 @@ MODELS = [
     # v35 训练停在 epoch 3/4（checkpoint_meta），缺顶层 final save——其补完训练即 v36
     # （epoch 4/4，11-03），参评的是 v36。
     ("v36（11-02 新数据重训补完）", "/home/your-user/models/laya-finetuned-confidential-v36"),
+    # v37：11-05 重训（4/4 epoch，4.97h，独立从头训非续 v36），新增近重复样板样本
+    #（样本特征见 18-real-eval-review 错误归因）
+    ("v37（11-05 近重复样板重训）", "/home/your-user/models/laya-finetuned-confidential-v37"),
 ]
 
 def render(text, filename=""):

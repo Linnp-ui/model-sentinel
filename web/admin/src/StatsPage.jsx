@@ -171,8 +171,13 @@ function KeyCallBars({ keyModels, keyCalls, ov, testid }) {
 
 export default function StatsPage() {
   const billingRef = useRef(null);
-  const focus = new URLSearchParams((window.location.hash.split('?')[1]||'')).get('focus');
-  const [hours, setHours] = useState(168);
+  const _sp = new URLSearchParams((window.location.hash.split('?')[1]||''));
+  const focus = _sp.get('focus');
+  const _h = Number(_sp.get('hours'));
+  let _ls = 168;
+  try { _ls = Number(localStorage.getItem('gw_hours')) || 168; } catch { /* ignore */ }
+  const [hours, setHours] = useState(RANGES.some((r) => r.hours === _ls) ? _ls
+    : (RANGES.some((r) => r.hours === _h) ? _h : 168));
   const [ov, setOv] = useState(null);
   const [provTop, setProvTop] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -224,7 +229,7 @@ export default function StatsPage() {
       {typeof document !== 'undefined' && document.getElementById('page-toolbar-slot')
         ? createPortal((
           <Space size="middle">
-            <Select size="small" value={hours} onChange={(v) => setHours(v)} style={{ width: 130 }}
+            <Select size="small" value={hours} onChange={(v) => { setHours(v); try { localStorage.setItem('gw_hours', String(v)); } catch { /* ignore */ } }} style={{ width: 130 }}
               options={RANGES.map((r) => ({ value: r.hours, label: r.label }))} />
           </Space>
         ), document.getElementById('page-toolbar-slot'))
@@ -266,9 +271,9 @@ export default function StatsPage() {
 
       {ov && (
         <>
-          <MetricsSection hours={hours} />
+          <MetricsSection hours={hours} focus={focus} />
           <div style={{ display: 'flex', gap: 'var(--gw-sp-12)', flexWrap: 'wrap', alignItems: 'stretch', marginTop: 'var(--gw-sp-12)' }}>
-            <Card title={<>Provider 调用分布（前 8 · 占比=全部请求）<Tip term="provider" /></>}
+            <Card title={<>Provider 调用分布<Tip term="provider" /></>}
               style={{ minWidth: 380, flex: 1, display: 'flex', flexDirection: 'column' }}
               styles={{ body: { flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' } }}>
               {provTop.length

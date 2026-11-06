@@ -1,7 +1,7 @@
 """把 docs/thesis 下的章节 Markdown 组装为本科毕业论文 Word。
 
 用法: .venv/bin/python scripts/build_thesis_docx.py
-输出: docs/thesis/毕业论文-企业大模型数据防泄漏系统.docx
+输出: docs/thesis/毕业论文-数据防泄漏系统.docx
 
 目录条目带超链接（锚定标题 _Toc 书签），打开即可点击跳转；页码构建时预嵌入
 （soffice 渲染 PDF 定位标题页，PAGEREF 域保持活跃，Word 更新域会再修正；
@@ -23,7 +23,7 @@ from docx.shared import Cm, Pt, RGBColor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 D = os.path.join(ROOT, "docs", "thesis")
-OUT = os.path.join(D, "毕业论文-企业大模型数据防泄漏系统.docx")
+OUT = os.path.join(D, "毕业论文-数据防泄漏系统.docx")
 FIGS = os.path.join(D, "figures")
 
 SERIF = "宋体"
@@ -255,6 +255,9 @@ def table(block):
     widths = [base + extra * w / sum(weights) for w in weights]
     for gc, w in zip(t._tbl.tblGrid.findall(qn("w:gridCol")), widths):
         gc.set(qn("w:w"), str(int(w * 567)))
+    # 短表整表同页；长表只在表头设 keep_with_next（表头不得孤悬页底，续页靠
+    # tblHeader 重复表头）。w:cantSplit 防单行跨页。
+    keep_all = len(rows) <= 12
     for ri, row in enumerate(rows):
         tr = t.rows[ri]._tr
         trPr = tr.get_or_add_trPr()
@@ -274,6 +277,8 @@ def table(block):
             pf.space_after = Pt(1)
             pf.line_spacing = 1.0
             pf.alignment = WD_ALIGN_PARAGRAPH.CENTER if ri == 0 else WD_ALIGN_PARAGRAPH.LEFT
+            if (keep_all and ri < len(rows) - 1) or ri == 0:
+                pf.keep_with_next = True
             add_inline(p, text, 10.5, bold=ri == 0)
     doc.add_paragraph()
 
@@ -436,7 +441,7 @@ def cover():
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.first_line_indent = Pt(0)
     p.paragraph_format.line_spacing = 1.5
-    set_run_font(p.add_run("基于规则与小模型级联的企业大模型\n数据防泄漏系统设计与实现"), 22, True, LATIN, SANS)
+    set_run_font(p.add_run("基于规则与小模型级联的\n数据防泄漏系统设计与实现"), 22, True, LATIN, SANS)
     for _ in range(4):
         doc.add_paragraph()
     t = doc.add_table(rows=6, cols=2)
@@ -685,7 +690,7 @@ def toc_styles():
 def setup_doc():
     global doc
     doc = Document()
-    doc.core_properties.title = "基于规则与小模型级联的企业大模型数据防泄漏系统设计与实现"
+    doc.core_properties.title = "基于规则与小模型级联的数据防泄漏系统设计与实现"
     doc.core_properties.subject = "本科毕业设计（论文）"
     doc.core_properties.author = ""
     normal = doc.styles["Normal"]

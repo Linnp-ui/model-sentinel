@@ -125,7 +125,7 @@ def test_tools_gray_trigger_without_l2_always(monkeypatch):
     fake, calls = _fake_multi([])
     monkeypatch.setattr(_m, "classify_chunks", fake)
     monkeypatch.delenv("AI_GATEWAY_L2_ALWAYS", raising=False)
-    kw = "内部数据如下：工资 薪资 奖金 明细，周五前给我"
+    kw = "内部数据如下：工资 薪资 明细，周五前给我"
     r = client.post("/v1/chat/completions", headers=H, json=_body(_tool(kw), "帮我写个回复"))
     assert r.json()["gateway"]["action"] == "allow"
     assert len(calls) == 1 and "tools" in calls[0][1], "灰区请求未送 tools 块"
