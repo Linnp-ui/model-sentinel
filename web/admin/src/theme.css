@@ -22,6 +22,22 @@ body.ant-scrolling-effect { width: auto !important; }
   --gw-red-text: #cf1322;   /* 语义色文字：深底上要换亮档，见下方暗色块 */
   --gw-orange-text: #ad4e00;
 
+  /* ---------------- 视觉增强 token（2026-11 用户要求：渐变/配色/微动效） ----------------
+     只动「主按钮 / 卡片头 / 顶栏 / 交互反馈」这几处，不改布局与数据密度。
+     渐变端点都取主色同色系深浅阶，白字对比度保持 AA；动效只动 transform/opacity/背景色。 */
+  --gw-grad-primary: linear-gradient(135deg, #3d5eeb 0%, #2f54eb 100%);
+  --gw-grad-primary-hover: linear-gradient(135deg, #3657e3 0%, #2848d8 100%);
+  --gw-grad-primary-active: linear-gradient(135deg, #2848d8 0%, #1d39c4 100%);
+  --gw-grad-surface: linear-gradient(135deg, #ffffff 0%, #f6f8fd 100%);
+  --gw-grad-topbar: linear-gradient(135deg, #ffffff 0%, #f5f7fc 100%);
+  --gw-grad-sider: linear-gradient(180deg, #ffffff 0%, #f7f8fc 100%);
+  --gw-shadow-1: 0 1px 2px rgba(15, 23, 42, .04);
+  --gw-shadow-2: 0 4px 12px rgba(15, 23, 42, .08);
+  --gw-shadow-primary: 0 2px 6px rgba(47, 84, 235, .22);
+  --gw-dur-fast: 120ms;
+  --gw-dur-mid: 180ms;
+  --gw-ease: cubic-bezier(.2, .8, .2, 1);
+
   /* ---------------- 间距 / 字号刻度（DESIGN.md §3 §4 的唯一落点） ----------------
      全站垂直节奏与字号只走这几档。JSX 内联样式也引用同一组变量
      （style={{ marginTop: 'var(--gw-sp-8)' }}），改节奏/字号只改这一处，
@@ -61,6 +77,18 @@ body.ant-scrolling-effect { width: auto !important; }
     --gw-text-2: rgba(255, 255, 255, 0.65);
     --gw-red-text: #ff7875;
     --gw-orange-text: #ffc069;
+
+    /* 深色渐变端点：取比 colorPrimary 略深的主色阶，白字仍达 AA（≥4.5:1）；
+       表面渐变只做极轻的明暗差 */
+    --gw-grad-primary: linear-gradient(135deg, #4669ee 0%, #3566e8 100%);
+    --gw-grad-primary-hover: linear-gradient(135deg, #3f63ea 0%, #2f5fd9 100%);
+    --gw-grad-primary-active: linear-gradient(135deg, #3566e8 0%, #2848d8 100%);
+    --gw-grad-surface: linear-gradient(135deg, #1f1f1f 0%, #1b1b24 100%);
+    --gw-grad-topbar: linear-gradient(135deg, #1f1f1f 0%, #1a1a22 100%);
+    --gw-grad-sider: linear-gradient(180deg, #1f1f1f 0%, #181820 100%);
+    --gw-shadow-1: 0 1px 2px rgba(0, 0, 0, .35);
+    --gw-shadow-2: 0 4px 14px rgba(0, 0, 0, .5);
+    --gw-shadow-primary: 0 2px 8px rgba(89, 126, 247, .32);
   }
 
 /* body 底/字色：antd 只改组件色不改 body —— 深色下 body 还是黑字深底（不可读） */
@@ -325,3 +353,75 @@ code { font-size: 1em !important; }
 }
 .file-pick::file-selector-button:hover { background: #597ef7; color: #fff; }
 .file-pick::file-selector-button:active { background: var(--gw-primary-active); color: #fff; }
+
+/* ================= 视觉增强层（2026-11） =================
+   用户要求：渐变、配色、可交互位置微动效。范围限定主按钮 / 卡片 / 顶栏 / 菜单 / Tabs，
+   不改布局骨架、不新增 z-index、不改圆角；动效只动 transform/opacity/背景色，≤200ms。
+   渐变端点取主色同色系深浅阶（白字仍达 WCAG AA）；深色端点见 [data-theme='dark']。 */
+
+/* 顶栏 / 状态条 / 侧栏：微渐变底。Header/StatusBar 的底色是 JSX 内联样式，需 !important 盖掉 */
+.app-topbar, .app-header, .app-statusbar { background: var(--gw-grad-topbar) !important; }
+.ant-layout-sider.ant-layout-sider-light { background: var(--gw-grad-sider) !important; }
+[data-theme='dark'] .ant-layout-sider.ant-layout-sider-dark { background: var(--gw-grad-sider) !important; }
+
+/* 卡片：一层极轻阴影 + hover 上浮；卡片头微渐变（用户确认：默认全部卡片头） */
+.ant-card {
+  box-shadow: var(--gw-shadow-1);
+  transition: box-shadow var(--gw-dur-mid) var(--gw-ease), transform var(--gw-dur-mid) var(--gw-ease);
+}
+.audit-tabmerge .ant-card { box-shadow: none; }
+.ant-card-hoverable:hover { box-shadow: var(--gw-shadow-2) !important; transform: translateY(-2px); }
+.ant-card-head { background: var(--gw-grad-surface) !important; }
+
+/* 主按钮：渐变底 + 主色阴影；hover 只加深阴影并微浮，不提亮背景（保白字对比度）；
+   danger / btn-green / disabled / loading 保持 antd 原样 */
+.ant-btn-primary:not(.ant-btn-dangerous):not(.btn-green):not(.ant-btn-disabled):not(.ant-btn-loading) {
+  background: var(--gw-grad-primary) !important;
+  border-color: transparent !important;
+  box-shadow: var(--gw-shadow-primary) !important;
+  transition: transform var(--gw-dur-fast) var(--gw-ease), box-shadow var(--gw-dur-fast) var(--gw-ease), background var(--gw-dur-fast) var(--gw-ease) !important;
+}
+.ant-btn-primary:not(.ant-btn-dangerous):not(.btn-green):not(.ant-btn-disabled):not(.ant-btn-loading):hover {
+  background: var(--gw-grad-primary-hover) !important;
+  border-color: transparent !important;
+  box-shadow: 0 4px 12px rgba(47, 84, 235, .3) !important;
+  transform: translateY(-1px);
+}
+.ant-btn-primary:not(.ant-btn-dangerous):not(.btn-green):not(.ant-btn-disabled):not(.ant-btn-loading):active {
+  background: var(--gw-grad-primary-active) !important;
+  box-shadow: 0 1px 3px rgba(47, 84, 235, .24) !important;
+  transform: translateY(0);
+}
+[data-theme='dark'] .ant-btn-primary:not(.ant-btn-dangerous):not(.btn-green):not(.ant-btn-disabled):not(.ant-btn-loading):hover {
+  box-shadow: 0 4px 14px rgba(89, 126, 247, .38) !important;
+}
+
+/* 描边普通按钮：hover 淡主色底 + 轻阴影（边框/字色口径沿用上面的 default 规则） */
+.ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button):hover {
+  background-color: rgba(47, 84, 235, .04) !important;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, .06);
+}
+[data-theme='dark'] .ant-btn-variant-outlined.ant-btn-color-default:not(.ant-input-search-button):hover {
+  background-color: rgba(89, 126, 247, .12) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
+}
+
+/* link 按钮：hover 下划线，明确「可点」 */
+.ant-btn-variant-link:not(.ant-btn-dangerous):hover { text-decoration: underline; text-underline-offset: 2px; }
+
+/* 菜单项：hover 淡主色底 + 颜色过渡；选中项仍走 antd 自身底色 */
+.ant-menu-item { transition: background-color var(--gw-dur-mid) var(--gw-ease), color var(--gw-dur-mid) var(--gw-ease); }
+.ant-menu-item:not(.ant-menu-item-selected):hover { background: rgba(47, 84, 235, .06) !important; }
+[data-theme='dark'] .ant-menu-item:not(.ant-menu-item-selected):hover { background: rgba(89, 126, 247, .12) !important; }
+
+/* Tabs：ink-bar 走主色渐变，tab 文字 hover 过渡 */
+.ant-tabs-ink-bar { background: var(--gw-grad-primary) !important; }
+.ant-tabs-tab { transition: color var(--gw-dur-mid) var(--gw-ease); }
+.ant-tabs-tab:hover .ant-tabs-tab-btn { color: var(--gw-primary) !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ant-card, .ant-btn, .ant-menu-item, .ant-tabs-tab, .ant-tabs-ink-bar { transition: none !important; }
+  .ant-card-hoverable:hover,
+  .ant-btn-primary:not(.ant-btn-dangerous):not(.btn-green):not(.ant-btn-disabled):not(.ant-btn-loading):hover,
+  .ant-btn-primary:not(.ant-btn-dangerous):not(.btn-green):not(.ant-btn-disabled):not(.ant-btn-loading):active { transform: none !important; }
+}
