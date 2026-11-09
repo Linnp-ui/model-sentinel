@@ -190,39 +190,45 @@ async def _decide(src: str) -> Optional[dict]:
     if not breaker.allow(_BREAKER_KEY):
         return None
 
-    from . import small_model as sm
-    if not sm.l2_enabled():
+    # 复杂度路由改由 Laya /classify 判定（非 OpenAI chat 协议）。
+    # 仅发送用户消息，Laya 返回 complexity_level(1/2/3)。
+    if os.getenv("SMALL_MODEL_ENABLED", "true").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    _url = os.getenv("AI_GATEWAY_COMPLEXITY_LAYA_URL",
+                     "http://127.0.0.1:8004/classify")
+    if not _url:
         return None
     t0 = time.time()
     try:
-        resp = await sm._get_client().post(
-            sm.l2_url(),
-            json={
-                "model": sm.l2_name(),
-                "messages": [
-                    {"role": "system", "content": _SYSTEM},
-                    # 客户端会把 user_info/cwd/当前时间塞进正文，剥掉只留真问题
-                    {"role": "user", "content": _slim(src)},
-                ],
-                "temperature": 0,
-                "max_tokens": 24,
-            },
-            timeout=_timeout(),
-        )
+        import httpx
+        async with httpx.AsyncClient(timeout=_timeout(), trust_env=False) as _c:
+            resp = await _c.post(_url, json={"text": _slim(src), "filename": "", "headers": [], "sheet_names": []})
         resp.raise_for_status()
-        content = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        data = resp.json() or {}
     except Exception:
         breaker.record_failure(_BREAKER_KEY)
         return None
 
-    level = _parse(content)
-    if level is None:
-        # 模型答了但不是数字：算一次失败（熔断阈值内不会再拖慢下一轮）
+    level = data.get("complexity_level")
+    if level not in (1, 2, 3):
+        # 兼容旧服务：从 simple/complex 概率映射
+        try:
+            pc = float(data.get("complex_prob", 0.0) or 0.0)
+            ps = float(data.get("simple_prob", 0.0) or 0.0)
+            if pc >= 0.5:
+                level = 3
+            elif ps >= 0.5:
+                level = 1
+            else:
+                level = 2
+        except Exception:
+            level = None
+    if level not in (1, 2, 3):
         breaker.record_failure(_BREAKER_KEY)
         return None
     breaker.record_success(_BREAKER_KEY)
 
-    out = {"level": level, "ms": int((time.time() - t0) * 1000), "cached": False}
+    out = {"level": int(level), "ms": int((time.time() - t0) * 1000), "cached": False}
     _CACHE[key] = (now, {k: v for k, v in out.items() if k != "cached"})
     if len(_CACHE) > _CACHE_MAX:
         _CACHE.pop(next(iter(_CACHE)))

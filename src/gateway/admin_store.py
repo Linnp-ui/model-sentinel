@@ -1725,7 +1725,7 @@ class AdminStore:
         """统计页整页单遍聚合：窗口行只遍历一遍，同时产出 7 个独立 stats_* 的全部结果。
 
         等价性（逐字段口径）与独立调用一一对应，tests 有对拍断言：
-        overview/group_key_name/group_provider/group_rule/billing/billing_daily 同
+        overview/group_key_name/group_provider/group_model/group_rule/billing/billing_daily 同
         名函数；timeseries 同 n 桶口径；key_model 同 top-N 口径。
         返回未定价的聚合（billing 定价在 stats_service.build_summary 做，与
         build_billing 共用 _price_billing，口径不漂移）。
@@ -1755,6 +1755,7 @@ class AdminStore:
         # 三个分组维度共用一行
         g_key: dict = {}
         g_prov: dict = {}
+        g_model: dict = {}
         g_rule: dict = {}
         # key×model / 计费 / 分日计费
         km: dict = {}
@@ -1805,6 +1806,20 @@ class AdminStore:
                 label = (raw or "").strip() or "(unknown)"
                 g = agg.setdefault(label, {"label": label, "calls": 0, "tokens": 0,
                                            "blocked": 0, "local_routed": 0, "errors": 0})
+                g["calls"] += 1
+                g["tokens"] += p + c
+                if blk:
+                    g["blocked"] += 1
+                if loc:
+                    g["local_routed"] += 1
+                if sc >= 500:
+                    g["errors"] += 1
+            # 模型分布（实际应答模型，别名经 _real_model_label 归一；空/未登记 provider 同 provider 口径排除）
+            prov_raw = (r.get("provider") or "").strip()
+            if prov_raw and (not registered_providers or prov_raw in registered_providers):
+                label_model = _real_model_label(_routes, prov_raw, r.get("model") or "")
+                g = g_model.setdefault(label_model, {"label": label_model, "calls": 0, "tokens": 0,
+                                                     "blocked": 0, "local_routed": 0, "errors": 0})
                 g["calls"] += 1
                 g["tokens"] += p + c
                 if blk:
@@ -1883,6 +1898,7 @@ class AdminStore:
             "overview": overview,
             "group_key_name": _gout(g_key),
             "group_provider": _gout(g_prov),
+            "group_model": _gout(g_model),
             "group_rule": _gout(g_rule),
             "timeseries": timeseries,
             "key_model": key_model,

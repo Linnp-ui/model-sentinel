@@ -828,7 +828,7 @@ def test_l2_long_text_only_covers_head(monkeypatch):
     store = get_admin_store()
     plain = "sk_idle_%d" % int(_time.time() * 1000)
     kid = store.create_api_key(plain, "pytest-idle", "", "pytest idle whitelist")["id"]
-    rid = store.add_key_rule(kind="white", key_value=plain, note="pytest", source="strategy")["id"]
+    rid = store.add_key_rule(kind="white", key_value=plain, note="pytest", source="manual")["id"]
     try:
         store._key_rules[rid]["created_at"] = "2020-01-01 00:00:00"  # 模拟老白名单
         items = client.get("/admin/api/suggestions", params={"hours": 168}).json()["items"]
@@ -2090,6 +2090,22 @@ def test_stats_summary_equivalent_to_individual_funcs():
     # 定价与 build_billing 同源
     assert _ss._price_billing(d["billing"], d["billing_daily"], 168) == \
         _ss._price_billing(store.stats_billing(s, u), store.stats_billing_daily(s, u), 168)
+
+def test_stats_summary_group_model_resolves_alias():
+    # 模型调用分布：按实际应答模型聚合（别名经 _real_model_label 归一），
+    # 只统计登记的 provider（deepseek 在测试 routing 里已登记）。
+    from src.gateway.admin_store import get_admin_store
+    store = get_admin_store()
+    seed = lambda pt, ct, ts: store.insert_request_log({
+        "key_name": "pytest-gm", "action": "allow", "model": "deepseek-flash",
+        "provider": "deepseek", "client_ip": "7.7.7.11", "status_code": 200,
+        "prompt_tokens": pt, "completion_tokens": ct, "duration_ms": 10, "ts": ts})
+    seed(10, 5, "2030-07-01 12:00:00")
+    seed(2, 1, "2030-07-01 12:00:01")
+    d = store.stats_summary("2030-07-01 00:00:00", "2030-07-01 23:59:59")
+    gm = {g["label"]: g for g in d["group_model"]}
+    assert gm["deepseek/deepseek-flash"]["calls"] == 2
+    assert gm["deepseek/deepseek-flash"]["tokens"] == 18
 
 def test_real_model_label_normalizes_dirty_rows():
     # 2026-10-12 生产实测计费页 model 脏行：空 model → "vllm_local/"、客户端斜杠式

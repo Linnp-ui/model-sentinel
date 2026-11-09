@@ -179,7 +179,7 @@ export default function StatsPage() {
   const [hours, setHours] = useState(RANGES.some((r) => r.hours === _ls) ? _ls
     : (RANGES.some((r) => r.hours === _h) ? _h : 168));
   const [ov, setOv] = useState(null);
-  const [provTop, setProvTop] = useState([]);
+  const [modelTop, setModelTop] = useState([]);
   const [loading, setLoading] = useState(false);
   const [keyModels, setKeyModels] = useState([]);
   const [keyCalls, setKeyCalls] = useState([]);
@@ -201,9 +201,9 @@ export default function StatsPage() {
         api(`/stats/summary?hours=${h}&top=20`),
         api(`/rule-hits?hours=${h}`).catch(() => null), // 审计后端不可用时不拖垮整页
       ]);
-      const [o, m, k, pg, b] = [d.overview, { items: d.key_model }, { items: d.group_key_name }, { items: d.group_provider }, d.billing];
+      const [o, m, k, mg, b] = [d.overview, { items: d.key_model }, { items: d.group_key_name }, { items: d.group_model }, d.billing];
       setOv(o);
-      setProvTop((pg.items || []).slice(0, 8).map((g) => ({ label: g.label, count: g.calls, tokens: g.tokens })));
+      setModelTop((mg.items || []).slice(0, 8).map((g) => ({ label: g.label, count: g.calls, tokens: g.tokens })));
       setRuleHits(rh);
       setKeyModels(m.items || []); setKeyCalls(k.items || []); setBilling(b);
       setErr('');
@@ -273,11 +273,11 @@ export default function StatsPage() {
         <>
           <MetricsSection hours={hours} focus={focus} />
           <div style={{ display: 'flex', gap: 'var(--gw-sp-12)', flexWrap: 'wrap', alignItems: 'stretch', marginTop: 'var(--gw-sp-12)' }}>
-            <Card title={<>Provider 调用分布<Tip term="provider" /></>}
+            <Card title={<>模型调用分布<Tip term="model" /></>}
               style={{ minWidth: 380, flex: 1, display: 'flex', flexDirection: 'column' }}
               styles={{ body: { flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' } }}>
-              {provTop.length
-                ? <HBarList testid="stats-provider-bars" items={provTop} total={ov?.total}
+              {modelTop.length
+                ? <HBarList testid="stats-model-bars" items={modelTop} total={ov?.total}
                     renderVal={(x) => `${x.count} 次 · ${(x.tokens || 0).toLocaleString()} tok`} />
                 : <Alert type="info" showIcon message="窗口内无调用" />}
             </Card>

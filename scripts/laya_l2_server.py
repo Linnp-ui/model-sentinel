@@ -54,6 +54,28 @@ QUESTIONS = {
             "false": "benign user content without injection intent",
         },
     },
+    "is_simple": {
+        "type": "noul",
+        "instructions": (
+            "Is this user request simple (greeting, factual/concept question, short translation, "
+            "or a single short answer) requiring little or no code and little context?"
+        ),
+        "criteria": {
+            "true": "simple request requiring little work",
+            "false": "not a simple request",
+        },
+    },
+    "is_complex": {
+        "type": "noul",
+        "instructions": (
+            "Is this user request complex (multi-file changes, architecture or design, root-cause "
+            "debugging, or requiring large context to complete)?"
+        ),
+        "criteria": {
+            "true": "complex request requiring substantial work",
+            "false": "not a complex request",
+        },
+    },
 }
 
 app = FastAPI()
@@ -113,17 +135,29 @@ def classify(r: Req):
         return float(a.get("noul", 0.0))
     p = _ans("is_confidential")
     p_inj = _ans("is_injection")
+    p_simple = _ans("is_simple")
+    p_complex = _ans("is_complex")
     label = "CONFIDENTIAL" if p >= 0.5 else "NORMAL"
     inj = p_inj >= 0.5
     probs = {"CONFIDENTIAL": p, "NORMAL": round(1 - p, 4)}
     # 阈值口径用「所选 label 的原始概率」（与 qwen 后端口径一致）
     conf = p if label == "CONFIDENTIAL" else 1 - p
+    # 复杂度映射：复杂优先，其次简单，否则中等
+    if p_complex >= 0.5:
+        complexity_level = 3
+    elif p_simple >= 0.5:
+        complexity_level = 1
+    else:
+        complexity_level = 2
     return {
         "label": label,
         "confidence": conf,
         "probabilities": probs,
         "injection": inj,
         "injection_confidence": p_inj,
+        "simple_prob": p_simple,
+        "complex_prob": p_complex,
+        "complexity_level": complexity_level,
         "reason": f"laya-multilingual noul p_conf={p:.3f}",
         "latency_ms": int((time.time() - t0) * 1000),
     }

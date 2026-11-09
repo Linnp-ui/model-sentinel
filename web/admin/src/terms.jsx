@@ -20,6 +20,7 @@ export const G = {
 
   // —— 接入方与上游 ——
   provider: 'Provider（上游服务）：真正干活的模型服务，可以是外网 API，也可以是公司内网的模型。网关按 provider 名字转发。',
+  model: '模型：客户端请求的模型名（别名会解析成实际应答模型）；模型调用分布按模型统计调用次数与 Token。',
   base_url: 'base_url：上游服务的接口根地址，例如 https://api.example.com/v1。',
   local_provider: '内网 provider：模型跑在公司内网，请求内容不会离开内网。标错了等于把内容送出去，安全边界就破了。',
   api_mode: '接口类型：上游用哪种请求格式（OpenAI / Anthropic / Gemini 等），要跟对方的文档对上。',

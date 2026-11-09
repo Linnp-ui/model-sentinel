@@ -43,7 +43,7 @@ def _pdf(name):
     ("财务报表", "route_local", "financial_local_only"),
     ("工资表", "allow", "default_allow"),  # 纯文本"工资表"已移出 L1（文件维度仍拦）
     ("资产负债", "route_local", "financial_local_only"),
-    ("利润表", "route_local", "financial_local_only"),
+    ("利润表", "allow", "default_allow"),  # 纯文本"利润表"已移出 L1 text 关键词（文件维度仍拦）
     ("员工张三 身份证 110101199001011237", "route_local", "pii_weighted_route_local"),
     ("手机号 13812345678", "route_local", "pii_weighted_route_local"),  # phone pattern 60分单命中（旧名 pii_local_only 已改名）
     ("我的AKIAIOSFODNN7EXAMPLE泄露", "route_local", "block_secrets"),  # fallback_local -> route_local

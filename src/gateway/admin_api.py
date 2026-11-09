@@ -554,8 +554,6 @@ def suggestion_apply_api(req: SuggestionApplyReq):
         rows = [r for r in store.list_key_rules() if r["id"] == req.rule_id]
         if not rows or rows[0]["kind"] != "white":
             raise HTTPException(404, "白名单规则不存在")
-        if rows[0].get("source") not in ("strategy", "auto"):
-            raise HTTPException(409, "手工添加的规则请手动删除")
         store.remove_key_rule(req.rule_id)
         return {"ok": True, "removed": req.rule_id}
     kv = req.key

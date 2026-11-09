@@ -1,0 +1,28 @@
+[Unit]
+Description=Laya multilingual decision model (complexity routing, port 8004, GPU 5)
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user
+Environment=CUDA_VISIBLE_DEVICES=5
+EnvironmentFile=-/home/your-user/gateway/var/laya-complexity.env
+Environment=USE_TF=0
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ExecStart=/home/your-user/venvs/laya/bin/python /home/your-user/gateway/scripts/laya_l2_server.py
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=append:/home/your-user/gateway/logs/laya_complexity.log
+StandardError=append:/home/your-user/gateway/logs/laya_complexity.log
+
+[Install]
+WantedBy=multi-user.target

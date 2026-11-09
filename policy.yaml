@@ -90,6 +90,11 @@ policies:
       - 营收
       - 利润
       - 资产负债
+      - 预算执行
+      - 利润分配
+      - 应收应付
+      - 现金流
+      - 损益
     - file.headers contains_any:
       - 姓名
       - 身份证
@@ -101,6 +106,12 @@ policies:
       - 成本
       - 利润
       - 营收
+      - 收入
+      - 支出
+      - 折旧
+      - 摊销
+      - 费用
+      - 资产
     - file.filename contains_any:
       - 工资
       - 薪资
@@ -109,10 +120,19 @@ policies:
       - salary
       - financial
       - cost
+      - 预算表
+      - 损益表
+      - 现金流量
+      - 资产报表
     - text contains_any:
       - 财务报表
       - 资产负债
-      - 利润表
+      - 现金流分析
+      - 利润预测
+      - 成本控制
+      - 资产变动
+      - 应收应付账款
+      - 银行对账
   target:
     provider: vllm_local
     model: qwen2.5:7b
@@ -122,16 +142,17 @@ policies:
     rows:
     - content_type: sheet_names
       match_type: contains
-      match_value: 工资, 薪资, 财务, 预算, 决算, 成本, 营收, 利润, 资产负债
+      match_value: 工资, 薪资, 财务, 预算, 决算, 成本, 营收, 利润, 资产负债, 预算执行, 利润分配, 应收应付, 现金流, 损益
     - content_type: headers
       match_type: contains
-      match_value: 姓名, 身份证, 工资, 薪资, 银行账号, 银行卡, 金额, 成本, 利润, 营收
+      match_value: 姓名, 身份证, 工资, 薪资, 银行账号, 银行卡, 金额, 成本, 利润, 营收, 收入, 支出, 折旧, 摊销, 费用,
+        资产
     - content_type: filename
       match_type: contains
-      match_value: 工资, 薪资, 财务, 预算, salary, financial, cost
+      match_value: 工资, 薪资, 财务, 预算, salary, financial, cost, 预算表, 损益表, 现金流量, 资产报表
     - content_type: prompt
       match_type: contains
-      match_value: 财务报表, 资产负债, 利润表
+      match_value: 财务报表, 资产负债, 现金流分析, 利润预测, 成本控制, 资产变动, 应收应付账款, 银行对账
   locked: false
   locked_priority: false
   pinned: false

@@ -48,7 +48,7 @@ def _extract(relpath):
 
 def test_questions_verbatim_consistent():
     ref = _extract(FILES["生产服务(源头)"])
-    assert set(ref) == {"is_confidential", "is_injection"}, "生产题规格任务集变化，需同步更新本测试"
+    assert set(ref) == {"is_confidential", "is_injection", "is_simple", "is_complex"}, "生产题规格任务集变化，需同步更新本测试"
     for name, path in FILES.items():
         spec = _extract(path)
         assert set(spec) <= set(ref), f"{name}（{path}）出现生产没有的任务: {set(spec) - set(ref)}"

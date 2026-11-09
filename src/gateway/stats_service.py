@@ -1070,7 +1070,7 @@ def build_summary(store, window_hours: float = 168.0, top: int = 20) -> dict:
     """统计页整页单请求：单遍聚合（store.stats_summary）+ 与 build_billing 同口径定价。
 
     前端统计页 7 端点 → 1 端点；旧端点保留给 dashboard 等其他消费者。
-    返回 {hours, overview, group_key_name, group_provider, group_rule,
+    返回 {hours, overview, group_key_name, group_provider, group_model, group_rule,
           timeseries, key_model, billing}。
     """
     since, until = _window(window_hours)

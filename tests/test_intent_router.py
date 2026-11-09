@@ -128,28 +128,34 @@ class _FakeResp:
         pass
 
     def json(self):
-        return {"choices": [{"message": {"content": self._content}}]}
+        return {"complexity_level": int(self._content)}
 
 
-class _FakeClient:
+class _FakeAsyncClient:
     def __init__(self, content):
         self.calls = 0
         self._content = content
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
     async def post(self, *a, **k):
         self.calls += 1
         return _FakeResp(self._content)
 
 
-def _fake_sm(monkeypatch, client):
-    monkeypatch.setattr(sm, "l2_enabled", lambda: True)
-    monkeypatch.setattr(sm, "_get_client", lambda: client)
+def _fake_httpx(monkeypatch, client_factory):
+    monkeypatch.setenv("SMALL_MODEL_ENABLED", "true")
+    monkeypatch.setattr("httpx.AsyncClient", client_factory)
 
 
 def test_decide_caches_per_message(monkeypatch):
     """同一轮几十个 tool 回合带同一段用户消息 ⇒ 只判一次。"""
-    fake = _FakeClient("2")
-    _fake_sm(monkeypatch, fake)
+    fake = _FakeAsyncClient("2")
+    _fake_httpx(monkeypatch, lambda *a, **k: fake)
     ir._CACHE.clear()
     a = asyncio.run(ir._decide("pytest-ir 同一段用户消息"))
     b = asyncio.run(ir._decide("pytest-ir 同一段用户消息"))
@@ -159,11 +165,17 @@ def test_decide_caches_per_message(monkeypatch):
 
 
 def test_decide_failure_is_silent(monkeypatch):
-    class _Boom:
+    class _BoomClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
         async def post(self, *a, **k):
             raise RuntimeError("classifier down")
 
-    _fake_sm(monkeypatch, _Boom())
+    _fake_httpx(monkeypatch, lambda *a, **k: _BoomClient())
     ir._CACHE.clear()
     assert asyncio.run(ir._decide("pytest-ir 判定模型挂了")) is None
 

@@ -53,6 +53,28 @@ QUESTIONS = {
             "false": "benign user content without injection intent",
         },
     },
+    "is_simple": {
+        "type": "noul",
+        "instructions": (
+            "Is this user request simple (greeting, factual/concept question, short translation, "
+            "or a single short answer) requiring little or no code and little context?"
+        ),
+        "criteria": {
+            "true": "simple request requiring little work",
+            "false": "not a simple request",
+        },
+    },
+    "is_complex": {
+        "type": "noul",
+        "instructions": (
+            "Is this user request complex (multi-file changes, architecture or design, root-cause "
+            "debugging, or requiring large context to complete)?"
+        ),
+        "criteria": {
+            "true": "complex request requiring substantial work",
+            "false": "not a complex request",
+        },
+    },
 }
 
 
@@ -141,10 +163,15 @@ def main():
         for qkey in QUESTIONS:
             q = QUESTIONS[qkey]
             if qkey == "is_confidential":
-                p_true = 1.0 if row["label"] == 1 else 0.0
-            else:
-                # is_injection：行带 is_injection 任务标记（1=注入尝试），缺省视为非注入
+                p_true = 1.0 if row.get("label", 0) == 1 else 0.0
+            elif qkey == "is_injection":
                 p_true = 1.0 if bool(row.get(qkey)) else 0.0
+            elif qkey == "is_simple":
+                p_true = 1.0 if row.get("complexity") == 1 else 0.0
+            elif qkey == "is_complex":
+                p_true = 1.0 if row.get("complexity") == 3 else 0.0
+            else:
+                p_true = 0.0
             target = [1.0 - p_true, p_true]
             seq, markers = build_sequence(tok, state,
                                           {"t": q["type"], "ins": q["instructions"], "crit": q["criteria"]},
